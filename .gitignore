@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.idea/
+
+build/
+dist/
+
+compact-ui-screenshot.png
+compact-ui-window.png

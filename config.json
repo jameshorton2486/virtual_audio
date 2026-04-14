@@ -1,0 +1,11 @@
+{
+  "mic_device": "Microphone (Yeti Stereo Microphone)",
+  "vac_device": "CABLE Output (VB-Audio Virtual Cable)",
+  "speaker_device": "Speakers (Yeti Stereo Microphone)",
+  "vac_playback_device": "CABLE Input (VB-Audio Virtual Cable)",
+  "voicemeeter_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+  "wer_mode_enabled": true,
+  "quality_check_interval_seconds": 2.0,
+  "sample_rate_hz": 24000,
+  "last_mode": "VAC"
+}
