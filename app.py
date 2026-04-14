@@ -84,6 +84,27 @@ MODE_STATUS = {
     "Mixed": "Sets the Windows default recording device to the Voicemeeter output and restores playback to your speakers.",
 }
 
+MODE_UI = {
+    "Microphone": {
+        "title": "Microphone Mode",
+        "badge": "WER 10-15%",
+        "accent": "#4CAF50",
+        "route": "Voice -> Microphone -> Windows recording",
+    },
+    "VAC": {
+        "title": "Virtual Audio Cable Mode",
+        "badge": "WER 3-7% BEST",
+        "accent": "#2E7D32",
+        "route": "Playback -> CABLE Input -> CABLE Output -> Recording",
+    },
+    "Mixed": {
+        "title": "Mixed Mode",
+        "badge": "WER 5-10%",
+        "accent": "#7B1FA2",
+        "route": "Mic + system audio -> Voicemeeter -> Recording",
+    },
+}
+
 
 def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
@@ -598,13 +619,42 @@ class App:
             font=("Arial", 11),
         ).pack(pady=(5, 2))
 
+        mode_summary_row = ctk.CTkFrame(mode_frame, fg_color="transparent")
+        mode_summary_row.pack(fill="x", padx=12, pady=(0, 2))
+
+        mode_text_frame = ctk.CTkFrame(mode_summary_row, fg_color="transparent")
+        mode_text_frame.pack(side="left", fill="both", expand=True)
+
         self.mode_display = ctk.CTkLabel(
-            mode_frame,
+            mode_text_frame,
             text=f"{self.current_mode}",
-            font=("Arial", 15, "bold"),
+            font=("Arial", 16, "bold"),
             text_color="#4CAF50",
+            anchor="w",
         )
-        self.mode_display.pack(pady=(0, 2))
+        self.mode_display.pack(anchor="w")
+
+        self.mode_device_label = ctk.CTkLabel(
+            mode_text_frame,
+            text="",
+            text_color="#C6C6C6",
+            font=("Arial", 10),
+            anchor="w",
+            wraplength=330,
+            justify="left",
+        )
+        self.mode_device_label.pack(anchor="w", pady=(1, 0))
+
+        self.mode_badge_label = ctk.CTkLabel(
+            mode_summary_row,
+            text="",
+            width=96,
+            height=42,
+            corner_radius=8,
+            font=("Arial", 10, "bold"),
+            fg_color="#2E7D32",
+        )
+        self.mode_badge_label.pack(side="right", padx=(10, 0))
 
         self.mode_hint_label = ctk.CTkLabel(
             mode_frame,
@@ -626,12 +676,22 @@ class App:
         )
         self.mode_status_label.pack(pady=(0, 6), padx=12)
 
+        self.mode_route_label = ctk.CTkLabel(
+            mode_frame,
+            text="",
+            text_color="#64B5F6",
+            font=("Arial", 10, "bold"),
+            wraplength=460,
+            justify="center",
+        )
+        self.mode_route_label.pack(pady=(0, 8), padx=12)
+
         button_frame = ctk.CTkFrame(self.root)
         button_frame.pack(pady=6, padx=20, fill="x")
 
         self.btn_mic = ctk.CTkButton(
             button_frame,
-            text="Microphone\nWER: ~10-15%",
+            text="Microphone\nLive speaking | WER 10-15%",
             command=lambda: self.switch_mode("Microphone", self.mic_var.get()),
             height=42,
             font=("Arial", 11, "bold"),
@@ -640,7 +700,7 @@ class App:
 
         self.btn_vac = ctk.CTkButton(
             button_frame,
-            text="Virtual Audio Cable\nWER: ~3-7% BEST",
+            text="Virtual Audio Cable\nPlayback routing | WER 3-7% BEST",
             command=lambda: self.switch_mode("VAC", self.vac_var.get()),
             height=42,
             font=("Arial", 11, "bold"),
@@ -662,7 +722,7 @@ class App:
 
         self.btn_mix = ctk.CTkButton(
             button_frame,
-            text="Mixed Mode\nWER: ~5-10%",
+            text="Mixed Mode\nMic + system audio | WER 5-10%",
             command=lambda: self.switch_mode("Mixed", self.mix_var.get()),
             height=42,
             font=("Arial", 11, "bold"),
@@ -880,6 +940,7 @@ class App:
         self.direct_playback_var.set(self._normalize_direct_device_selection(self.direct_playback_var.get(), self.detected_output_devices))
         self._refresh_device_menus()
         self._refresh_detection_summary()
+        self._refresh_mode_hint()
         self.status_var.set("Refreshed detected Windows recording and playback devices.")
 
     def _normalize_direct_device_selection(self, current_value: str, devices: list[str]) -> str:
@@ -1251,6 +1312,7 @@ class App:
         return recommendation
 
     def _refresh_mode_hint(self) -> None:
+        ui_config = MODE_UI.get(self.current_mode, MODE_UI["Microphone"])
         hint = {
             "Microphone": "Best when you are speaking live. Expect more room noise than direct digital audio.",
             "VAC": "Best WER path for playback-only transcription because the signal stays fully digital.",
@@ -1258,7 +1320,23 @@ class App:
         }.get(self.current_mode, "")
         self.mode_hint_label.configure(text=hint)
         self.mode_status_label.configure(text=MODE_STATUS.get(self.current_mode, ""))
-        self.mode_display.configure(text=self.current_mode)
+        self.mode_display.configure(text=ui_config["title"], text_color=ui_config["accent"])
+        self.mode_badge_label.configure(text=ui_config["badge"], fg_color=ui_config["accent"])
+        self.mode_route_label.configure(text=ui_config["route"])
+        self.mode_device_label.configure(text=self._current_mode_device_summary())
+
+    def _current_mode_device_summary(self) -> str:
+        if self.current_mode == "VAC":
+            recording_device = self.vac_var.get().strip() or "Not configured"
+            playback_device = self.vac_playback_var.get().strip() or "Not configured"
+        elif self.current_mode == "Mixed":
+            recording_device = self.mix_var.get().strip() or "Not configured"
+            playback_device = self.speaker_var.get().strip() or "Not configured"
+        else:
+            recording_device = self.mic_var.get().strip() or "Not configured"
+            playback_device = self.speaker_var.get().strip() or "Not configured"
+
+        return f"Recording: {recording_device}\nPlayback: {playback_device}"
 
     def on_close(self) -> None:
         self._closing = True
