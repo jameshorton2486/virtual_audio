@@ -487,6 +487,8 @@ class App:
         self.speaker_var = ctk.StringVar(value=self.config["speaker_device"])
         self.vac_playback_var = ctk.StringVar(value=self.config["vac_playback_device"])
         self.mix_var = ctk.StringVar(value=self.config["voicemeeter_device"])
+        self.direct_recording_var = ctk.StringVar(value=self.config["mic_device"])
+        self.direct_playback_var = ctk.StringVar(value=self.config["speaker_device"])
         self.wer_enabled_var = ctk.BooleanVar(value=bool(self.config["wer_mode_enabled"]))
 
         self._build_ui()
@@ -678,6 +680,8 @@ class App:
         )
         self.mute_button.pack(pady=6, padx=15, fill="x")
 
+        self._build_direct_device_controls()
+
         util_frame = ctk.CTkFrame(self.root)
         util_frame.pack(pady=6, padx=20, fill="x")
 
@@ -716,6 +720,98 @@ class App:
             font=("Arial", 8),
             text_color="#555555",
         ).pack(pady=(0, 6))
+
+    def _build_direct_device_controls(self) -> None:
+        control_frame = ctk.CTkFrame(self.root)
+        control_frame.pack(pady=6, padx=20, fill="x")
+
+        ctk.CTkLabel(
+            control_frame,
+            text="Direct Audio Device Control",
+            font=("Arial", 12, "bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 4))
+
+        ctk.CTkLabel(
+            control_frame,
+            text="Change Windows recording and playback devices directly from here.",
+            font=("Arial", 9),
+            text_color="#C6C6C6",
+            wraplength=460,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        self.direct_recording_menu = self._add_device_selector(
+            control_frame,
+            "Recording input",
+            self.direct_recording_var,
+            self.detected_input_devices,
+        )
+
+        direct_recording_actions = ctk.CTkFrame(control_frame, fg_color="transparent")
+        direct_recording_actions.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(
+            direct_recording_actions,
+            text="Set Input",
+            command=self.apply_selected_recording_device,
+            height=28,
+            font=("Arial", 9, "bold"),
+        ).pack(side="left", expand=True, fill="x")
+
+        self.direct_playback_menu = self._add_device_selector(
+            control_frame,
+            "Playback output",
+            self.direct_playback_var,
+            self.detected_output_devices,
+        )
+
+        direct_playback_actions = ctk.CTkFrame(control_frame, fg_color="transparent")
+        direct_playback_actions.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(
+            direct_playback_actions,
+            text="Set Output",
+            command=self.apply_selected_playback_device,
+            height=28,
+            font=("Arial", 9, "bold"),
+        ).pack(side="left", expand=True, fill="x")
+
+        preset_row = ctk.CTkFrame(control_frame, fg_color="transparent")
+        preset_row.pack(fill="x", padx=10, pady=(0, 8))
+
+        ctk.CTkButton(
+            preset_row,
+            text="Normal",
+            command=lambda: self.apply_device_preset("normal"),
+            height=30,
+            font=("Arial", 9, "bold"),
+        ).pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        ctk.CTkButton(
+            preset_row,
+            text="VAC",
+            command=lambda: self.apply_device_preset("vac"),
+            height=30,
+            font=("Arial", 9, "bold"),
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+        ).pack(side="left", padx=3, expand=True, fill="x")
+
+        ctk.CTkButton(
+            preset_row,
+            text="Voicemeeter",
+            command=lambda: self.apply_device_preset("mixed"),
+            height=30,
+            font=("Arial", 9, "bold"),
+        ).pack(side="left", padx=(6, 0), expand=True, fill="x")
+
+        utility_row = ctk.CTkFrame(control_frame, fg_color="transparent")
+        utility_row.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(
+            utility_row,
+            text="Refresh Devices",
+            command=self.refresh_detected_devices,
+            height=28,
+            font=("Arial", 9),
+        ).pack(side="left", expand=True, fill="x")
 
     def _add_device_selector(self, parent, label: str, variable: ctk.StringVar, devices: list[str]):
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=10)
@@ -780,13 +876,39 @@ class App:
         self.speaker_var.set(self.config["speaker_device"])
         self.vac_playback_var.set(self.config["vac_playback_device"])
         self.mix_var.set(self.config["voicemeeter_device"])
-        self.mic_menu.configure(values=self._menu_values_for(self.mic_var.get(), self.detected_input_devices))
-        self.vac_menu.configure(values=self._menu_values_for(self.vac_var.get(), self.detected_input_devices))
-        self.speaker_menu.configure(values=self._menu_values_for(self.speaker_var.get(), self.detected_output_devices))
-        self.vac_playback_menu.configure(values=self._menu_values_for(self.vac_playback_var.get(), self.detected_output_devices))
-        self.mix_menu.configure(values=self._menu_values_for(self.mix_var.get(), self.detected_input_devices))
+        self.direct_recording_var.set(self._normalize_direct_device_selection(self.direct_recording_var.get(), self.detected_input_devices))
+        self.direct_playback_var.set(self._normalize_direct_device_selection(self.direct_playback_var.get(), self.detected_output_devices))
+        self._refresh_device_menus()
         self._refresh_detection_summary()
         self.status_var.set("Refreshed detected Windows recording and playback devices.")
+
+    def _normalize_direct_device_selection(self, current_value: str, devices: list[str]) -> str:
+        if current_value in devices:
+            return current_value
+        if devices:
+            return devices[0]
+        return current_value
+
+    def _refresh_device_menus(self) -> None:
+        menu_specs = [
+            ("mic_menu", self.mic_var, self.detected_input_devices),
+            ("vac_menu", self.vac_var, self.detected_input_devices),
+            ("speaker_menu", self.speaker_var, self.detected_output_devices),
+            ("vac_playback_menu", self.vac_playback_var, self.detected_output_devices),
+            ("mix_menu", self.mix_var, self.detected_input_devices),
+            ("direct_recording_menu", self.direct_recording_var, self.detected_input_devices),
+            ("direct_playback_menu", self.direct_playback_var, self.detected_output_devices),
+        ]
+
+        for menu_name, variable, devices in menu_specs:
+            menu = getattr(self, menu_name, None)
+            if menu is None:
+                continue
+            try:
+                if menu.winfo_exists():
+                    menu.configure(values=self._menu_values_for(variable.get(), devices))
+            except Exception:
+                continue
 
     def _refresh_detection_summary(self) -> None:
         if self.detected_input_devices:
@@ -828,6 +950,28 @@ class App:
             self.settings_window.grab_release()
             self.settings_window.destroy()
         self.settings_window = None
+
+    def apply_selected_recording_device(self) -> None:
+        device_name = self.direct_recording_var.get().strip()
+        ok, message = self.device_manager.set_default_recording_device(device_name)
+        self.status_var.set(message)
+
+    def apply_selected_playback_device(self) -> None:
+        device_name = self.direct_playback_var.get().strip()
+        ok, message = self.device_manager.set_default_playback_device(device_name)
+        self.status_var.set(message)
+
+    def apply_device_preset(self, preset_name: str) -> None:
+        presets = {
+            "normal": (self.mic_var.get().strip(), self.speaker_var.get().strip(), "Microphone"),
+            "vac": (self.vac_var.get().strip(), self.vac_playback_var.get().strip(), "VAC"),
+            "mixed": (self.mix_var.get().strip(), self.speaker_var.get().strip(), "Mixed"),
+        }
+        recording_device, playback_device, mode_name = presets[preset_name]
+
+        self.direct_recording_var.set(recording_device)
+        self.direct_playback_var.set(playback_device)
+        self.switch_mode(mode_name, recording_device)
 
     def open_config(self) -> None:
         if self.settings_window and self.settings_window.winfo_exists():
@@ -942,6 +1086,9 @@ class App:
             self.config["last_mode"] = mode_name
             save_config(self.config)
             self.mode_var.set(mode_name)
+            self.direct_recording_var.set(device_name)
+            if playback_target:
+                self.direct_playback_var.set(playback_target)
             self._refresh_mode_hint()
             if mode_name == "VAC":
                 self.status_var.set(f"{record_message} {playback_message}")
