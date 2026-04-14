@@ -7,6 +7,39 @@ import numpy as np
 
 
 class DeviceHelpersTests(unittest.TestCase):
+    def test_infer_vac_recording_device_prefers_cable_output(self) -> None:
+        devices = [
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "CABLE Output (VB-Audio Virtual Cable)",
+            "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)",
+        ]
+
+        result = app.infer_vac_recording_device(app.DEFAULT_CONFIG["vac_device"], devices)
+
+        self.assertEqual(result, "CABLE Output (VB-Audio Virtual Cable)")
+
+    def test_infer_vac_playback_device_prefers_cable_input(self) -> None:
+        devices = [
+            "CABLE Output (VB-Audio Virtual Cable)",
+            "Speakers (Realtek Audio)",
+            "CABLE Input (VB-Audio Virtual Cable)",
+        ]
+
+        result = app.infer_vac_playback_device(app.DEFAULT_CONFIG["vac_playback_device"], devices)
+
+        self.assertEqual(result, "CABLE Input (VB-Audio Virtual Cable)")
+
+    def test_infer_speaker_output_device_avoids_virtual_outputs(self) -> None:
+        devices = [
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)",
+            "Speakers (Realtek Audio)",
+        ]
+
+        result = app.infer_speaker_output_device(app.DEFAULT_CONFIG["speaker_device"], devices)
+
+        self.assertEqual(result, "Speakers (Realtek Audio)")
+
     def test_set_default_recording_device_updates_all_windows_roles(self) -> None:
         calls = []
 

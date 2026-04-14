@@ -205,6 +205,79 @@ def infer_device(preferred_name: str, devices: list[str], keywords: list[str]) -
     return preferred_name
 
 
+def infer_device_by_patterns(
+    preferred_name: str,
+    devices: list[str],
+    required_patterns: list[tuple[str, ...]],
+    optional_patterns: list[tuple[str, ...]] | None = None,
+    excluded_terms: tuple[str, ...] = (),
+) -> str:
+    if preferred_name in devices:
+        return preferred_name
+
+    optional_patterns = optional_patterns or []
+    excluded = tuple(term.lower() for term in excluded_terms)
+
+    def is_excluded(device_lower: str) -> bool:
+        return any(term in device_lower for term in excluded)
+
+    def matching_score(device: str) -> tuple[int, tuple[int, int, str]] | None:
+        device_lower = device.lower()
+        if is_excluded(device_lower):
+            return None
+
+        for index, pattern in enumerate(required_patterns):
+            if all(term in device_lower for term in pattern):
+                return (200 - index, _device_rank_key(device))
+
+        for index, pattern in enumerate(optional_patterns):
+            if all(term in device_lower for term in pattern):
+                return (100 - index, _device_rank_key(device))
+
+        return None
+
+    ranked: list[tuple[int, tuple[int, int, str], str]] = []
+    for device in devices:
+        score = matching_score(device)
+        if score is None:
+            continue
+        ranked.append((score[0], score[1], device))
+
+    if ranked:
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return ranked[0][2]
+
+    return preferred_name
+
+
+def infer_vac_recording_device(preferred_name: str, devices: list[str]) -> str:
+    return infer_device_by_patterns(
+        preferred_name,
+        devices,
+        required_patterns=[("cable", "output"), ("vb-audio", "output")],
+        optional_patterns=[("virtual", "cable"), ("cable",)],
+    )
+
+
+def infer_vac_playback_device(preferred_name: str, devices: list[str]) -> str:
+    return infer_device_by_patterns(
+        preferred_name,
+        devices,
+        required_patterns=[("cable", "input"), ("vb-audio", "input")],
+        optional_patterns=[("virtual", "cable"), ("cable",)],
+    )
+
+
+def infer_speaker_output_device(preferred_name: str, devices: list[str]) -> str:
+    return infer_device_by_patterns(
+        preferred_name,
+        devices,
+        required_patterns=[("speaker",), ("headphone",), ("realtek",)],
+        optional_patterns=[("output",)],
+        excluded_terms=("cable", "vb-audio", "voicemeeter"),
+    )
+
+
 def _device_rank_key(device: str) -> tuple[int, int, str]:
     lowered = device.lower()
     penalty = 0
@@ -388,6 +461,7 @@ class App:
         self.setup_notes_label = None
         self.setup_notes_visible = False
         self._closing = False
+        self._vac_test_running = False
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -573,6 +647,17 @@ class App:
         )
         self.btn_vac.pack(pady=4, padx=15, fill="x")
 
+        self.btn_vac_test = ctk.CTkButton(
+            button_frame,
+            text="Test VAC Routing",
+            command=self.test_vac_routing,
+            height=34,
+            font=("Arial", 10, "bold"),
+            fg_color="#1565C0",
+            hover_color="#0D47A1",
+        )
+        self.btn_vac_test.pack(pady=(0, 6), padx=15, fill="x")
+
         self.btn_mix = ctk.CTkButton(
             button_frame,
             text="Mixed Mode\nWER: ~5-10%",
@@ -672,14 +757,14 @@ class App:
         if current_mic not in devices or "microphone" not in current_mic.lower():
             self.config["mic_device"] = infer_device(current_mic, devices, ["microphone"])
 
-        if current_vac not in devices or not any(token in current_vac.lower() for token in ("cable", "vb-audio")):
-            self.config["vac_device"] = infer_device(DEFAULT_CONFIG["vac_device"], devices, ["cable"])
+        if current_vac not in devices or not all(token in current_vac.lower() for token in ("cable", "output")):
+            self.config["vac_device"] = infer_vac_recording_device(DEFAULT_CONFIG["vac_device"], devices)
 
         if current_speaker not in output_devices or not any(token in current_speaker.lower() for token in ("speaker", "headphone", "realtek")):
-            self.config["speaker_device"] = infer_device(current_speaker, output_devices, ["speaker"])
+            self.config["speaker_device"] = infer_speaker_output_device(current_speaker, output_devices)
 
-        if current_vac_playback not in output_devices or not any(token in current_vac_playback.lower() for token in ("cable", "vb-audio")):
-            self.config["vac_playback_device"] = infer_device(DEFAULT_CONFIG["vac_playback_device"], output_devices, ["cable"])
+        if current_vac_playback not in output_devices or not all(token in current_vac_playback.lower() for token in ("cable", "input")):
+            self.config["vac_playback_device"] = infer_vac_playback_device(DEFAULT_CONFIG["vac_playback_device"], output_devices)
 
         if current_mix not in devices or "voicemeeter" not in current_mix.lower():
             self.config["voicemeeter_device"] = infer_device(DEFAULT_CONFIG["voicemeeter_device"], devices, ["voicemeeter"])
@@ -794,8 +879,9 @@ class App:
             "5. Microphone mode is best for live speech.\n"
             "6. VAC is best for playback-only transcription.\n"
             "7. CABLE Output is the recording side and CABLE Input is the playback side.\n"
-            "8. Mixed mode needs Voicemeeter routing.\n"
-            "9. Use Settings to refresh devices or update device names.",
+            "8. Use Test VAC Routing to send a short tone through the cable.\n"
+            "9. Mixed mode needs Voicemeeter routing.\n"
+            "10. Use Settings to refresh devices or update device names.",
         )
 
     def open_config_file(self) -> None:
@@ -861,6 +947,63 @@ class App:
                 self.status_var.set(f"{record_message} {playback_message}")
             else:
                 self.status_var.set(f"{record_message} {playback_message}".strip())
+
+    def test_vac_routing(self) -> None:
+        if self._vac_test_running:
+            self.status_var.set("VAC routing test is already running.")
+            return
+
+        self.save_form_config()
+        ok_record, record_message = self.device_manager.set_default_recording_device(self.vac_var.get().strip())
+        if not ok_record:
+            self.status_var.set(record_message)
+            return
+
+        ok_playback, playback_message = self.device_manager.set_default_playback_device(self.vac_playback_var.get().strip())
+        if not ok_playback:
+            self.status_var.set(f"{record_message} Playback switch failed: {playback_message}")
+            return
+
+        self.current_mode = "VAC"
+        self.config["last_mode"] = "VAC"
+        save_config(self.config)
+        self.mode_var.set("VAC")
+        self._refresh_mode_hint()
+        self._vac_test_running = True
+        self.btn_vac_test.configure(state="disabled", text="Testing VAC...")
+        self.status_var.set("VAC routing test started. A short tone is being sent through CABLE Input.")
+        threading.Thread(target=self._run_vac_test_tone, daemon=True).start()
+
+    def _run_vac_test_tone(self) -> None:
+        sample_rate = 48000
+        duration_seconds = 1.2
+        amplitude = 0.18
+        frequency_hz = 880.0
+
+        try:
+            timeline = np.linspace(0.0, duration_seconds, int(sample_rate * duration_seconds), endpoint=False)
+            envelope = np.minimum(1.0, timeline * 6.0) * np.minimum(1.0, (duration_seconds - timeline) * 6.0)
+            tone = (np.sin(2 * np.pi * frequency_hz * timeline) * envelope * amplitude).astype(np.float32)
+            sd.play(tone, samplerate=sample_rate, blocking=True)
+            result_message = "VAC routing test completed. If the app meter moved, the route is working."
+        except Exception as exc:
+            result_message = f"VAC routing test failed: {exc}"
+        finally:
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            if self._closing:
+                return
+            try:
+                self.root.after(0, lambda: self._finish_vac_test(result_message))
+            except Exception:
+                return
+
+    def _finish_vac_test(self, message: str) -> None:
+        self._vac_test_running = False
+        self.btn_vac_test.configure(state="normal", text="Test VAC Routing")
+        self.status_var.set(message)
 
     def toggle_mute(self) -> None:
         ok, message = self.device_manager.toggle_mute()

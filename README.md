@@ -8,7 +8,9 @@ Windows desktop utility for switching recording devices between a microphone, a 
 - Device switching through `nircmd.exe`
 - Built-in config editor for device names
 - Auto-detection and refresh for Windows recording devices
+- Auto-detection for VAC recording and playback endpoints
 - Live audio quality panel intended to help reduce transcription errors
+- Built-in `Test VAC Routing` action that sends a short tone through the cable
 - Packaging command for a standalone `.exe`
 
 ## Setup
@@ -46,6 +48,7 @@ In Zoom, set `Microphone` to `Same as System`. Otherwise Windows default-device 
 - `VAC` mode selects `CABLE Output (VB-Audio Virtual Cable)` as the recording device and `CABLE Input (VB-Audio Virtual Cable)` as the Windows playback device.
 - `Microphone` and `Mixed` modes restore playback to the configured speaker device.
 - If an individual app is pinned to a different output device instead of `Default`, change that app back to the Windows default output.
+- Use `Test VAC Routing` to send a short tone through the cable and confirm the app meter responds.
 
 ## Configure Device Names
 
