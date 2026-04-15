@@ -79,6 +79,7 @@ TRANSCRIPTS_DIR = APP_DIR / "transcripts"
 LOGS_DIR = APP_DIR / "logs"
 LOG_PATH = LOGS_DIR / "virtual_audio.log"
 DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
+LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ = 16000
 
 SUPPORTED_TRANSCRIPTION_SUFFIXES = {
     ".aac",
@@ -1068,7 +1069,8 @@ class LiveTranscriptionSession:
         self.input_device_name = input_device["name"].strip()
         self.input_device_index = int(input_device["index"])
         self.input_device_info = input_device["info"]
-        self.sample_rate_hz = int(input_device["sample_rate"])
+        self.sample_rate_hz = LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ
+        self.capture_channels = max(1, min(int(self.input_device_info.get("max_input_channels", 1)), 2))
         self.mode_name = mode_name.strip() or "Unknown"
         self.smart_format = bool(smart_format)
         self.diarize = bool(diarize)
@@ -1158,12 +1160,25 @@ class LiveTranscriptionSession:
             return False, "Failed to start Deepgram live transcription connection."
 
         try:
-            stream = sd.RawInputStream(
+            sd.check_input_settings(
+                device=self.input_device_index,
+                samplerate=self.sample_rate_hz,
+                channels=self.capture_channels,
+            )
+            if self.stream is not None:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+            stream = sd.InputStream(
                 samplerate=self.sample_rate_hz,
                 blocksize=1024,
                 device=self.input_device_index,
-                channels=1,
-                dtype="int16",
+                channels=self.capture_channels,
+                dtype="float32",
                 callback=self._audio_callback,
             )
             self.stream = stream
@@ -1174,7 +1189,7 @@ class LiveTranscriptionSession:
             except Exception:
                 pass
             self.connection = None
-            debug_log(f"[LiveTranscriptionSession] Failed to open RawInputStream for {self.input_device_name}: {exc}", level="error")
+            debug_log(f"[LiveTranscriptionSession] Failed to open InputStream for {self.input_device_name}: {exc}", level="error")
             return False, f"Failed to open input stream on {self.input_device_name}: {exc}"
 
         self.running = True
@@ -1229,12 +1244,25 @@ class LiveTranscriptionSession:
         if status:
             debug_log(f"[LiveTranscriptionSession] Audio callback status: {status}", level="warning")
             self.on_status(f"Audio stream status: {status}")
-        self._report_input_signal(bytes(indata))
+        pcm_bytes = self._pcm16_bytes_from_input(indata)
+        self._report_input_signal(pcm_bytes)
         try:
-            self.connection.send(bytes(indata))
+            self.connection.send(pcm_bytes)
         except Exception as exc:
             self.error_message = f"Audio send failed: {exc}"
             self.on_status(self.error_message)
+
+    def _pcm16_bytes_from_input(self, indata: np.ndarray) -> bytes:
+        samples = np.asarray(indata, dtype=np.float32)
+        if samples.ndim == 2:
+            samples = np.mean(samples, axis=1)
+        samples = np.squeeze(samples)
+        if samples.ndim == 0:
+            samples = np.asarray([float(samples)], dtype=np.float32)
+        samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
+        samples = np.clip(samples, -1.0, 1.0)
+        pcm16 = (samples * 32767.0).astype(np.int16, copy=False)
+        return pcm16.tobytes()
 
     def _on_open(self, client, open=None, **kwargs) -> None:
         debug_log("[LiveTranscriptionSession] Deepgram websocket opened")
@@ -1290,6 +1318,7 @@ class LiveTranscriptionSession:
             "configured_input_device": self.input_device_name,
             "actual_input_device": self.actual_device_name,
             "sample_rate_hz": self.sample_rate_hz,
+            "capture_channels": self.capture_channels,
             "smart_format": self.smart_format,
             "diarize": self.diarize,
             "paragraphs": self.paragraphs,
@@ -1371,6 +1400,7 @@ class App:
         self._pending_vac_test = False
         self._audio_switch_in_progress = False
         self._latest_signal_state = "Unknown"
+        self._resume_monitor_after_live = False
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -2608,6 +2638,10 @@ class App:
             f"[App] Starting live transcription mode={self.current_mode} input={input_device_name} "
             f"index={active_device['index']} sample_rate={active_device['sample_rate']}"
         )
+        self._resume_monitor_after_live = False
+        if self.wer_enabled_var.get():
+            self.monitor.stop()
+            self._resume_monitor_after_live = True
         self._set_live_controls_state(starting=True)
         self.live_transcript_final_text = ""
         self.live_transcript_interim_text = ""
@@ -2712,6 +2746,9 @@ class App:
         if not success:
             debug_log(f"[App] Live transcription failed to start: {message}", level="error")
             self.live_transcription_session = None
+            if self._resume_monitor_after_live and self.wer_enabled_var.get():
+                self.monitor.start()
+            self._resume_monitor_after_live = False
             self._set_live_controls_state(running=False, starting=False)
             self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
             self.live_signal_status_text = "No live input signal available because the session did not start."
@@ -2747,6 +2784,9 @@ class App:
         )
         self.live_signal_status_text = "Stopped. Start live transcription to sample the selected input again."
         self.live_signal_status_label.configure(text="Input signal: " + self.live_signal_status_text, text_color="#C6C6C6")
+        if self._resume_monitor_after_live and self.wer_enabled_var.get():
+            self.monitor.start()
+        self._resume_monitor_after_live = False
         self.status_var.set(message)
 
     def transcribe_media_file(self) -> None:
@@ -3041,7 +3081,10 @@ class App:
         save_config(self.config)
 
         if enabled:
-            self.monitor.start()
+            if self._live_transcription_running or self._live_transcription_starting:
+                self._resume_monitor_after_live = True
+            else:
+                self.monitor.start()
             self.monitor_status_var.set("Excellent")
             self.monitor_level_var.set("Listening for input...")
             self.monitor_detail_var.set("Sampling the current default recording device.")
