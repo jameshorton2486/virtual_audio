@@ -47,6 +47,11 @@ def ensure_local_venv() -> None:
     if not VENV_PYTHON.exists():
         return
 
+    # PyCharm should use its configured interpreter directly instead of being
+    # force-relaunched behind the IDE's back.
+    if os.environ.get("PYCHARM_HOSTED"):
+        return
+
     current_python = Path(sys.executable).resolve()
     target_python = VENV_PYTHON.resolve()
     if current_python == target_python:
@@ -57,7 +62,6 @@ def ensure_local_venv() -> None:
 
 
 load_dotenv_file(ENV_PATH)
-ensure_local_venv()
 
 import customtkinter as ctk
 import numpy as np
@@ -240,6 +244,47 @@ def build_transcript_output_paths(media_path: Path, output_dir: Path = TRANSCRIP
     transcript_path = output_dir / f"{safe_stem}_{timestamp}.txt"
     payload_path = output_dir / f"{safe_stem}_{timestamp}.json"
     return transcript_path, payload_path
+
+
+def build_live_transcript_output_path(output_dir: Path = TRANSCRIPTS_DIR) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"live_transcript_{timestamp}.txt"
+
+
+def build_live_transcript_metadata_path(transcript_path: Path) -> Path:
+    return transcript_path.with_suffix(".json")
+
+
+def normalize_audio_device_name(name: str) -> str:
+    return re.sub(r",\s*(MME|Windows .+|DirectSound|WDM-KS)$", "", name, flags=re.IGNORECASE).strip()
+
+
+def resolve_input_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
+    target = normalize_audio_device_name(name)
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None, None
+
+    exact_match: tuple[int, dict[str, Any]] | None = None
+    partial_match: tuple[int, dict[str, Any]] | None = None
+
+    for index, device in enumerate(devices):
+        if int(device.get("max_input_channels", 0)) <= 0:
+            continue
+        raw_name = str(device.get("name", "")).strip()
+        normalized = normalize_audio_device_name(raw_name)
+        if normalized == target:
+            exact_match = (index, device)
+            break
+        if target and target.lower() in normalized.lower() and partial_match is None:
+            partial_match = (index, device)
+
+    match = exact_match or partial_match
+    if match is None:
+        return None, None
+    return match[0], match[1]
 
 
 def _list_devices(channel_key: str) -> list[str]:
@@ -603,6 +648,207 @@ class DeepgramFileTranscriber:
         return True, f"Transcript saved to {transcript_path.name}\nRaw response saved to {payload_path.name}"
 
 
+class LiveTranscriptionSession:
+    def __init__(
+        self,
+        api_key: str,
+        input_device_name: str,
+        sample_rate_hz: int,
+        mode_name: str,
+        on_transcript,
+        on_status,
+    ):
+        self.api_key = api_key.strip()
+        self.input_device_name = input_device_name.strip()
+        self.sample_rate_hz = sample_rate_hz
+        self.mode_name = mode_name.strip() or "Unknown"
+        self.on_transcript = on_transcript
+        self.on_status = on_status
+        self.connection = None
+        self.stream = None
+        self.transcript_path: Path | None = None
+        self.metadata_path: Path | None = None
+        self.final_lines: list[str] = []
+        self.current_interim = ""
+        self.running = False
+        self.error_message = ""
+        self.actual_device_name = self.input_device_name
+        self.started_at = ""
+        self.stopped_at = ""
+
+    def start(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "Missing DEEPGRAM_API_KEY in .env."
+
+        if not self.input_device_name:
+            return False, "No recording device selected for live transcription."
+
+        device_index, device_info = resolve_input_device(self.input_device_name)
+        if device_index is None or device_info is None:
+            return False, f"Unable to find recording device: {self.input_device_name}"
+
+        try:
+            from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
+        except Exception as exc:
+            return False, f"Deepgram SDK is not available in this Python environment: {exc}"
+
+        self.transcript_path = build_live_transcript_output_path()
+        self.metadata_path = build_live_transcript_metadata_path(self.transcript_path)
+        deepgram = DeepgramClient(self.api_key)
+        self.connection = deepgram.listen.websocket.v("1")
+        self.connection.on(LiveTranscriptionEvents.Open, self._on_open)
+        self.connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
+        self.connection.on(LiveTranscriptionEvents.Error, self._on_error)
+        self.connection.on(LiveTranscriptionEvents.Close, self._on_close)
+
+        options = LiveOptions(
+            model="nova-3",
+            language="en-US",
+            smart_format=True,
+            punctuate=True,
+            interim_results=True,
+            diarize=True,
+            encoding="linear16",
+            channels=1,
+            sample_rate=self.sample_rate_hz,
+        )
+
+        if not self.connection.start(options):
+            return False, "Failed to start Deepgram live transcription connection."
+
+        try:
+            self.stream = sd.RawInputStream(
+                samplerate=self.sample_rate_hz,
+                blocksize=1024,
+                device=device_index,
+                channels=1,
+                dtype="int16",
+                callback=self._audio_callback,
+            )
+            self.stream.start()
+        except Exception as exc:
+            try:
+                self.connection.finish()
+            except Exception:
+                pass
+            self.connection = None
+            return False, f"Failed to open input stream on {self.input_device_name}: {exc}"
+
+        self.running = True
+        self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.actual_device_name = normalize_audio_device_name(str(device_info.get("name", self.input_device_name)))
+        self._write_metadata(status="running")
+        return True, f"Live transcription started from {self.actual_device_name}."
+
+    def stop(self) -> tuple[bool, str]:
+        self.running = False
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
+        if self.connection is not None:
+            try:
+                self.connection.finish()
+            except Exception:
+                pass
+            self.connection = None
+
+        transcript_body = "\n".join(line for line in self.final_lines if line.strip()).strip()
+        transcript_text = transcript_body or "[No final transcript captured]"
+        output_path = self.transcript_path or build_live_transcript_output_path()
+        self.stopped_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            output_path.write_text(transcript_text, encoding="utf-8")
+        except OSError as exc:
+            return False, f"Failed to save live transcript: {exc}"
+
+        self._write_metadata(status="error" if self.error_message else "completed")
+
+        if self.error_message:
+            return False, f"{self.error_message}\nPartial transcript saved to {output_path.name}"
+        return True, f"Live transcript saved to {output_path.name}"
+
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
+        if not self.running or self.connection is None:
+            return
+        if status:
+            self.on_status(f"Audio stream status: {status}")
+        try:
+            self.connection.send(bytes(indata))
+        except Exception as exc:
+            self.error_message = f"Audio send failed: {exc}"
+            self.on_status(self.error_message)
+
+    def _on_open(self, client, open=None, **kwargs) -> None:
+        self.on_status("Deepgram live connection opened.")
+
+    def _on_close(self, client, close=None, **kwargs) -> None:
+        self.on_status("Deepgram live connection closed.")
+
+    def _on_error(self, client, error=None, **kwargs) -> None:
+        self.error_message = str(error) if error else "Deepgram live transcription error."
+        self.on_status(self.error_message)
+
+    def _on_transcript(self, client, result=None, **kwargs) -> None:
+        if result is None:
+            return
+
+        try:
+            alternatives = result.channel.alternatives
+            transcript = alternatives[0].transcript.strip() if alternatives else ""
+        except Exception:
+            transcript = ""
+
+        if not transcript:
+            return
+
+        if getattr(result, "is_final", False):
+            self.final_lines.append(transcript)
+            self.current_interim = ""
+            self._write_partial_transcript()
+            combined = "\n".join(self.final_lines)
+            self.on_transcript(combined, "")
+        else:
+            self.current_interim = transcript
+            combined = "\n".join(self.final_lines)
+            self.on_transcript(combined, self.current_interim)
+
+    def _write_partial_transcript(self) -> None:
+        if self.transcript_path is None:
+            return
+        transcript_body = "\n".join(line for line in self.final_lines if line.strip()).strip()
+        if not transcript_body:
+            return
+        try:
+            self.transcript_path.write_text(transcript_body, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _write_metadata(self, status: str) -> None:
+        if self.metadata_path is None:
+            return
+        payload = {
+            "status": status,
+            "mode": self.mode_name,
+            "configured_input_device": self.input_device_name,
+            "actual_input_device": self.actual_device_name,
+            "sample_rate_hz": self.sample_rate_hz,
+            "started_at": self.started_at,
+            "stopped_at": self.stopped_at,
+            "final_segment_count": len(self.final_lines),
+            "error_message": self.error_message,
+            "transcript_file": self.transcript_path.name if self.transcript_path else "",
+        }
+        try:
+            self.metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+
 class App:
     def __init__(self) -> None:
         self.config = load_config()
@@ -623,6 +869,11 @@ class App:
         self._closing = False
         self._vac_test_running = False
         self._transcription_running = False
+        self._live_transcription_running = False
+        self._live_transcription_starting = False
+        self.live_transcription_session: LiveTranscriptionSession | None = None
+        self.live_transcript_final_text = ""
+        self.live_transcript_interim_text = ""
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -888,6 +1139,7 @@ class App:
 
         self._build_direct_device_controls()
         self._build_transcription_controls()
+        self._build_live_transcription_controls()
 
         util_frame = ctk.CTkFrame(self.ui_parent)
         util_frame.pack(pady=6, padx=20, fill="x")
@@ -1072,6 +1324,100 @@ class App:
             font=("Arial", 10),
         ).pack(side="left", padx=(6, 0), expand=True, fill="x")
 
+    def _build_live_transcription_controls(self) -> None:
+        live_frame = ctk.CTkFrame(self.ui_parent)
+        live_frame.pack(pady=6, padx=20, fill="x")
+
+        ctk.CTkLabel(
+            live_frame,
+            text="Live Transcription",
+            font=("Arial", 12, "bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 4))
+
+        ctk.CTkLabel(
+            live_frame,
+            text="Streams the currently active recording device to Deepgram and saves the session transcript automatically.",
+            font=("Arial", 9),
+            text_color="#C6C6C6",
+            wraplength=460,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        self.live_transcription_device_label = ctk.CTkLabel(
+            live_frame,
+            text="Live input source: " + self._current_live_input_device_name(),
+            font=("Arial", 9, "bold"),
+            text_color="#8AB4F8",
+            wraplength=460,
+            justify="left",
+        )
+        self.live_transcription_device_label.pack(anchor="w", padx=12, pady=(0, 6))
+
+        api_key_ready = bool(get_deepgram_api_key())
+        self.live_transcription_key_label = ctk.CTkLabel(
+            live_frame,
+            text="Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env",
+            font=("Arial", 9, "bold"),
+            text_color="#66BB6A" if api_key_ready else "#F9A825",
+            wraplength=460,
+            justify="left",
+        )
+        self.live_transcription_key_label.pack(anchor="w", padx=12, pady=(0, 6))
+
+        live_actions = ctk.CTkFrame(live_frame, fg_color="transparent")
+        live_actions.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.btn_start_live = ctk.CTkButton(
+            live_actions,
+            text="Start Live Transcription",
+            command=self.start_live_transcription,
+            height=34,
+            font=("Arial", 10, "bold"),
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+        )
+        self.btn_start_live.pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        self.btn_stop_live = ctk.CTkButton(
+            live_actions,
+            text="Stop Live Transcription",
+            command=self.stop_live_transcription,
+            height=34,
+            font=("Arial", 10, "bold"),
+            fg_color="#B71C1C",
+            hover_color="#7F1010",
+            state="disabled",
+        )
+        self.btn_stop_live.pack(side="left", padx=(6, 0), expand=True, fill="x")
+
+        self.live_transcription_status_label = ctk.CTkLabel(
+            live_frame,
+            text="Idle",
+            font=("Arial", 9, "bold"),
+            text_color="#C6C6C6",
+            wraplength=460,
+            justify="left",
+        )
+        self.live_transcription_status_label.pack(anchor="w", padx=12, pady=(0, 6))
+
+        self.live_transcript_box = ctk.CTkTextbox(
+            live_frame,
+            height=180,
+            font=("Consolas", 10),
+            wrap="word",
+        )
+        self.live_transcript_box.pack(fill="x", padx=12, pady=(0, 10))
+        self.live_transcript_box.insert("1.0", "Live transcript will appear here.")
+        self.live_transcript_box.configure(state="disabled")
+
+        ctk.CTkButton(
+            live_frame,
+            text="Open Transcripts Folder",
+            command=self.open_transcripts_folder,
+            height=30,
+            font=("Arial", 9),
+        ).pack(fill="x", padx=12, pady=(0, 10))
+
     def _add_device_selector(self, parent, label: str, variable: ctk.StringVar, devices: list[str]):
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=10)
         menu = ctk.CTkComboBox(
@@ -1127,6 +1473,9 @@ class App:
         save_config(self.config)
 
     def refresh_detected_devices(self) -> None:
+        if self._live_transcription_running or self._live_transcription_starting:
+            self.status_var.set("Stop live transcription before refreshing device lists.")
+            return
         self.detected_input_devices = list_input_devices()
         self.detected_output_devices = list_output_devices()
         self._hydrate_config_from_detected_devices()
@@ -1212,11 +1561,17 @@ class App:
         self.settings_window = None
 
     def apply_selected_recording_device(self) -> None:
+        if self._live_transcription_running or self._live_transcription_starting:
+            self.status_var.set("Stop live transcription before changing the recording device.")
+            return
         device_name = self.direct_recording_var.get().strip()
         ok, message = self.device_manager.set_default_recording_device(device_name)
         self.status_var.set(message)
 
     def apply_selected_playback_device(self) -> None:
+        if self._live_transcription_running or self._live_transcription_starting:
+            self.status_var.set("Stop live transcription before changing the playback device.")
+            return
         device_name = self.direct_playback_var.get().strip()
         ok, message = self.device_manager.set_default_playback_device(device_name)
         self.status_var.set(message)
@@ -1314,6 +1669,170 @@ class App:
             return
         self.status_var.set(f"Open {TRANSCRIPTS_DIR} manually on this platform.")
 
+    def _current_live_input_device_name(self) -> str:
+        if self.current_mode == "VAC":
+            return self.vac_var.get().strip() or "Not configured"
+        if self.current_mode == "Mixed":
+            return self.mix_var.get().strip() or "Not configured"
+        return self.mic_var.get().strip() or "Not configured"
+
+    def _refresh_live_transcription_labels(self) -> None:
+        label = getattr(self, "live_transcription_device_label", None)
+        if label is not None:
+            label.configure(text="Live input source: " + self._current_live_input_device_name())
+        key_label = getattr(self, "live_transcription_key_label", None)
+        if key_label is not None:
+            api_key_ready = bool(get_deepgram_api_key())
+            key_label.configure(
+                text="Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env",
+                text_color="#66BB6A" if api_key_ready else "#F9A825",
+            )
+
+    def _set_live_transcript_box_text(self, text: str) -> None:
+        self.live_transcript_box.configure(state="normal")
+        self.live_transcript_box.delete("1.0", "end")
+        self.live_transcript_box.insert("1.0", text)
+        self.live_transcript_box.configure(state="disabled")
+
+    def _render_live_transcript(self) -> None:
+        final_text = self.live_transcript_final_text.strip()
+        interim_text = self.live_transcript_interim_text.strip()
+        sections = []
+        if final_text:
+            sections.append(final_text)
+        if interim_text:
+            sections.append(f"[Listening] {interim_text}")
+        rendered = "\n\n".join(sections) if sections else "Live transcript will appear here."
+        self._set_live_transcript_box_text(rendered)
+        try:
+            self.live_transcript_box.see("end")
+        except Exception:
+            pass
+
+    def _queue_live_transcript_update(self, final_text: str, interim_text: str) -> None:
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self._apply_live_transcript_update(final_text, interim_text))
+        except Exception:
+            return
+
+    def _apply_live_transcript_update(self, final_text: str, interim_text: str) -> None:
+        self.live_transcript_final_text = final_text
+        self.live_transcript_interim_text = interim_text
+        self._render_live_transcript()
+
+    def _queue_live_status_update(self, message: str) -> None:
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self._apply_live_status_update(message))
+        except Exception:
+            return
+
+    def _apply_live_status_update(self, message: str) -> None:
+        lowered = message.lower()
+        is_problem = any(token in lowered for token in ("error", "failed", "unable"))
+        self.live_transcription_status_label.configure(
+            text=message,
+            text_color="#F57C00" if is_problem else ("#66BB6A" if self._live_transcription_running else ("#F9A825" if self._live_transcription_starting else "#C6C6C6")),
+        )
+        self.status_var.set(message)
+
+    def _set_live_controls_state(self, *, running: bool = False, starting: bool = False) -> None:
+        self._live_transcription_running = running
+        self._live_transcription_starting = starting
+        if hasattr(self, "btn_start_live") and self.btn_start_live.winfo_exists():
+            self.btn_start_live.configure(
+                state="disabled" if (running or starting) else "normal",
+                text="Starting..." if starting else "Start Live Transcription",
+            )
+        if hasattr(self, "btn_stop_live") and self.btn_stop_live.winfo_exists():
+            self.btn_stop_live.configure(state="normal" if running else "disabled")
+
+    def start_live_transcription(self) -> None:
+        if self._live_transcription_running or self._live_transcription_starting:
+            self.status_var.set("Live transcription is already running.")
+            return
+
+        if self._vac_test_running:
+            self.status_var.set("Wait for the VAC routing test to finish before starting live transcription.")
+            return
+
+        api_key = get_deepgram_api_key()
+        if not api_key:
+            messagebox.showerror(
+                "Deepgram API Key Missing",
+                "Add DEEPGRAM_API_KEY to .env before starting live transcription.",
+            )
+            return
+
+        input_device_name = self._current_live_input_device_name()
+        self._set_live_controls_state(starting=True)
+        self.live_transcript_final_text = ""
+        self.live_transcript_interim_text = ""
+        self._render_live_transcript()
+        self.live_transcription_status_label.configure(text="Connecting to Deepgram live transcription...", text_color="#F9A825")
+        self.status_var.set(f"Starting live transcription from {input_device_name}...")
+        threading.Thread(
+            target=self._start_live_transcription_worker,
+            args=(api_key, input_device_name, self.current_mode),
+            daemon=True,
+        ).start()
+
+    def _start_live_transcription_worker(self, api_key: str, input_device_name: str, mode_name: str) -> None:
+        session = LiveTranscriptionSession(
+            api_key=api_key,
+            input_device_name=input_device_name,
+            sample_rate_hz=int(self.config["sample_rate_hz"]),
+            mode_name=mode_name,
+            on_transcript=self._queue_live_transcript_update,
+            on_status=self._queue_live_status_update,
+        )
+        success, message = session.start()
+        if self._closing:
+            if success:
+                session.stop()
+            return
+        try:
+            self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
+        except Exception:
+            if success:
+                session.stop()
+            return
+
+    def _finish_start_live_transcription(self, success: bool, message: str, session: LiveTranscriptionSession) -> None:
+        if not success:
+            self.live_transcription_session = None
+            self._set_live_controls_state(running=False, starting=False)
+            self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
+            messagebox.showerror("Live Transcription Failed", message)
+            self.status_var.set(message)
+            return
+
+        self.live_transcription_session = session
+        self._set_live_controls_state(running=True, starting=False)
+        self.live_transcription_status_label.configure(text=message, text_color="#66BB6A")
+        self.status_var.set(message)
+
+    def stop_live_transcription(self) -> None:
+        if self._live_transcription_starting:
+            self.status_var.set("Live transcription is still starting. Wait a moment and stop it again.")
+            return
+
+        if not self._live_transcription_running or self.live_transcription_session is None:
+            self.status_var.set("Live transcription is not running.")
+            return
+
+        success, message = self.live_transcription_session.stop()
+        self._set_live_controls_state(running=False, starting=False)
+        self.live_transcription_session = None
+        self.live_transcription_status_label.configure(
+            text=message,
+            text_color="#66BB6A" if success else "#F57C00",
+        )
+        self.status_var.set(message)
+
     def transcribe_media_file(self) -> None:
         if self._transcription_running:
             self.status_var.set("A transcription job is already running.")
@@ -1379,6 +1898,9 @@ class App:
             self.status_var.set("Setup notes shown.")
 
     def switch_mode(self, mode_name: str, device_name: str) -> None:
+        if self._live_transcription_running or self._live_transcription_starting:
+            self.status_var.set("Stop live transcription before switching modes.")
+            return
         self.save_form_config()
         ok_record, record_message = self.device_manager.set_default_recording_device(device_name)
         if not ok_record:
@@ -1580,6 +2102,7 @@ class App:
         self.mode_badge_label.configure(text=ui_config["badge"], fg_color=ui_config["accent"])
         self.mode_route_label.configure(text=ui_config["route"])
         self.mode_device_label.configure(text=self._current_mode_device_summary())
+        self._refresh_live_transcription_labels()
 
     def _current_mode_device_summary(self) -> str:
         if self.current_mode == "VAC":
@@ -1597,6 +2120,9 @@ class App:
     def on_close(self) -> None:
         self._closing = True
         self._close_settings_window()
+        if self.live_transcription_session is not None:
+            self.live_transcription_session.stop()
+            self.live_transcription_session = None
         self.monitor.stop()
         if self.root.winfo_exists():
             self.save_form_config()
@@ -1607,4 +2133,5 @@ class App:
 
 
 if __name__ == "__main__":
+    ensure_local_venv()
     App().run()

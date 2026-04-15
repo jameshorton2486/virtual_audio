@@ -1,3 +1,4 @@
 customtkinter
+deepgram-sdk==3.7.0
 numpy
 sounddevice

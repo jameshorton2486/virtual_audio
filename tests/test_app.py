@@ -43,6 +43,28 @@ class DeviceHelpersTests(unittest.TestCase):
             self.assertEqual(payload_path.suffix, ".json")
             self.assertIn("zoom_recording", transcript_path.name)
 
+    def test_build_live_transcript_output_path_uses_timestamped_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = app.build_live_transcript_output_path(output_dir=Path(temp_dir))
+
+            self.assertEqual(output_path.parent, Path(temp_dir))
+            self.assertEqual(output_path.suffix, ".txt")
+            self.assertIn("live_transcript_", output_path.name)
+
+    def test_build_live_transcript_metadata_path_uses_same_stem(self) -> None:
+        transcript_path = Path("transcripts") / "live_transcript_20260414_210000.txt"
+        metadata_path = app.build_live_transcript_metadata_path(transcript_path)
+
+        self.assertEqual(metadata_path.parent, transcript_path.parent)
+        self.assertEqual(metadata_path.suffix, ".json")
+        self.assertEqual(metadata_path.stem, transcript_path.stem)
+
+    def test_normalize_audio_device_name_strips_backend_suffix(self) -> None:
+        self.assertEqual(
+            app.normalize_audio_device_name("CABLE Output (VB-Audio Virtual Cable), Windows WASAPI"),
+            "CABLE Output (VB-Audio Virtual Cable)",
+        )
+
     def test_infer_vac_recording_device_prefers_cable_output(self) -> None:
         devices = [
             "CABLE Input (VB-Audio Virtual Cable)",
@@ -83,7 +105,7 @@ class DeviceHelpersTests(unittest.TestCase):
             calls.append(command)
             return subprocess.CompletedProcess(command, 0)
 
-        with patch("app.NIRCMD_PATH.exists", return_value=True), patch("app.subprocess.run", side_effect=fake_run):
+        with patch("pathlib.Path.exists", return_value=True), patch("app.subprocess.run", side_effect=fake_run):
             ok, message = app.AudioDeviceManager.set_default_recording_device("CABLE Output (VB-Audio Virtual Cable)")
 
         self.assertTrue(ok)
@@ -104,7 +126,7 @@ class DeviceHelpersTests(unittest.TestCase):
             calls.append(command)
             return subprocess.CompletedProcess(command, 0)
 
-        with patch("app.NIRCMD_PATH.exists", return_value=True), patch("app.subprocess.run", side_effect=fake_run):
+        with patch("pathlib.Path.exists", return_value=True), patch("app.subprocess.run", side_effect=fake_run):
             ok, message = app.AudioDeviceManager.set_default_playback_device("CABLE Input (VB-Audio Virtual Cable)")
 
         self.assertTrue(ok)

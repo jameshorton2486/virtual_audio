@@ -12,6 +12,7 @@ Windows desktop utility for switching recording devices between a microphone, a 
 - Live audio quality panel intended to help reduce transcription errors
 - Built-in `Test VAC Routing` action that sends a short tone through the cable
 - Built-in file transcription for Zoom recordings and saved media using Deepgram
+- Built-in live transcription panel for active microphone, VAC, or mixed input
 - Packaging command for a standalone `.exe`
 
 ## Setup
@@ -48,7 +49,7 @@ DEEPGRAM_API_KEY=your_real_key_here
 .\.venv\Scripts\python.exe app.py
 ```
 
-`app.py` also auto-restarts itself inside `.venv` on Windows, so `python app.py` will still hand off to the local project environment if it exists.
+`app.py` also auto-restarts itself inside `.venv` on Windows when launched from a normal shell, so `python app.py` will still hand off to the local project environment if it exists. PyCharm-hosted runs keep the interpreter you selected in the IDE.
 You can also just double-click `run_app.bat`.
 
 ## Important Zoom Setting
@@ -78,6 +79,22 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - Use the `Transcribe File` button in the app for saved Zoom recordings, downloaded videos, and other media files
 - Supported file types include `wav`, `mp3`, `m4a`, `mp4`, `webm`, `flac`, `ogg`, and more
 - Transcript text and the full Deepgram JSON response are saved into the local `transcripts` folder
+
+## Live Transcription
+
+- Use `Start Live Transcription` to stream the currently active recording device to Deepgram in real time
+- `Microphone` mode streams your live mic
+- `VAC` mode streams routed playback audio such as Zoom output or other system audio
+- `Mixed` mode streams the configured Voicemeeter mixed path
+- The rolling transcript appears in the app, auto-scrolls, and is saved automatically into the local `transcripts` folder when you stop
+- Each live session also saves a matching `.json` metadata file with mode, device, timestamps, and status
+- While live transcription is running, mode and device switching are intentionally blocked so the capture source stays stable
+
+## Recommended Live Workflows
+
+- Zoom deposition audio only: switch to `VAC`, make sure Windows playback is routed to `CABLE Input`, then start live transcription
+- Your own live speech: switch to `Microphone`, confirm your mic is the active recording device, then start live transcription
+- Narration over routed playback: switch to `Mixed`, verify Voicemeeter routing first, then start live transcription
 
 ## WER Notes
 
