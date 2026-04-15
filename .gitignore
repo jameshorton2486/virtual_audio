@@ -9,6 +9,8 @@ __pycache__/
 
 build/
 dist/
+logs/
+transcripts/
 
 compact-ui-screenshot.png
 compact-ui-window.png

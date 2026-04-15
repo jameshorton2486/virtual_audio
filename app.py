@@ -1,4 +1,5 @@
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -58,6 +59,7 @@ def ensure_local_venv() -> None:
         return
 
     # Restart inside the project venv so local dependencies are always used.
+    print(f"[virtual_audio] Restarting in local venv: {target_python}")
     os.execv(str(target_python), [str(target_python), str(APP_DIR / "app.py"), *sys.argv[1:]])
 
 
@@ -73,6 +75,8 @@ from meter_widget import AudioLevelMeter
 CONFIG_PATH = APP_DIR / "config.json"
 NIRCMD_PATH = APP_DIR / "nircmd.exe"
 TRANSCRIPTS_DIR = APP_DIR / "transcripts"
+LOGS_DIR = APP_DIR / "logs"
+LOG_PATH = LOGS_DIR / "virtual_audio.log"
 DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 
 SUPPORTED_TRANSCRIPTION_SUFFIXES = {
@@ -95,6 +99,11 @@ DEFAULT_CONFIG = {
     "speaker_device": "Speakers (Realtek Audio)",
     "vac_playback_device": "CABLE Input (VB-Audio Virtual Cable)",
     "voicemeeter_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+    "deepgram_smart_format": True,
+    "deepgram_diarize": True,
+    "deepgram_paragraphs": True,
+    "deepgram_filler_words": True,
+    "deepgram_numerals": True,
     "wer_mode_enabled": True,
     "quality_check_interval_seconds": 2.0,
     "sample_rate_hz": 24000,
@@ -153,6 +162,36 @@ MODE_UI = {
 }
 
 
+def setup_logging() -> logging.Logger:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("virtual_audio")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    logger.propagate = False
+    return logger
+
+
+LOGGER = setup_logging()
+
+
+def debug_log(message: str, level: str = "info") -> None:
+    print(message)
+    log_fn = getattr(LOGGER, level, LOGGER.info)
+    log_fn(message)
+
+
 def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -176,6 +215,26 @@ def sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
     sanitized["wer_mode_enabled"] = _coerce_bool(
         sanitized.get("wer_mode_enabled"),
         bool(DEFAULT_CONFIG["wer_mode_enabled"]),
+    )
+    sanitized["deepgram_smart_format"] = _coerce_bool(
+        sanitized.get("deepgram_smart_format"),
+        bool(DEFAULT_CONFIG["deepgram_smart_format"]),
+    )
+    sanitized["deepgram_diarize"] = _coerce_bool(
+        sanitized.get("deepgram_diarize"),
+        bool(DEFAULT_CONFIG["deepgram_diarize"]),
+    )
+    sanitized["deepgram_paragraphs"] = _coerce_bool(
+        sanitized.get("deepgram_paragraphs"),
+        bool(DEFAULT_CONFIG["deepgram_paragraphs"]),
+    )
+    sanitized["deepgram_filler_words"] = _coerce_bool(
+        sanitized.get("deepgram_filler_words"),
+        bool(DEFAULT_CONFIG["deepgram_filler_words"]),
+    )
+    sanitized["deepgram_numerals"] = _coerce_bool(
+        sanitized.get("deepgram_numerals"),
+        bool(DEFAULT_CONFIG["deepgram_numerals"]),
     )
 
     try:
@@ -444,6 +503,7 @@ class AudioDeviceManager:
             raise FileNotFoundError(f"Missing {NIRCMD_PATH.name} in {APP_DIR}.")
 
         for role in ("0", "1", "2"):
+            debug_log(f"[AudioDeviceManager] Setting default device role={role} name={device_name}")
             subprocess.run(
                 [str(NIRCMD_PATH), "setdefaultsounddevice", device_name, role],
                 check=True,
@@ -454,23 +514,29 @@ class AudioDeviceManager:
     @classmethod
     def set_default_recording_device(cls, device_name: str) -> tuple[bool, str]:
         try:
+            debug_log(f"[AudioDeviceManager] Request to switch recording device -> {device_name}")
             cls._set_default_device(device_name)
             return True, f"Switched recording device to {device_name} for all Windows audio roles."
         except subprocess.CalledProcessError as exc:
             error_text = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
+            debug_log(f"[AudioDeviceManager] Recording device switch failed: {error_text or exc}", level="error")
             return False, error_text or f"Failed to switch to {device_name}."
         except Exception as exc:
+            debug_log(f"[AudioDeviceManager] Recording device switch exception: {exc}", level="error")
             return False, str(exc)
 
     @classmethod
     def set_default_playback_device(cls, device_name: str) -> tuple[bool, str]:
         try:
+            debug_log(f"[AudioDeviceManager] Request to switch playback device -> {device_name}")
             cls._set_default_device(device_name)
             return True, f"Switched playback device to {device_name} for all Windows audio roles."
         except subprocess.CalledProcessError as exc:
             error_text = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
+            debug_log(f"[AudioDeviceManager] Playback device switch failed: {error_text or exc}", level="error")
             return False, error_text or f"Failed to switch to {device_name}."
         except Exception as exc:
+            debug_log(f"[AudioDeviceManager] Playback device switch exception: {exc}", level="error")
             return False, str(exc)
 
     @staticmethod
@@ -479,6 +545,7 @@ class AudioDeviceManager:
             return False, f"Missing {NIRCMD_PATH.name} in {APP_DIR}."
 
         try:
+            debug_log("[AudioDeviceManager] Toggling mute on default recording device")
             subprocess.run(
                 [str(NIRCMD_PATH), "mutesysvolume", "2", "default_record"],
                 check=True,
@@ -488,8 +555,10 @@ class AudioDeviceManager:
             return True, "Toggled mute on the default recording device."
         except subprocess.CalledProcessError as exc:
             error_text = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
+            debug_log(f"[AudioDeviceManager] Toggle mute failed: {error_text or exc}", level="error")
             return False, error_text or "Failed to toggle mute."
         except Exception as exc:
+            debug_log(f"[AudioDeviceManager] Toggle mute exception: {exc}", level="error")
             return False, str(exc)
 
 
@@ -580,10 +649,29 @@ class AudioQualityMonitor:
 
 
 class DeepgramFileTranscriber:
-    def __init__(self, api_key: str):
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        smart_format: bool = True,
+        diarize: bool = True,
+        paragraphs: bool = True,
+        filler_words: bool = True,
+        numerals: bool = True,
+    ):
         self.api_key = api_key.strip()
+        self.smart_format = bool(smart_format)
+        self.diarize = bool(diarize)
+        self.paragraphs = bool(paragraphs)
+        self.filler_words = bool(filler_words)
+        self.numerals = bool(numerals)
 
     def transcribe_file(self, media_path: Path, output_dir: Path = TRANSCRIPTS_DIR) -> tuple[bool, str]:
+        debug_log(
+            f"[DeepgramFileTranscriber] Starting file transcription for {media_path} "
+            f"smart_format={self.smart_format} diarize={self.diarize} paragraphs={self.paragraphs} "
+            f"filler_words={self.filler_words} numerals={self.numerals}"
+        )
         if not self.api_key:
             return False, "Missing DEEPGRAM_API_KEY in .env."
 
@@ -599,10 +687,12 @@ class DeepgramFileTranscriber:
         query = urllib.parse.urlencode(
             {
                 "model": "nova-3",
-                "smart_format": "true",
+                "smart_format": "true" if self.smart_format else "false",
                 "punctuate": "true",
-                "paragraphs": "true",
-                "diarize": "true",
+                "paragraphs": "true" if self.paragraphs else "false",
+                "diarize": "true" if self.diarize else "false",
+                "filler_words": "true" if self.filler_words else "false",
+                "numerals": "true" if self.numerals else "false",
                 "detect_language": "true",
             }
         )
@@ -627,10 +717,13 @@ class DeepgramFileTranscriber:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="ignore").strip()
+            debug_log(f"[DeepgramFileTranscriber] HTTP error for {media_path.name}: {error_body or exc}", level="error")
             return False, error_body or f"Deepgram request failed with HTTP {exc.code}."
         except urllib.error.URLError as exc:
+            debug_log(f"[DeepgramFileTranscriber] Network error for {media_path.name}: {exc.reason}", level="error")
             return False, f"Unable to reach Deepgram: {exc.reason}"
         except json.JSONDecodeError as exc:
+            debug_log(f"[DeepgramFileTranscriber] Invalid JSON for {media_path.name}: {exc}", level="error")
             return False, f"Deepgram returned invalid JSON: {exc}"
 
         transcript_text = extract_transcript_text(payload)
@@ -640,11 +733,14 @@ class DeepgramFileTranscriber:
             transcript_path.write_text(transcript_text or "[No transcript text returned]", encoding="utf-8")
             payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError as exc:
+            debug_log(f"[DeepgramFileTranscriber] Failed to save outputs for {media_path.name}: {exc}", level="error")
             return False, f"Failed to save transcript output: {exc}"
 
         if not transcript_text:
+            debug_log(f"[DeepgramFileTranscriber] No transcript text returned for {media_path.name}", level="warning")
             return False, f"Deepgram returned no transcript text. Saved raw response to {payload_path.name}."
 
+        debug_log(f"[DeepgramFileTranscriber] Completed file transcription for {media_path.name} -> {transcript_path.name}")
         return True, f"Transcript saved to {transcript_path.name}\nRaw response saved to {payload_path.name}"
 
 
@@ -655,6 +751,11 @@ class LiveTranscriptionSession:
         input_device_name: str,
         sample_rate_hz: int,
         mode_name: str,
+        smart_format: bool,
+        diarize: bool,
+        paragraphs: bool,
+        filler_words: bool,
+        numerals: bool,
         on_transcript,
         on_status,
     ):
@@ -662,6 +763,11 @@ class LiveTranscriptionSession:
         self.input_device_name = input_device_name.strip()
         self.sample_rate_hz = sample_rate_hz
         self.mode_name = mode_name.strip() or "Unknown"
+        self.smart_format = bool(smart_format)
+        self.diarize = bool(diarize)
+        self.paragraphs = bool(paragraphs)
+        self.filler_words = bool(filler_words)
+        self.numerals = bool(numerals)
         self.on_transcript = on_transcript
         self.on_status = on_status
         self.connection = None
@@ -677,6 +783,12 @@ class LiveTranscriptionSession:
         self.stopped_at = ""
 
     def start(self) -> tuple[bool, str]:
+        debug_log(
+            f"[LiveTranscriptionSession] Start requested mode={self.mode_name} "
+            f"configured_device={self.input_device_name} smart_format={self.smart_format} "
+            f"diarize={self.diarize} paragraphs={self.paragraphs} "
+            f"filler_words={self.filler_words} numerals={self.numerals}"
+        )
         if not self.api_key:
             return False, "Missing DEEPGRAM_API_KEY in .env."
 
@@ -685,6 +797,7 @@ class LiveTranscriptionSession:
 
         device_index, device_info = resolve_input_device(self.input_device_name)
         if device_index is None or device_info is None:
+            debug_log(f"[LiveTranscriptionSession] Unable to resolve input device: {self.input_device_name}", level="error")
             return False, f"Unable to find recording device: {self.input_device_name}"
 
         try:
@@ -704,16 +817,20 @@ class LiveTranscriptionSession:
         options = LiveOptions(
             model="nova-3",
             language="en-US",
-            smart_format=True,
+            smart_format=self.smart_format,
             punctuate=True,
             interim_results=True,
-            diarize=True,
+            diarize=self.diarize,
+            paragraphs=self.paragraphs,
+            filler_words=self.filler_words,
+            numerals=self.numerals,
             encoding="linear16",
             channels=1,
             sample_rate=self.sample_rate_hz,
         )
 
         if not self.connection.start(options):
+            debug_log("[LiveTranscriptionSession] Deepgram websocket start returned false", level="error")
             return False, "Failed to start Deepgram live transcription connection."
 
         try:
@@ -732,15 +849,21 @@ class LiveTranscriptionSession:
             except Exception:
                 pass
             self.connection = None
+            debug_log(f"[LiveTranscriptionSession] Failed to open RawInputStream for {self.input_device_name}: {exc}", level="error")
             return False, f"Failed to open input stream on {self.input_device_name}: {exc}"
 
         self.running = True
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.actual_device_name = normalize_audio_device_name(str(device_info.get("name", self.input_device_name)))
+        debug_log(
+            f"[LiveTranscriptionSession] Running mode={self.mode_name} resolved_device={self.actual_device_name} "
+            f"device_index={device_index} sample_rate={self.sample_rate_hz}"
+        )
         self._write_metadata(status="running")
         return True, f"Live transcription started from {self.actual_device_name}."
 
     def stop(self) -> tuple[bool, str]:
+        debug_log(f"[LiveTranscriptionSession] Stop requested mode={self.mode_name} resolved_device={self.actual_device_name}")
         self.running = False
         if self.stream is not None:
             try:
@@ -769,13 +892,16 @@ class LiveTranscriptionSession:
         self._write_metadata(status="error" if self.error_message else "completed")
 
         if self.error_message:
+            debug_log(f"[LiveTranscriptionSession] Stopped with error: {self.error_message}", level="warning")
             return False, f"{self.error_message}\nPartial transcript saved to {output_path.name}"
+        debug_log(f"[LiveTranscriptionSession] Completed successfully -> {output_path.name}")
         return True, f"Live transcript saved to {output_path.name}"
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if not self.running or self.connection is None:
             return
         if status:
+            debug_log(f"[LiveTranscriptionSession] Audio callback status: {status}", level="warning")
             self.on_status(f"Audio stream status: {status}")
         try:
             self.connection.send(bytes(indata))
@@ -784,13 +910,16 @@ class LiveTranscriptionSession:
             self.on_status(self.error_message)
 
     def _on_open(self, client, open=None, **kwargs) -> None:
+        debug_log("[LiveTranscriptionSession] Deepgram websocket opened")
         self.on_status("Deepgram live connection opened.")
 
     def _on_close(self, client, close=None, **kwargs) -> None:
+        debug_log("[LiveTranscriptionSession] Deepgram websocket closed")
         self.on_status("Deepgram live connection closed.")
 
     def _on_error(self, client, error=None, **kwargs) -> None:
         self.error_message = str(error) if error else "Deepgram live transcription error."
+        debug_log(f"[LiveTranscriptionSession] Deepgram error: {self.error_message}", level="error")
         self.on_status(self.error_message)
 
     def _on_transcript(self, client, result=None, **kwargs) -> None:
@@ -809,11 +938,13 @@ class LiveTranscriptionSession:
         if getattr(result, "is_final", False):
             self.final_lines.append(transcript)
             self.current_interim = ""
+            debug_log(f"[LiveTranscriptionSession] Final transcript segment #{len(self.final_lines)}: {transcript[:120]}")
             self._write_partial_transcript()
             combined = "\n".join(self.final_lines)
             self.on_transcript(combined, "")
         else:
             self.current_interim = transcript
+            debug_log(f"[LiveTranscriptionSession] Interim transcript: {transcript[:120]}")
             combined = "\n".join(self.final_lines)
             self.on_transcript(combined, self.current_interim)
 
@@ -837,6 +968,11 @@ class LiveTranscriptionSession:
             "configured_input_device": self.input_device_name,
             "actual_input_device": self.actual_device_name,
             "sample_rate_hz": self.sample_rate_hz,
+            "smart_format": self.smart_format,
+            "diarize": self.diarize,
+            "paragraphs": self.paragraphs,
+            "filler_words": self.filler_words,
+            "numerals": self.numerals,
             "started_at": self.started_at,
             "stopped_at": self.stopped_at,
             "final_segment_count": len(self.final_lines),
@@ -847,10 +983,13 @@ class LiveTranscriptionSession:
             self.metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError:
             pass
+        else:
+            debug_log(f"[LiveTranscriptionSession] Metadata updated -> {self.metadata_path.name}")
 
 
 class App:
     def __init__(self) -> None:
+        debug_log("[App] Initializing application")
         self.config = load_config()
         self.detected_input_devices = list_input_devices()
         self.detected_output_devices = list_output_devices()
@@ -887,6 +1026,11 @@ class App:
 
         self.status_var = ctk.StringVar(value="Ready - Monitoring active" if self.config["wer_mode_enabled"] else "Ready")
         self.mode_var = ctk.StringVar(value=self.current_mode)
+        self.deepgram_smart_format_var = ctk.BooleanVar(value=bool(self.config["deepgram_smart_format"]))
+        self.deepgram_diarize_var = ctk.BooleanVar(value=bool(self.config["deepgram_diarize"]))
+        self.deepgram_paragraphs_var = ctk.BooleanVar(value=bool(self.config["deepgram_paragraphs"]))
+        self.deepgram_filler_words_var = ctk.BooleanVar(value=bool(self.config["deepgram_filler_words"]))
+        self.deepgram_numerals_var = ctk.BooleanVar(value=bool(self.config["deepgram_numerals"]))
         self.monitor_status_var = ctk.StringVar(value="Excellent")
         self.monitor_level_var = ctk.StringVar(value="RMS: -∞ dB | Peak: -∞ dB")
         self.monitor_detail_var = ctk.StringVar(value="No issues detected")
@@ -1294,13 +1438,61 @@ class App:
         api_key_ready = bool(get_deepgram_api_key())
         self.transcription_status_label = ctk.CTkLabel(
             transcription_frame,
-            text="Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env",
+            text=(
+                ("Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env")
+                + "\n"
+                + self._deepgram_options_summary()
+            ),
             font=("Arial", 9, "bold"),
             text_color="#66BB6A" if api_key_ready else "#F9A825",
             wraplength=460,
             justify="left",
         )
         self.transcription_status_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        options_frame = ctk.CTkFrame(transcription_frame, fg_color="transparent")
+        options_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        ctk.CTkLabel(
+            options_frame,
+            text="Deepgram Options",
+            font=("Arial", 10, "bold"),
+        ).pack(anchor="w", padx=2, pady=(0, 4))
+
+        ctk.CTkSwitch(
+            options_frame,
+            text="Smart Format",
+            variable=self.deepgram_smart_format_var,
+            command=self._save_deepgram_options,
+        ).pack(anchor="w", padx=2, pady=2)
+
+        ctk.CTkSwitch(
+            options_frame,
+            text="Diarization",
+            variable=self.deepgram_diarize_var,
+            command=self._save_deepgram_options,
+        ).pack(anchor="w", padx=2, pady=2)
+
+        ctk.CTkSwitch(
+            options_frame,
+            text="Paragraphs",
+            variable=self.deepgram_paragraphs_var,
+            command=self._save_deepgram_options,
+        ).pack(anchor="w", padx=2, pady=2)
+
+        ctk.CTkSwitch(
+            options_frame,
+            text="Filler Words",
+            variable=self.deepgram_filler_words_var,
+            command=self._save_deepgram_options,
+        ).pack(anchor="w", padx=2, pady=2)
+
+        ctk.CTkSwitch(
+            options_frame,
+            text="Numerals",
+            variable=self.deepgram_numerals_var,
+            command=self._save_deepgram_options,
+        ).pack(anchor="w", padx=2, pady=2)
 
         transcription_actions = ctk.CTkFrame(transcription_frame, fg_color="transparent")
         transcription_actions.pack(fill="x", padx=10, pady=(0, 10))
@@ -1356,7 +1548,11 @@ class App:
         api_key_ready = bool(get_deepgram_api_key())
         self.live_transcription_key_label = ctk.CTkLabel(
             live_frame,
-            text="Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env",
+            text=(
+                ("Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env")
+                + "\n"
+                + self._deepgram_options_summary()
+            ),
             font=("Arial", 9, "bold"),
             text_color="#66BB6A" if api_key_ready else "#F9A825",
             wraplength=460,
@@ -1476,6 +1672,7 @@ class App:
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Stop live transcription before refreshing device lists.")
             return
+        debug_log("[App] Refreshing detected input and output devices")
         self.detected_input_devices = list_input_devices()
         self.detected_output_devices = list_output_devices()
         self._hydrate_config_from_detected_devices()
@@ -1543,6 +1740,11 @@ class App:
         self.config["speaker_device"] = self.speaker_var.get().strip()
         self.config["vac_playback_device"] = self.vac_playback_var.get().strip()
         self.config["voicemeeter_device"] = self.mix_var.get().strip()
+        self.config["deepgram_smart_format"] = bool(self.deepgram_smart_format_var.get())
+        self.config["deepgram_diarize"] = bool(self.deepgram_diarize_var.get())
+        self.config["deepgram_paragraphs"] = bool(self.deepgram_paragraphs_var.get())
+        self.config["deepgram_filler_words"] = bool(self.deepgram_filler_words_var.get())
+        self.config["deepgram_numerals"] = bool(self.deepgram_numerals_var.get())
         self.config["wer_mode_enabled"] = bool(self.wer_enabled_var.get())
         save_config(self.config)
         self.status_var.set(f"Saved configuration to {CONFIG_PATH.name}.")
@@ -1565,6 +1767,7 @@ class App:
             self.status_var.set("Stop live transcription before changing the recording device.")
             return
         device_name = self.direct_recording_var.get().strip()
+        debug_log(f"[App] Applying selected recording device: {device_name}")
         ok, message = self.device_manager.set_default_recording_device(device_name)
         self.status_var.set(message)
 
@@ -1573,6 +1776,7 @@ class App:
             self.status_var.set("Stop live transcription before changing the playback device.")
             return
         device_name = self.direct_playback_var.get().strip()
+        debug_log(f"[App] Applying selected playback device: {device_name}")
         ok, message = self.device_manager.set_default_playback_device(device_name)
         self.status_var.set(message)
 
@@ -1676,6 +1880,34 @@ class App:
             return self.mix_var.get().strip() or "Not configured"
         return self.mic_var.get().strip() or "Not configured"
 
+    def _deepgram_options_summary(self) -> str:
+        smart_format = "On" if self.deepgram_smart_format_var.get() else "Off"
+        diarize = "On" if self.deepgram_diarize_var.get() else "Off"
+        paragraphs = "On" if self.deepgram_paragraphs_var.get() else "Off"
+        filler_words = "On" if self.deepgram_filler_words_var.get() else "Off"
+        numerals = "On" if self.deepgram_numerals_var.get() else "Off"
+        return (
+            f"Deepgram options: Smart Format {smart_format} | Diarization {diarize} | "
+            f"Paragraphs {paragraphs} | Filler Words {filler_words} | Numerals {numerals}"
+        )
+
+    def _save_deepgram_options(self) -> None:
+        self.config["deepgram_smart_format"] = bool(self.deepgram_smart_format_var.get())
+        self.config["deepgram_diarize"] = bool(self.deepgram_diarize_var.get())
+        self.config["deepgram_paragraphs"] = bool(self.deepgram_paragraphs_var.get())
+        self.config["deepgram_filler_words"] = bool(self.deepgram_filler_words_var.get())
+        self.config["deepgram_numerals"] = bool(self.deepgram_numerals_var.get())
+        save_config(self.config)
+        if hasattr(self, "transcription_status_label") and self.transcription_status_label.winfo_exists():
+            api_key_ready = bool(get_deepgram_api_key())
+            base_text = "Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env"
+            self.transcription_status_label.configure(
+                text=f"{base_text}\n{self._deepgram_options_summary()}",
+                text_color="#66BB6A" if api_key_ready else "#F9A825",
+            )
+        self._refresh_live_transcription_labels()
+        self.status_var.set(self._deepgram_options_summary())
+
     def _refresh_live_transcription_labels(self) -> None:
         label = getattr(self, "live_transcription_device_label", None)
         if label is not None:
@@ -1684,7 +1916,11 @@ class App:
         if key_label is not None:
             api_key_ready = bool(get_deepgram_api_key())
             key_label.configure(
-                text="Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env",
+                text=(
+                    ("Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env")
+                    + "\n"
+                    + self._deepgram_options_summary()
+                ),
                 text_color="#66BB6A" if api_key_ready else "#F9A825",
             )
 
@@ -1768,6 +2004,7 @@ class App:
             return
 
         input_device_name = self._current_live_input_device_name()
+        debug_log(f"[App] Starting live transcription mode={self.current_mode} input={input_device_name}")
         self._set_live_controls_state(starting=True)
         self.live_transcript_final_text = ""
         self.live_transcript_interim_text = ""
@@ -1776,16 +2013,40 @@ class App:
         self.status_var.set(f"Starting live transcription from {input_device_name}...")
         threading.Thread(
             target=self._start_live_transcription_worker,
-            args=(api_key, input_device_name, self.current_mode),
+            args=(
+                api_key,
+                input_device_name,
+                self.current_mode,
+                bool(self.deepgram_smart_format_var.get()),
+                bool(self.deepgram_diarize_var.get()),
+                bool(self.deepgram_paragraphs_var.get()),
+                bool(self.deepgram_filler_words_var.get()),
+                bool(self.deepgram_numerals_var.get()),
+            ),
             daemon=True,
         ).start()
 
-    def _start_live_transcription_worker(self, api_key: str, input_device_name: str, mode_name: str) -> None:
+    def _start_live_transcription_worker(
+        self,
+        api_key: str,
+        input_device_name: str,
+        mode_name: str,
+        smart_format: bool,
+        diarize: bool,
+        paragraphs: bool,
+        filler_words: bool,
+        numerals: bool,
+    ) -> None:
         session = LiveTranscriptionSession(
             api_key=api_key,
             input_device_name=input_device_name,
             sample_rate_hz=int(self.config["sample_rate_hz"]),
             mode_name=mode_name,
+            smart_format=smart_format,
+            diarize=diarize,
+            paragraphs=paragraphs,
+            filler_words=filler_words,
+            numerals=numerals,
             on_transcript=self._queue_live_transcript_update,
             on_status=self._queue_live_status_update,
         )
@@ -1803,6 +2064,7 @@ class App:
 
     def _finish_start_live_transcription(self, success: bool, message: str, session: LiveTranscriptionSession) -> None:
         if not success:
+            debug_log(f"[App] Live transcription failed to start: {message}", level="error")
             self.live_transcription_session = None
             self._set_live_controls_state(running=False, starting=False)
             self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
@@ -1811,6 +2073,7 @@ class App:
             return
 
         self.live_transcription_session = session
+        debug_log(f"[App] Live transcription started successfully: {message}")
         self._set_live_controls_state(running=True, starting=False)
         self.live_transcription_status_label.configure(text=message, text_color="#66BB6A")
         self.status_var.set(message)
@@ -1824,6 +2087,7 @@ class App:
             self.status_var.set("Live transcription is not running.")
             return
 
+        debug_log("[App] Stopping live transcription")
         success, message = self.live_transcription_session.stop()
         self._set_live_controls_state(running=False, starting=False)
         self.live_transcription_session = None
@@ -1865,7 +2129,14 @@ class App:
         ).start()
 
     def _run_file_transcription(self, media_path: Path) -> None:
-        transcriber = DeepgramFileTranscriber(get_deepgram_api_key())
+        transcriber = DeepgramFileTranscriber(
+            get_deepgram_api_key(),
+            smart_format=bool(self.deepgram_smart_format_var.get()),
+            diarize=bool(self.deepgram_diarize_var.get()),
+            paragraphs=bool(self.deepgram_paragraphs_var.get()),
+            filler_words=bool(self.deepgram_filler_words_var.get()),
+            numerals=bool(self.deepgram_numerals_var.get()),
+        )
         success, message = transcriber.transcribe_file(media_path)
         if self._closing:
             return
@@ -1901,6 +2172,7 @@ class App:
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Stop live transcription before switching modes.")
             return
+        debug_log(f"[App] Switching mode -> {mode_name} using recording device {device_name}")
         self.save_form_config()
         ok_record, record_message = self.device_manager.set_default_recording_device(device_name)
         if not ok_record:
@@ -1938,6 +2210,8 @@ class App:
         if self._vac_test_running:
             self.status_var.set("VAC routing test is already running.")
             return
+
+        debug_log("[App] Starting VAC routing test")
 
         self.save_form_config()
         ok_record, record_message = self.device_manager.set_default_recording_device(self.vac_var.get().strip())
@@ -1989,6 +2263,7 @@ class App:
     def _finish_vac_test(self, message: str) -> None:
         self._vac_test_running = False
         self.btn_vac_test.configure(state="normal", text="Test VAC Routing")
+        debug_log(f"[App] VAC routing test finished: {message}")
         self.status_var.set(message)
 
     def toggle_mute(self) -> None:
@@ -2118,6 +2393,7 @@ class App:
         return f"Recording: {recording_device}\nPlayback: {playback_device}"
 
     def on_close(self) -> None:
+        debug_log("[App] Closing application")
         self._closing = True
         self._close_settings_window()
         if self.live_transcription_session is not None:

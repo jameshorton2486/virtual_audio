@@ -148,6 +148,11 @@ class DeviceHelpersTests(unittest.TestCase):
                 "speaker_device": "",
                 "vac_playback_device": None,
                 "voicemeeter_device": None,
+                "deepgram_smart_format": "false",
+                "deepgram_diarize": "true",
+                "deepgram_paragraphs": "false",
+                "deepgram_filler_words": "true",
+                "deepgram_numerals": "false",
                 "wer_mode_enabled": "false",
                 "quality_check_interval_seconds": 0,
                 "sample_rate_hz": "invalid",
@@ -160,6 +165,11 @@ class DeviceHelpersTests(unittest.TestCase):
         self.assertEqual(result["speaker_device"], app.DEFAULT_CONFIG["speaker_device"])
         self.assertEqual(result["vac_playback_device"], app.DEFAULT_CONFIG["vac_playback_device"])
         self.assertEqual(result["voicemeeter_device"], app.DEFAULT_CONFIG["voicemeeter_device"])
+        self.assertFalse(result["deepgram_smart_format"])
+        self.assertTrue(result["deepgram_diarize"])
+        self.assertFalse(result["deepgram_paragraphs"])
+        self.assertTrue(result["deepgram_filler_words"])
+        self.assertFalse(result["deepgram_numerals"])
         self.assertFalse(result["wer_mode_enabled"])
         self.assertEqual(
             result["quality_check_interval_seconds"],

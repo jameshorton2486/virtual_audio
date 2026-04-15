@@ -79,6 +79,7 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - Use the `Transcribe File` button in the app for saved Zoom recordings, downloaded videos, and other media files
 - Supported file types include `wav`, `mp3`, `m4a`, `mp4`, `webm`, `flac`, `ogg`, and more
 - Transcript text and the full Deepgram JSON response are saved into the local `transcripts` folder
+- `Smart Format`, `Diarization`, `Paragraphs`, `Filler Words`, and `Numerals` can be turned on or off from the UI before starting either file or live transcription
 
 ## Live Transcription
 
@@ -89,6 +90,7 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - The rolling transcript appears in the app, auto-scrolls, and is saved automatically into the local `transcripts` folder when you stop
 - Each live session also saves a matching `.json` metadata file with mode, device, timestamps, and status
 - While live transcription is running, mode and device switching are intentionally blocked so the capture source stays stable
+- Live transcription uses the same `Smart Format`, `Diarization`, `Paragraphs`, `Filler Words`, and `Numerals` options shown in the Deepgram panel
 
 ## Recommended Live Workflows
 
