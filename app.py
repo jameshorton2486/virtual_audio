@@ -114,6 +114,13 @@ class ConfigDict(TypedDict):
     last_mode: ModeName
 
 
+class ActiveAudioDevice(TypedDict):
+    name: str
+    index: int
+    info: dict[str, Any]
+    sample_rate: int
+
+
 DEFAULT_CONFIG: Final[ConfigDict] = {
     "mic_device": "Microphone (Realtek Audio)",
     "vac_device": "CABLE Output (VB-Audio Virtual Cable)",
@@ -508,6 +515,114 @@ def resolve_input_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
     return match[0], match[1]
 
 
+def get_default_input_device() -> tuple[int | None, dict[str, Any] | None]:
+    try:
+        device_info = sd.query_devices(kind="input")
+    except Exception:
+        return None, None
+
+    if not isinstance(device_info, dict):
+        return None, None
+
+    try:
+        index = int(device_info.get("index", -1))
+    except (TypeError, ValueError):
+        index = -1
+
+    if index < 0:
+        return None, None
+    return index, device_info
+
+
+def get_default_output_device() -> tuple[int | None, dict[str, Any] | None]:
+    try:
+        device_info = sd.query_devices(kind="output")
+    except Exception:
+        return None, None
+
+    if not isinstance(device_info, dict):
+        return None, None
+
+    try:
+        index = int(device_info.get("index", -1))
+    except (TypeError, ValueError):
+        index = -1
+
+    if index < 0:
+        return None, None
+    return index, device_info
+
+
+def sample_input_signal(device_name: str, sample_rate_hz: int, duration_seconds: float = 0.35) -> dict[str, Any] | None:
+    device_index, device_info = resolve_input_device(device_name)
+    if device_index is None or device_info is None:
+        return None
+
+    actual_sample_rate = int(float(device_info.get("default_samplerate", sample_rate_hz)))
+    if actual_sample_rate <= 0:
+        actual_sample_rate = int(sample_rate_hz)
+    frames = max(1, int(actual_sample_rate * duration_seconds))
+
+    try:
+        recording = sd.rec(
+            frames,
+            samplerate=actual_sample_rate,
+            channels=1,
+            dtype="float32",
+            device=device_index,
+        )
+        sd.wait()
+    except Exception:
+        return None
+
+    samples = np.asarray(np.squeeze(recording), dtype=np.float64)
+    if samples.size == 0:
+        return None
+
+    samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
+    samples = np.clip(samples, -1.0, 1.0)
+    pcm16 = np.asarray(samples * 32767.0, dtype=np.int16).tobytes()
+    signal = analyze_live_input_signal(pcm16)
+    if signal is None:
+        return None
+    signal["device_name"] = normalize_audio_device_name(str(device_info.get("name", device_name)))
+    return signal
+
+
+def sample_resolved_input_signal(
+    device_index: int,
+    sample_rate_hz: int,
+    device_name: str,
+    duration_seconds: float = 0.35,
+) -> dict[str, Any] | None:
+    frames = max(1, int(sample_rate_hz * duration_seconds))
+
+    try:
+        recording = sd.rec(
+            frames,
+            samplerate=sample_rate_hz,
+            channels=1,
+            dtype="float32",
+            device=device_index,
+        )
+        sd.wait()
+    except Exception:
+        return None
+
+    samples = np.asarray(np.squeeze(recording), dtype=np.float64)
+    if samples.size == 0:
+        return None
+
+    samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
+    samples = np.clip(samples, -1.0, 1.0)
+    pcm16 = np.asarray(samples * 32767.0, dtype=np.int16).tobytes()
+    signal = analyze_live_input_signal(pcm16)
+    if signal is None:
+        return None
+    signal["device_name"] = normalize_audio_device_name(device_name)
+    return signal
+
+
 def _list_devices(channel_key: str) -> list[str]:
     devices: list[str] = []
     seen: set[str] = set()
@@ -725,10 +840,11 @@ class AudioDeviceManager:
 
 
 class AudioQualityMonitor:
-    def __init__(self, sample_rate_hz: int, interval_seconds: float, callback):
+    def __init__(self, sample_rate_hz: int, interval_seconds: float, callback, device_provider=None):
         self.sample_rate_hz = sample_rate_hz
         self.interval_seconds = interval_seconds
         self.callback = callback
+        self.device_provider = device_provider
         self._running = False
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -758,10 +874,35 @@ class AudioQualityMonitor:
 
     def _sample_quality(self) -> dict[str, Any]:
         duration_seconds = 0.4
-        frames = max(1, int(self.sample_rate_hz * duration_seconds))
+        requested_device_name = ""
 
         try:
-            recording = sd.rec(frames, samplerate=self.sample_rate_hz, channels=1, dtype="float32")
+            active_device = self.device_provider() if callable(self.device_provider) else None
+            device_index: int | None = None
+            device_info: dict[str, Any] | None = None
+
+            if active_device:
+                requested_device_name = str(active_device.get("name", "")).strip()
+                device_index = int(active_device["index"])
+                device_info = active_device["info"]
+                actual_sample_rate = int(active_device["sample_rate"])
+            else:
+                device_index, device_info = get_default_input_device()
+                if device_index is None or device_info is None:
+                    raise ValueError("Unable to resolve an input device for monitoring.")
+                requested_device_name = str(device_info.get("name", "")).strip()
+                actual_sample_rate = int(float(device_info.get("default_samplerate", self.sample_rate_hz)))
+            if actual_sample_rate <= 0:
+                actual_sample_rate = int(self.sample_rate_hz)
+            frames = max(1, int(actual_sample_rate * duration_seconds))
+
+            recording = sd.rec(
+                frames,
+                samplerate=actual_sample_rate,
+                channels=1,
+                dtype="float32",
+                device=device_index,
+            )
             sd.wait()
             samples = np.asarray(np.squeeze(recording), dtype=np.float64)
             if samples.size == 0:
@@ -778,7 +919,7 @@ class AudioQualityMonitor:
                 "quality": "error",
                 "level_text": "Unavailable",
                 "status_text": "Audio monitor unavailable",
-                "detail_text": str(exc),
+                "detail_text": f"{requested_device_name or 'Default input'}: {exc}",
             }
 
         if rms < 0.005:
@@ -806,7 +947,9 @@ class AudioQualityMonitor:
             "quality": quality,
             "level_text": f"RMS {rms:.3f} | Peak {peak:.3f}",
             "status_text": status,
-            "detail_text": detail,
+            "detail_text": (
+                f"{detail} Input: {normalize_audio_device_name(str(device_info.get('name', requested_device_name or 'Default input')))}."
+            ),
         }
 
 
@@ -910,8 +1053,7 @@ class LiveTranscriptionSession:
     def __init__(
         self,
         api_key: str,
-        input_device_name: str,
-        sample_rate_hz: int,
+        input_device: ActiveAudioDevice,
         mode_name: str,
         smart_format: bool,
         diarize: bool,
@@ -923,8 +1065,10 @@ class LiveTranscriptionSession:
         on_signal,
     ):
         self.api_key = api_key.strip()
-        self.input_device_name = input_device_name.strip()
-        self.sample_rate_hz = sample_rate_hz
+        self.input_device_name = input_device["name"].strip()
+        self.input_device_index = int(input_device["index"])
+        self.input_device_info = input_device["info"]
+        self.sample_rate_hz = int(input_device["sample_rate"])
         self.mode_name = mode_name.strip() or "Unknown"
         self.smart_format = bool(smart_format)
         self.diarize = bool(diarize)
@@ -962,8 +1106,7 @@ class LiveTranscriptionSession:
         if not self.input_device_name:
             return False, "No recording device selected for live transcription."
 
-        device_index, device_info = resolve_input_device(self.input_device_name)
-        if device_index is None or device_info is None:
+        if self.input_device_index is None or self.input_device_info is None:
             debug_log(f"[LiveTranscriptionSession] Unable to resolve input device: {self.input_device_name}", level="error")
             return False, f"Unable to find recording device: {self.input_device_name}"
 
@@ -1018,7 +1161,7 @@ class LiveTranscriptionSession:
             stream = sd.RawInputStream(
                 samplerate=self.sample_rate_hz,
                 blocksize=1024,
-                device=device_index,
+                device=self.input_device_index,
                 channels=1,
                 dtype="int16",
                 callback=self._audio_callback,
@@ -1036,10 +1179,10 @@ class LiveTranscriptionSession:
 
         self.running = True
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.actual_device_name = normalize_audio_device_name(str(device_info.get("name", self.input_device_name)))
+        self.actual_device_name = normalize_audio_device_name(str(self.input_device_info.get("name", self.input_device_name)))
         debug_log(
             f"[LiveTranscriptionSession] Running mode={self.mode_name} resolved_device={self.actual_device_name} "
-            f"device_index={device_index} sample_rate={self.sample_rate_hz}"
+            f"device_index={self.input_device_index} sample_rate={self.sample_rate_hz}"
         )
         self._write_metadata(status="running")
         return True, f"Live transcription started from {self.actual_device_name}."
@@ -1209,12 +1352,8 @@ class App:
         self.detected_output_devices = list_output_devices()
         self._hydrate_config_from_detected_devices()
         self.device_manager = AudioDeviceManager()
-        self.monitor = AudioQualityMonitor(
-            sample_rate_hz=int(self.config["sample_rate_hz"]),
-            interval_seconds=float(self.config["quality_check_interval_seconds"]),
-            callback=self._queue_quality_update,
-        )
         self.current_mode: ModeName = self.config["last_mode"]
+        self.active_audio_device: ActiveAudioDevice | None = None
         self.is_muted = False
         self.settings_window: ctk.CTkToplevel | None = None
         self.setup_notes_label = None
@@ -1229,6 +1368,9 @@ class App:
         self.live_transcript_interim_text = ""
         self.live_signal_status_text = "Waiting to sample the selected input."
         self._vac_test_forced_monitoring = False
+        self._pending_vac_test = False
+        self._audio_switch_in_progress = False
+        self._latest_signal_state = "Unknown"
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -1253,6 +1395,7 @@ class App:
         self.monitor_summary_var = ctk.StringVar(value="Monitoring active")
         self.monitor_recommendation_var = ctk.StringVar(value="No issues detected\nAll systems optimal")
         self.footer_var = ctk.StringVar(value="v3.0 Pro | Real-Time WER Optimization")
+        self.runtime_audio_var = ctk.StringVar(value="Active Input: Detecting... | Active Output: Detecting... | Signal: Unknown")
 
         self.mic_var = ctk.StringVar(value=self.config["mic_device"])
         self.vac_var = ctk.StringVar(value=self.config["vac_device"])
@@ -1262,10 +1405,18 @@ class App:
         self.direct_recording_var = ctk.StringVar(value=self.config["mic_device"])
         self.direct_playback_var = ctk.StringVar(value=self.config["speaker_device"])
         self.wer_enabled_var = ctk.BooleanVar(value=bool(self.config["wer_mode_enabled"]))
+        self.resolve_active_device(self._current_live_input_device_name())
+        self.monitor = AudioQualityMonitor(
+            sample_rate_hz=int(self.config["sample_rate_hz"]),
+            interval_seconds=float(self.config["quality_check_interval_seconds"]),
+            callback=self._queue_quality_update,
+            device_provider=self.get_active_audio_device,
+        )
 
         self._build_ui()
         self._refresh_mode_hint()
         self._refresh_detection_summary()
+        self._refresh_runtime_audio_status()
 
         if self.wer_enabled_var.get():
             self.monitor.start()
@@ -1344,6 +1495,14 @@ class App:
             text_color="#A0A0A0",
             anchor="w",
         ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 2))
+
+        ctk.CTkLabel(
+            status_bar,
+            textvariable=self.runtime_audio_var,
+            font=("Arial", 9),
+            text_color="#C6C6C6",
+            anchor="w",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8))
 
         ctk.CTkLabel(
             status_bar,
@@ -2041,6 +2200,20 @@ class App:
         if routing_meter is not None and routing_meter.winfo_exists():
             routing_meter.set_levels(rms_text, peak_text, status_text, color, progress)
 
+    def _refresh_runtime_audio_status(self, *, signal_state: str | None = None) -> None:
+        if self.active_audio_device is not None:
+            input_name = self.active_audio_device["name"]
+        else:
+            _input_index, input_info = get_default_input_device()
+            input_name = normalize_audio_device_name(str(input_info.get("name", "Unavailable"))) if input_info else "Unavailable"
+        _output_index, output_info = get_default_output_device()
+        output_name = normalize_audio_device_name(str(output_info.get("name", "Unavailable"))) if output_info else "Unavailable"
+        if signal_state is not None:
+            self._latest_signal_state = signal_state
+        self.runtime_audio_var.set(
+            f"Active Input: {input_name} | Active Output: {output_name} | Signal: {self._latest_signal_state}"
+        )
+
     def _menu_values_for(self, current_value: str, devices: list[str]) -> list[str]:
         values = list(devices)
         if current_value and current_value not in values:
@@ -2093,6 +2266,7 @@ class App:
         self._refresh_device_menus()
         self._refresh_detection_summary()
         self._refresh_mode_hint()
+        self._refresh_runtime_audio_status()
         self.status_var.set("Refreshed detected Windows recording and playback devices.")
 
     def _normalize_direct_device_selection(self, current_value: str, devices: list[str]) -> str:
@@ -2224,7 +2398,35 @@ class App:
             return
         self.status_var.set(f"Open {TRANSCRIPTS_DIR} manually on this platform.")
 
+    def get_active_audio_device(self) -> ActiveAudioDevice | None:
+        return self.active_audio_device
+
+    def resolve_active_device(self, device_name: str) -> ActiveAudioDevice:
+        device_index, device_info = resolve_input_device(device_name)
+        if device_index is None or device_info is None:
+            raise RuntimeError(f"Failed to resolve device: {device_name}")
+
+        sample_rate = int(float(device_info.get("default_samplerate", self.config["sample_rate_hz"])))
+        if sample_rate <= 0:
+            sample_rate = int(self.config["sample_rate_hz"])
+
+        self.active_audio_device = {
+            "name": normalize_audio_device_name(str(device_info.get("name", device_name))),
+            "index": device_index,
+            "info": device_info,
+            "sample_rate": sample_rate,
+        }
+        return self.active_audio_device
+
+    def verify_active_device(self) -> bool:
+        if self.active_audio_device is None:
+            return False
+        current_index, _ = resolve_input_device(self.active_audio_device["name"])
+        return current_index == self.active_audio_device["index"]
+
     def _current_live_input_device_name(self) -> str:
+        if self.active_audio_device is not None:
+            return self.active_audio_device["name"]
         if self.current_mode == "VAC":
             return self.vac_var.get().strip() or "Not configured"
         if self.current_mode == "Mixed":
@@ -2342,12 +2544,20 @@ class App:
         rms = float(payload.get("rms", 0.0))
         peak = float(payload.get("peak", 0.0))
         detail = str(payload.get("detail", "")).strip()
+        state = str(payload.get("state", "unknown")).strip().lower()
         signal_text = f"Input signal: {detail} Device: {device_name}. RMS {rms:.4f}, Peak {peak:.4f}."
         self.live_signal_status_text = signal_text
         self.live_signal_status_label.configure(
             text=signal_text,
             text_color=str(payload.get("color", "#C6C6C6")),
         )
+        signal_state = {
+            "silent": "No signal",
+            "low": "Low signal",
+            "clipping": "Clipping",
+            "active": "Active",
+        }.get(state, "Unknown")
+        self._refresh_runtime_audio_status(signal_state=signal_state)
 
     def _set_live_controls_state(self, *, running: bool = False, starting: bool = False) -> None:
         self._live_transcription_running = running
@@ -2366,6 +2576,9 @@ class App:
                 button.configure(state="normal" if running else "disabled")
 
     def start_live_transcription(self) -> None:
+        if self._audio_switch_in_progress:
+            self.status_var.set("Wait for the audio device switch to finish before starting live transcription.")
+            return
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Live transcription is already running.")
             return
@@ -2382,8 +2595,19 @@ class App:
             )
             return
 
-        input_device_name = self._current_live_input_device_name()
-        debug_log(f"[App] Starting live transcription mode={self.current_mode} input={input_device_name}")
+        active_device = self.active_audio_device
+        if active_device is None:
+            message = "No active audio device is bound. Switch modes or reselect the input device first."
+            self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
+            self.status_var.set(message)
+            messagebox.showerror("Live Input Unavailable", message)
+            return
+
+        input_device_name = active_device["name"]
+        debug_log(
+            f"[App] Starting live transcription mode={self.current_mode} input={input_device_name} "
+            f"index={active_device['index']} sample_rate={active_device['sample_rate']}"
+        )
         self._set_live_controls_state(starting=True)
         self.live_transcript_final_text = ""
         self.live_transcript_interim_text = ""
@@ -2396,7 +2620,7 @@ class App:
             target=self._start_live_transcription_worker,
             args=(
                 api_key,
-                input_device_name,
+                active_device,
                 self.current_mode,
                 bool(self.deepgram_smart_format_var.get()),
                 bool(self.deepgram_diarize_var.get()),
@@ -2410,7 +2634,7 @@ class App:
     def _start_live_transcription_worker(
         self,
         api_key: str,
-        input_device_name: str,
+        active_device: ActiveAudioDevice,
         mode_name: str,
         smart_format: bool,
         diarize: bool,
@@ -2418,10 +2642,45 @@ class App:
         filler_words: bool,
         numerals: bool,
     ) -> None:
+        input_device_name = active_device["name"]
+        if not self.verify_active_device():
+            success = False
+            message = f"Device mismatch detected before live transcription start: {input_device_name}"
+            session = None
+            try:
+                self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
+            except Exception:
+                return
+            return
+
+        signal = sample_resolved_input_signal(
+            active_device["index"],
+            active_device["sample_rate"],
+            active_device["name"],
+            duration_seconds=0.25,
+        )
+        if signal is None:
+            success = False
+            message = f"Unable to read audio from {input_device_name} before starting live transcription."
+            session = None
+            try:
+                self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
+            except Exception:
+                return
+            return
+        if str(signal.get("state", "")).lower() == "silent":
+            success = False
+            message = f"No audio signal detected on {input_device_name}. Check routing before starting live transcription."
+            session = None
+            try:
+                self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
+            except Exception:
+                return
+            return
+
         session = LiveTranscriptionSession(
             api_key=api_key,
-            input_device_name=input_device_name,
-            sample_rate_hz=int(self.config["sample_rate_hz"]),
+            input_device=active_device,
             mode_name=mode_name,
             smart_format=smart_format,
             diarize=diarize,
@@ -2444,7 +2703,12 @@ class App:
                 session.stop()
             return
 
-    def _finish_start_live_transcription(self, success: bool, message: str, session: LiveTranscriptionSession) -> None:
+    def _finish_start_live_transcription(
+        self,
+        success: bool,
+        message: str,
+        session: LiveTranscriptionSession | None,
+    ) -> None:
         if not success:
             debug_log(f"[App] Live transcription failed to start: {message}", level="error")
             self.live_transcription_session = None
@@ -2452,6 +2716,7 @@ class App:
             self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
             self.live_signal_status_text = "No live input signal available because the session did not start."
             self.live_signal_status_label.configure(text="Input signal: " + self.live_signal_status_text, text_color="#F57C00")
+            self._refresh_runtime_audio_status(signal_state="No signal")
             messagebox.showerror("Live Transcription Failed", message)
             self.status_var.set(message)
             return
@@ -2460,6 +2725,7 @@ class App:
         debug_log(f"[App] Live transcription started successfully: {message}")
         self._set_live_controls_state(running=True, starting=False)
         self.live_transcription_status_label.configure(text=message, text_color="#66BB6A")
+        self._refresh_runtime_audio_status(signal_state="Active")
         self.status_var.set(message)
 
     def stop_live_transcription(self) -> None:
@@ -2562,6 +2828,9 @@ class App:
         return self.mix_var.get().strip(), self.speaker_var.get().strip()
 
     def apply_audio_mode(self, mode_name: ModeName) -> None:
+        if self._audio_switch_in_progress:
+            self.status_var.set("Audio device switch already in progress.")
+            return
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Stop live transcription before switching modes.")
             return
@@ -2575,36 +2844,104 @@ class App:
         if not playback_target:
             self.status_var.set(f"No playback device configured for {mode_name} mode.")
             return
+        self._audio_switch_in_progress = True
+        self.status_var.set(f"Switching audio device... {mode_name} mode requested.")
+        threading.Thread(
+            target=self._apply_audio_mode_worker,
+            args=(mode_name, input_device, playback_target),
+            daemon=True,
+        ).start()
 
-        ok_record, record_message = self.device_manager.set_default_recording_device(input_device)
-        if not ok_record:
-            self.status_var.set(record_message)
+    def _apply_audio_mode_worker(self, mode_name: ModeName, input_device: str, playback_target: str) -> None:
+        resolved_device: ActiveAudioDevice | None = None
+        try:
+            resolved_device = self.resolve_active_device(input_device)
+        except Exception as exc:
+            success = False
+            message = str(exc)
+        else:
+            ok_record, record_message = self.device_manager.set_default_recording_device(input_device)
+            if not ok_record:
+                success = False
+                message = record_message
+            else:
+                ok_playback, playback_message = self.device_manager.set_default_playback_device(playback_target)
+                if not ok_playback:
+                    success = False
+                    message = f"{record_message} Playback switch failed: {playback_message}"
+                elif not self._wait_for_active_input_device(resolved_device["name"]):
+                    success = False
+                    message = f"Switched Windows defaults, but the active input did not become {resolved_device['name']} in time."
+                else:
+                    success = True
+                    message = f"{mode_name} mode active | Input: {resolved_device['name']} | Output: {playback_target}"
+        if success and resolved_device is None:
+            success = False
+            message = f"Unable to resolve an active audio device for {mode_name} mode."
+
+        if self._closing:
+            return
+        try:
+            self.root.after(
+                0,
+                lambda: self._finish_apply_audio_mode(success, mode_name, resolved_device, playback_target, message),
+            )
+        except Exception:
             return
 
-        ok_playback, playback_message = self.device_manager.set_default_playback_device(playback_target)
-        if not ok_playback:
-            self.status_var.set(f"{record_message} Playback switch failed: {playback_message}")
+    def _finish_apply_audio_mode(
+        self,
+        success: bool,
+        mode_name: ModeName,
+        resolved_device: ActiveAudioDevice | None,
+        playback_target: str,
+        message: str,
+    ) -> None:
+        self._audio_switch_in_progress = False
+        if not success or resolved_device is None:
+            self._pending_vac_test = False
+            self._refresh_runtime_audio_status()
+            self.status_var.set(message)
             return
 
-        time.sleep(0.35)
-        device_index, _device_info = resolve_input_device(input_device)
-        if device_index is None:
-            self.status_var.set(f"Switched Windows defaults, but the input is not active yet: {input_device}")
+        self.active_audio_device = resolved_device
+        if not self.verify_active_device():
+            self._pending_vac_test = False
+            self._refresh_runtime_audio_status()
+            self.status_var.set("Device mismatch detected after switching modes.")
             return
 
         self.current_mode = mode_name
         self.config["last_mode"] = mode_name
         save_config(self.config)
         self.mode_var.set(mode_name)
-        self.direct_recording_var.set(input_device)
+        self.direct_recording_var.set(resolved_device["name"])
         self.direct_playback_var.set(playback_target)
         self._refresh_mode_hint()
+        self._refresh_runtime_audio_status()
         self.status_var.set(
-            f"{mode_name} mode active | Input: {input_device} | Output: {playback_target}"
+            f"{mode_name} mode active | Input: {resolved_device['name']} | Output: {playback_target} | Signal: {self._latest_signal_state}"
         )
         debug_log(
-            f"[App] Mode applied successfully -> {mode_name} | input={input_device} | output={playback_target}"
+            f"[App] Mode applied successfully -> {mode_name} | input={resolved_device['name']} | "
+            f"index={resolved_device['index']} | sample_rate={resolved_device['sample_rate']} | output={playback_target}"
         )
+        if self._pending_vac_test and mode_name == "VAC":
+            self._pending_vac_test = False
+            self._start_verified_vac_test()
+
+    def _wait_for_active_input_device(self, expected_device_name: str, timeout_seconds: float = 1.5) -> bool:
+        normalized_expected = normalize_audio_device_name(expected_device_name)
+        deadline = time.time() + timeout_seconds
+
+        while time.time() < deadline:
+            _index, device_info = get_default_input_device()
+            if device_info is not None:
+                active_name = normalize_audio_device_name(str(device_info.get("name", "")))
+                if active_name == normalized_expected:
+                    return True
+            time.sleep(0.1)
+        return False
 
     def test_vac_routing(self) -> None:
         if self._vac_test_running:
@@ -2612,9 +2949,10 @@ class App:
             return
 
         debug_log("[App] Starting VAC routing test")
+        self._pending_vac_test = True
         self.apply_audio_mode("VAC")
-        if self.current_mode != "VAC":
-            return
+
+    def _start_verified_vac_test(self) -> None:
         self.tabview.set("Routing")
 
         self._vac_test_forced_monitoring = False
@@ -2633,13 +2971,33 @@ class App:
         duration_seconds = 1.2
         amplitude = 0.18
         frequency_hz = 880.0
+        active_device = self.active_audio_device
 
         try:
             timeline = np.linspace(0.0, duration_seconds, int(sample_rate * duration_seconds), endpoint=False)
             envelope = np.minimum(1.0, timeline * 6.0) * np.minimum(1.0, (duration_seconds - timeline) * 6.0)
             tone = (np.sin(2 * np.pi * frequency_hz * timeline) * envelope * amplitude).astype(np.float32)
-            sd.play(tone, samplerate=sample_rate, blocking=True)
-            result_message = "VAC routing test completed. If the app meter moved, the route is working."
+            sd.play(tone, samplerate=sample_rate, blocking=False)
+            time.sleep(0.15)
+            signal = None
+            if active_device is not None:
+                signal = sample_resolved_input_signal(
+                    active_device["index"],
+                    active_device["sample_rate"],
+                    active_device["name"],
+                    duration_seconds=0.35,
+                )
+            sd.wait()
+            if signal is None:
+                result_message = "VAC routing test completed, but the app could not verify input signal on the selected VAC device."
+            else:
+                state = str(signal.get("state", "")).lower()
+                if state == "silent":
+                    result_message = "VAC routing test finished, but no audio was detected on the selected input. Do not assume routing is working."
+                elif state == "low":
+                    result_message = "VAC routing test finished with only low signal on the selected input. Routing may be weak or misconfigured."
+                else:
+                    result_message = "VAC routing test completed with confirmed signal on the selected input."
         except Exception as exc:
             result_message = f"VAC routing test failed: {exc}"
         finally:
@@ -2694,6 +3052,7 @@ class App:
             self.monitor_wer_label.configure(text="...", text_color="#8AB4F8")
             self.mode_badge_label.configure(fg_color="#8AB4F8")
             self._set_meter_levels("RMS: sampling", "Peak: sampling", "Starting", "#8AB4F8", 0.0)
+            self._refresh_runtime_audio_status(signal_state="Sampling")
             self.status_var.set("WER monitoring enabled.")
         else:
             self.monitor.stop()
@@ -2706,6 +3065,7 @@ class App:
             self.monitor_wer_label.configure(text="--", text_color="#9E9E9E")
             self.mode_badge_label.configure(fg_color="#4A4A4A")
             self._set_meter_levels("RMS: -∞ dB", "Peak: -∞ dB", "Paused", "#9E9E9E", 0.0)
+            self._refresh_runtime_audio_status(signal_state="Monitoring off")
             self._set_warnings_text(self.monitor_recommendation_var.get())
             self.status_var.set("WER monitoring disabled.")
 
@@ -2744,9 +3104,18 @@ class App:
         progress = QUALITY_PROGRESS.get(quality, 0.0)
         rms_text, peak_text = self._split_levels(result["level_text"])
         status_text = "Monitoring" if quality != "error" else "Unavailable"
+        signal_state = {
+            "excellent": "Active",
+            "good": "Active",
+            "low": "Low signal",
+            "too_quiet": "No signal",
+            "clipping": "Clipping",
+            "error": "Unavailable",
+        }.get(quality, "Unknown")
         self._set_meter_levels(rms_text, peak_text, status_text, color, progress)
         self.monitor_recommendation_var.set(self._recommendation_text(quality, result["detail_text"]))
         self.mode_badge_label.configure(text=ui_config["badge"], fg_color=color)
+        self._refresh_runtime_audio_status(signal_state=signal_state)
         self._set_warnings_text(self.monitor_recommendation_var.get())
 
     def _split_levels(self, level_text: str) -> tuple[str, str]:

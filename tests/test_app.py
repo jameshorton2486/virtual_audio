@@ -312,8 +312,12 @@ class LiveSignalTests(unittest.TestCase):
         signal_updates: list[dict[str, object]] = []
         session = app.LiveTranscriptionSession(
             api_key="test-key",
-            input_device_name="CABLE Output (VB-Audio Virtual Cable)",
-            sample_rate_hz=24000,
+            input_device={
+                "name": "CABLE Output (VB-Audio Virtual Cable)",
+                "index": 1,
+                "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "default_samplerate": 24000},
+                "sample_rate": 24000,
+            },
             mode_name="VAC",
             smart_format=True,
             diarize=True,
