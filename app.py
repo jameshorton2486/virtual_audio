@@ -283,6 +283,43 @@ def get_deepgram_api_key() -> str:
     return os.environ.get("DEEPGRAM_API_KEY", "").strip()
 
 
+def _deepgram_value(node: Any, key: str, default: Any = None) -> Any:
+    if isinstance(node, dict):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
+def _deepgram_words_to_speaker_lines(words: list[Any]) -> str:
+    segments: list[tuple[str | None, list[str]]] = []
+
+    for word_data in words:
+        token = str(
+            _deepgram_value(word_data, "punctuated_word")
+            or _deepgram_value(word_data, "word")
+            or ""
+        ).strip()
+        if not token:
+            continue
+
+        speaker_raw = _deepgram_value(word_data, "speaker")
+        speaker = None if speaker_raw in (None, "") else str(speaker_raw)
+        if segments and segments[-1][0] == speaker:
+            segments[-1][1].append(token)
+        else:
+            segments.append((speaker, [token]))
+
+    lines: list[str] = []
+    for speaker, tokens in segments:
+        text = " ".join(token for token in tokens if token).strip()
+        if not text:
+            continue
+        if speaker is None:
+            lines.append(text)
+        else:
+            lines.append(f"Speaker {speaker}: {text}")
+    return "\n".join(lines).strip()
+
+
 def extract_transcript_text(payload: dict[str, Any]) -> str:
     try:
         channels = payload["results"]["channels"]
@@ -293,6 +330,39 @@ def extract_transcript_text(payload: dict[str, Any]) -> str:
             return ""
         return str(alternatives[0].get("transcript", "")).strip()
     except (KeyError, TypeError, IndexError):
+        return ""
+
+
+def format_deepgram_payload_text(payload: dict[str, Any]) -> str:
+    try:
+        channels = payload["results"]["channels"]
+        if not channels:
+            return ""
+        alternatives = channels[0].get("alternatives", [])
+        if not alternatives:
+            return ""
+        words = alternatives[0].get("words", [])
+        speaker_text = _deepgram_words_to_speaker_lines(words)
+        if speaker_text:
+            return speaker_text
+    except (KeyError, TypeError, IndexError, AttributeError):
+        pass
+    return extract_transcript_text(payload)
+
+
+def format_live_result_text(result: Any) -> str:
+    try:
+        channel = _deepgram_value(result, "channel")
+        alternatives = _deepgram_value(channel, "alternatives", [])
+        if not alternatives:
+            return ""
+        primary = alternatives[0]
+        words = _deepgram_value(primary, "words", [])
+        speaker_text = _deepgram_words_to_speaker_lines(words)
+        if speaker_text:
+            return speaker_text
+        return str(_deepgram_value(primary, "transcript", "")).strip()
+    except Exception:
         return ""
 
 
@@ -314,6 +384,44 @@ def build_live_transcript_output_path(output_dir: Path = TRANSCRIPTS_DIR) -> Pat
 
 def build_live_transcript_metadata_path(transcript_path: Path) -> Path:
     return transcript_path.with_suffix(".json")
+
+
+def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
+    try:
+        samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+    except Exception:
+        return None
+    if samples.size == 0:
+        return None
+
+    normalized = samples / 32768.0
+    rms = float(np.sqrt(np.mean(normalized * normalized)))
+    peak = float(np.max(np.abs(normalized)))
+
+    if rms < 0.0015:
+        state = "silent"
+        color = "#F57C00"
+        detail = "No meaningful audio is reaching the selected input."
+    elif rms < 0.008:
+        state = "low"
+        color = "#F9A825"
+        detail = "Audio is reaching the selected input, but the level is very low."
+    elif peak > 0.95:
+        state = "clipping"
+        color = "#D32F2F"
+        detail = "Audio is reaching the selected input, but the signal is clipping."
+    else:
+        state = "active"
+        color = "#66BB6A"
+        detail = "Audio is reaching the selected input before Deepgram."
+
+    return {
+        "state": state,
+        "rms": rms,
+        "peak": peak,
+        "color": color,
+        "detail": detail,
+    }
 
 
 def normalize_audio_device_name(name: str) -> str:
@@ -727,7 +835,7 @@ class DeepgramFileTranscriber:
             debug_log(f"[DeepgramFileTranscriber] Invalid JSON for {media_path.name}: {exc}", level="error")
             return False, f"Deepgram returned invalid JSON: {exc}"
 
-        transcript_text = extract_transcript_text(payload)
+        transcript_text = format_deepgram_payload_text(payload)
         transcript_path, payload_path = build_transcript_output_paths(media_path, output_dir=output_dir)
 
         try:
@@ -759,6 +867,7 @@ class LiveTranscriptionSession:
         numerals: bool,
         on_transcript,
         on_status,
+        on_signal,
     ):
         self.api_key = api_key.strip()
         self.input_device_name = input_device_name.strip()
@@ -771,6 +880,7 @@ class LiveTranscriptionSession:
         self.numerals = bool(numerals)
         self.on_transcript = on_transcript
         self.on_status = on_status
+        self.on_signal = on_signal
         self.connection = None
         self.stream = None
         self.transcript_path: Path | None = None
@@ -782,6 +892,9 @@ class LiveTranscriptionSession:
         self.actual_device_name = self.input_device_name
         self.started_at = ""
         self.stopped_at = ""
+        self.callback_count = 0
+        self.last_signal_debug_at = 0.0
+        self.last_signal_status = ""
 
     def start(self) -> tuple[bool, str]:
         debug_log(
@@ -914,9 +1027,11 @@ class LiveTranscriptionSession:
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if not self.running or self.connection is None:
             return
+        self.callback_count += 1
         if status:
             debug_log(f"[LiveTranscriptionSession] Audio callback status: {status}", level="warning")
             self.on_status(f"Audio stream status: {status}")
+        self._report_input_signal(bytes(indata))
         try:
             self.connection.send(bytes(indata))
         except Exception as exc:
@@ -940,12 +1055,7 @@ class LiveTranscriptionSession:
         if result is None:
             return
 
-        try:
-            alternatives = result.channel.alternatives
-            transcript = alternatives[0].transcript.strip() if alternatives else ""
-        except Exception:
-            transcript = ""
-
+        transcript = format_live_result_text(result)
         if not transcript:
             return
 
@@ -1000,6 +1110,41 @@ class LiveTranscriptionSession:
         else:
             debug_log(f"[LiveTranscriptionSession] Metadata updated -> {self.metadata_path.name}")
 
+    def _report_input_signal(self, raw_bytes: bytes) -> None:
+        now = time.time()
+        if now - self.last_signal_debug_at < 2.0:
+            return
+
+        signal = analyze_live_input_signal(raw_bytes)
+        if signal is None:
+            return
+
+        self.last_signal_debug_at = now
+        self.on_signal(
+            {
+                **signal,
+                "device_name": self.actual_device_name,
+                "mode_name": self.mode_name,
+            }
+        )
+
+        rms = float(signal["rms"])
+        peak = float(signal["peak"])
+        state = str(signal["state"])
+        if state == "silent":
+            status_text = f"Live input looks silent on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
+        elif state == "low":
+            status_text = f"Live input is very low on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
+        elif state == "clipping":
+            status_text = f"Live input is clipping on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
+        else:
+            status_text = f"Live input active on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
+
+        if status_text != self.last_signal_status:
+            self.last_signal_status = status_text
+            debug_log(f"[LiveTranscriptionSession] {status_text}")
+            self.on_status(status_text)
+
 
 class App:
     def __init__(self) -> None:
@@ -1027,14 +1172,15 @@ class App:
         self.live_transcription_session: LiveTranscriptionSession | None = None
         self.live_transcript_final_text = ""
         self.live_transcript_interim_text = ""
+        self.live_signal_status_text = "Waiting to sample the selected input."
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
         self.root.title("Virtual Audio Control")
-        self.root.geometry("520x680")
-        self.root.minsize(480, 600)
+        self.root.geometry("920x760")
+        self.root.minsize(820, 640)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1072,110 +1218,141 @@ class App:
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
-        self.main_scroll_frame = ctk.CTkScrollableFrame(self.root, fg_color="transparent")
-        self.main_scroll_frame.pack(fill="both", expand=True)
-        self.main_scroll_frame.grid_columnconfigure(0, weight=1)
-        self.ui_parent = self.main_scroll_frame
+        app_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        app_frame.pack(fill="both", expand=True)
+        app_frame.grid_columnconfigure(0, weight=1)
+        app_frame.grid_rowconfigure(1, weight=1)
 
-        header_frame = ctk.CTkFrame(self.ui_parent, fg_color="transparent")
-        header_frame.pack(pady=8, padx=20, fill="x")
+        header_frame = ctk.CTkFrame(app_frame, fg_color="transparent")
+        header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(12, 8))
+        header_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             header_frame,
             text="Audio Control Panel Pro",
             font=("Arial", 20, "bold"),
-        ).pack()
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(
             header_frame,
             text="Real-Time WER Optimization for Deepgram",
             font=("Arial", 10),
             text_color="#888888",
-        ).pack(pady=(2, 0))
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        self.meter = AudioLevelMeter(self.ui_parent, width=480, height=80)
-        self.meter.pack(pady=6, padx=20, fill="x")
+        self.header_mode_chip = ctk.CTkLabel(
+            header_frame,
+            text="",
+            width=120,
+            height=32,
+            corner_radius=16,
+            font=("Arial", 11, "bold"),
+            fg_color="#1F6AA5",
+        )
+        self.header_mode_chip.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        self.wer_status_frame = ctk.CTkFrame(self.ui_parent, fg_color="#1a1a1a")
-        self.wer_status_frame.pack(pady=6, padx=20, fill="x")
+        self.tabview = ctk.CTkTabview(app_frame)
+        self.tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
 
-        status_header = ctk.CTkFrame(self.wer_status_frame, fg_color="transparent")
-        status_header.pack(pady=6, padx=10, fill="x")
+        self.dashboard_tab = self._create_tab_scroll_frame("Dashboard")
+        self.routing_tab = self._create_tab_scroll_frame("Routing")
+        self.transcribe_tab = self._create_tab_scroll_frame("Transcribe")
+        self.settings_tab = self._create_tab_scroll_frame("Settings")
+        self.advanced_tab = self._create_tab_scroll_frame("Advanced")
+
+        self._build_dashboard_tab()
+        self._build_routing_tab()
+        self._build_transcribe_tab()
+        self._build_settings_tab()
+        self._build_advanced_tab()
+
+        status_bar = ctk.CTkFrame(app_frame, corner_radius=10)
+        status_bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+        status_bar.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            status_bar,
+            textvariable=self.status_var,
+            font=("Arial", 10),
+            text_color="#4CAF50",
+            anchor="w",
+        )
+        self.status_label.grid(row=0, column=0, sticky="w", padx=12, pady=(8, 2))
 
         ctk.CTkLabel(
-            status_header,
-            text="WER OPTIMIZATION",
-            font=("Arial", 12, "bold"),
-        ).pack(side="left")
-
-        self.monitoring_toggle = ctk.CTkSwitch(
-            status_header,
-            text="Monitor",
-            variable=self.wer_enabled_var,
-            command=self.toggle_wer_monitoring,
-            onvalue=True,
-            offvalue=False,
-        )
-        self.monitoring_toggle.pack(side="right")
-        if self.wer_enabled_var.get():
-            self.monitoring_toggle.select()
-
-        status_content = ctk.CTkFrame(self.wer_status_frame, fg_color="#252525")
-        status_content.pack(pady=6, padx=10, fill="x")
-
-        status_row = ctk.CTkFrame(status_content, fg_color="transparent")
-        status_row.pack(pady=4, padx=10, fill="x")
-
-        ctk.CTkLabel(status_row, text="Quality:", font=("Arial", 10), width=60, anchor="w").pack(side="left")
-        self.monitor_status_label = ctk.CTkLabel(
-            status_row,
-            text="Excellent",
-            font=("Arial", 10, "bold"),
-            text_color="#66BB6A",
-        )
-        self.monitor_status_label.pack(side="left", padx=(0, 10))
-
-        ctk.CTkLabel(status_row, text="|", text_color="#444444").pack(side="left", padx=5)
-        ctk.CTkLabel(status_row, text="Stability:", font=("Arial", 10), width=60, anchor="w").pack(side="left")
-        self.monitor_stability_label = ctk.CTkLabel(
-            status_row,
-            text="Stable",
-            font=("Arial", 10, "bold"),
-            text_color="#66BB6A",
-        )
-        self.monitor_stability_label.pack(side="left", padx=(0, 10))
-
-        ctk.CTkLabel(status_row, text="|", text_color="#444444").pack(side="left", padx=5)
-        ctk.CTkLabel(status_row, text="Est. WER:", font=("Arial", 10), width=60, anchor="w").pack(side="left")
-        self.monitor_wer_label = ctk.CTkLabel(
-            status_row,
-            text="3-7%",
-            font=("Arial", 10, "bold"),
-            text_color="#66BB6A",
-        )
-        self.monitor_wer_label.pack(side="left")
-
-        self.warnings_box = ctk.CTkTextbox(
-            status_content,
-            height=60,
+            status_bar,
+            text="Shortcuts: Ctrl+1 Dashboard | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | Ctrl+5 Advanced | F5 Refresh",
             font=("Arial", 9),
-            fg_color="#1a1a1a",
-            wrap="word",
-        )
-        self.warnings_box.pack(pady=6, padx=10, fill="x")
-        self._set_warnings_text(self.monitor_recommendation_var.get())
+            text_color="#A0A0A0",
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 2))
 
-        mode_frame = ctk.CTkFrame(self.ui_parent)
-        mode_frame.pack(pady=6, padx=20, fill="x")
+        ctk.CTkLabel(
+            status_bar,
+            textvariable=self.footer_var,
+            font=("Arial", 8),
+            text_color="#555555",
+            anchor="e",
+        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=12)
+
+        self._bind_shortcuts()
+
+    def _create_tab_scroll_frame(self, tab_name: str) -> ctk.CTkScrollableFrame:
+        self.tabview.add(tab_name)
+        tab = self.tabview.tab(tab_name)
+        tab.grid_columnconfigure(0, weight=1)
+        scroll_frame = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        scroll_frame.grid_columnconfigure(0, weight=1)
+        return scroll_frame
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind("<Control-1>", lambda event: self._select_tab("Dashboard"))
+        self.root.bind("<Control-2>", lambda event: self._select_tab("Routing"))
+        self.root.bind("<Control-3>", lambda event: self._select_tab("Transcribe"))
+        self.root.bind("<Control-4>", lambda event: self._select_tab("Settings"))
+        self.root.bind("<Control-5>", lambda event: self._select_tab("Advanced"))
+        self.root.bind("<F5>", lambda event: self.refresh_detected_devices())
+
+    def _select_tab(self, tab_name: str) -> str:
+        self.tabview.set(tab_name)
+        return "break"
+
+    def _add_section_title(self, parent, title: str, subtitle: str | None = None) -> None:
+        ctk.CTkLabel(
+            parent,
+            text=title,
+            font=("Arial", 13, "bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+        if subtitle:
+            ctk.CTkLabel(
+                parent,
+                text=subtitle,
+                font=("Arial", 9),
+                text_color="#A9A9A9",
+                anchor="w",
+                wraplength=760,
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=(0, 6))
+
+    def _build_dashboard_tab(self) -> None:
+        self.dashboard_tab.grid_columnconfigure(0, weight=1)
+
+        mode_frame = ctk.CTkFrame(self.dashboard_tab)
+        mode_frame.pack(fill="x", padx=6, pady=(0, 8))
 
         ctk.CTkLabel(
             mode_frame,
-            text="Active Mode:",
-            font=("Arial", 11),
-        ).pack(pady=(5, 2))
+            text="Current Mode",
+            font=("Arial", 10),
+            text_color="#A9A9A9",
+        ).pack(anchor="w", padx=12, pady=(10, 2))
 
         mode_summary_row = ctk.CTkFrame(mode_frame, fg_color="transparent")
-        mode_summary_row.pack(fill="x", padx=12, pady=(0, 2))
+        mode_summary_row.pack(fill="x", padx=12, pady=(0, 6))
 
         mode_text_frame = ctk.CTkFrame(mode_summary_row, fg_color="transparent")
         mode_text_frame.pack(side="left", fill="both", expand=True)
@@ -1183,7 +1360,7 @@ class App:
         self.mode_display = ctk.CTkLabel(
             mode_text_frame,
             text=f"{self.current_mode}",
-            font=("Arial", 16, "bold"),
+            font=("Arial", 20, "bold"),
             text_color="#4CAF50",
             anchor="w",
         )
@@ -1193,9 +1370,9 @@ class App:
             mode_text_frame,
             text="",
             text_color="#C6C6C6",
-            font=("Arial", 10),
+            font=("Arial", 9),
             anchor="w",
-            wraplength=330,
+            wraplength=500,
             justify="left",
         )
         self.mode_device_label.pack(anchor="w", pady=(1, 0))
@@ -1203,363 +1380,365 @@ class App:
         self.mode_badge_label = ctk.CTkLabel(
             mode_summary_row,
             text="",
-            width=96,
-            height=42,
-            corner_radius=8,
+            width=116,
+            height=40,
+            corner_radius=12,
             font=("Arial", 10, "bold"),
             fg_color="#2E7D32",
         )
         self.mode_badge_label.pack(side="right", padx=(10, 0))
 
+        info_grid = ctk.CTkFrame(mode_frame, fg_color="transparent")
+        info_grid.pack(fill="x", padx=12, pady=(0, 8))
+        info_grid.grid_columnconfigure(0, weight=1)
+        info_grid.grid_columnconfigure(1, weight=1)
+
         self.mode_hint_label = ctk.CTkLabel(
-            mode_frame,
+            info_grid,
             text="",
             text_color="#8AB4F8",
             font=("Arial", 9),
-            wraplength=460,
-            justify="center",
+            wraplength=340,
+            justify="left",
+            anchor="w",
         )
-        self.mode_hint_label.pack(pady=(0, 5), padx=12)
+        self.mode_hint_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
 
         self.mode_status_label = ctk.CTkLabel(
-            mode_frame,
+            info_grid,
             text="",
             text_color="#C6C6C6",
             font=("Arial", 9),
-            wraplength=460,
-            justify="center",
+            wraplength=340,
+            justify="left",
+            anchor="w",
         )
-        self.mode_status_label.pack(pady=(0, 6), padx=12)
+        self.mode_status_label.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         self.mode_route_label = ctk.CTkLabel(
             mode_frame,
             text="",
             text_color="#64B5F6",
-            font=("Arial", 10, "bold"),
-            wraplength=460,
-            justify="center",
+            font=("Arial", 9, "bold"),
+            wraplength=760,
+            justify="left",
+            anchor="w",
         )
-        self.mode_route_label.pack(pady=(0, 8), padx=12)
+        self.mode_route_label.pack(fill="x", padx=12, pady=(0, 8))
 
-        button_frame = ctk.CTkFrame(self.ui_parent)
-        button_frame.pack(pady=6, padx=20, fill="x")
+        self.meter = AudioLevelMeter(mode_frame, width=760, height=78)
+        self.meter.pack(fill="x", padx=12, pady=(0, 10))
+
+        content_grid = ctk.CTkFrame(self.dashboard_tab, fg_color="transparent")
+        content_grid.pack(fill="x", padx=6, pady=(0, 6))
+        content_grid.grid_columnconfigure(0, weight=1)
+        content_grid.grid_columnconfigure(1, weight=1)
+
+        self.wer_status_frame = ctk.CTkFrame(content_grid, fg_color="#1A1A1A")
+        self.wer_status_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        status_header = ctk.CTkFrame(self.wer_status_frame, fg_color="transparent")
+        status_header.pack(fill="x", padx=12, pady=(10, 6))
+
+        ctk.CTkLabel(
+            status_header,
+            text="WER Optimization",
+            font=("Arial", 11, "bold"),
+        ).pack(side="left")
+
+        self.monitoring_toggle = ctk.CTkSwitch(
+            status_header,
+            text="Monitor",
+            variable=self.wer_enabled_var,
+            command=self.toggle_wer_monitoring,
+            onvalue=True,
+            offvalue=False,
+            width=78,
+        )
+        self.monitoring_toggle.pack(side="right")
+        if self.wer_enabled_var.get():
+            self.monitoring_toggle.select()
+
+        status_row = ctk.CTkFrame(self.wer_status_frame, fg_color="transparent")
+        status_row.pack(fill="x", padx=12, pady=(0, 4))
+
+        ctk.CTkLabel(status_row, text="Quality", font=("Arial", 9), width=52, anchor="w").pack(side="left")
+        self.monitor_status_label = ctk.CTkLabel(
+            status_row,
+            text="Excellent",
+            font=("Arial", 9, "bold"),
+            text_color="#66BB6A",
+        )
+        self.monitor_status_label.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(status_row, text="Stability", font=("Arial", 9), width=54, anchor="w").pack(side="left")
+        self.monitor_stability_label = ctk.CTkLabel(
+            status_row,
+            text="Stable",
+            font=("Arial", 9, "bold"),
+            text_color="#66BB6A",
+        )
+        self.monitor_stability_label.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(status_row, text="WER", font=("Arial", 9), width=34, anchor="w").pack(side="left")
+        self.monitor_wer_label = ctk.CTkLabel(
+            status_row,
+            text="3-7%",
+            font=("Arial", 9, "bold"),
+            text_color="#66BB6A",
+        )
+        self.monitor_wer_label.pack(side="left")
+
+        self.warnings_box = ctk.CTkTextbox(
+            self.wer_status_frame,
+            height=52,
+            font=("Arial", 9),
+            fg_color="#121212",
+            wrap="word",
+        )
+        self.warnings_box.pack(fill="x", padx=12, pady=(0, 10))
+        self._set_warnings_text(self.monitor_recommendation_var.get())
+
+        controls_frame = ctk.CTkFrame(content_grid)
+        controls_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self._add_section_title(controls_frame, "Run Controls")
+
+        mode_buttons = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        mode_buttons.pack(fill="x", padx=12, pady=(0, 8))
+        for column in range(3):
+            mode_buttons.grid_columnconfigure(column, weight=1)
 
         self.btn_mic = ctk.CTkButton(
-            button_frame,
-            text="Microphone\nLive speaking | WER 10-15%",
+            mode_buttons,
+            text="Microphone",
             command=lambda: self.switch_mode("Microphone", self.mic_var.get()),
-            height=42,
-            font=("Arial", 11, "bold"),
+            height=40,
+            font=("Arial", 10, "bold"),
         )
-        self.btn_mic.pack(pady=4, padx=15, fill="x")
+        self.btn_mic.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self.btn_vac = ctk.CTkButton(
-            button_frame,
-            text="Virtual Audio Cable\nPlayback routing | WER 3-7% BEST",
+            mode_buttons,
+            text="VAC",
             command=lambda: self.switch_mode("VAC", self.vac_var.get()),
-            height=42,
-            font=("Arial", 11, "bold"),
+            height=40,
+            font=("Arial", 10, "bold"),
             fg_color="#2E7D32",
             hover_color="#1B5E20",
         )
-        self.btn_vac.pack(pady=4, padx=15, fill="x")
-
-        self.btn_vac_test = ctk.CTkButton(
-            button_frame,
-            text="Test VAC Routing",
-            command=self.test_vac_routing,
-            height=34,
-            font=("Arial", 10, "bold"),
-            fg_color="#1565C0",
-            hover_color="#0D47A1",
-        )
-        self.btn_vac_test.pack(pady=(0, 6), padx=15, fill="x")
+        self.btn_vac.grid(row=0, column=1, sticky="ew", padx=4)
 
         self.btn_mix = ctk.CTkButton(
-            button_frame,
-            text="Mixed Mode\nMic + system audio | WER 5-10%",
+            mode_buttons,
+            text="Mixed",
             command=lambda: self.switch_mode("Mixed", self.mix_var.get()),
-            height=42,
-            font=("Arial", 11, "bold"),
+            height=40,
+            font=("Arial", 10, "bold"),
         )
-        self.btn_mix.pack(pady=4, padx=15, fill="x")
+        self.btn_mix.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        self.dashboard_live_input_label = ctk.CTkLabel(
+            controls_frame,
+            text="Live input source: " + self._current_live_input_device_name(),
+            font=("Arial", 9, "bold"),
+            text_color="#8AB4F8",
+            anchor="w",
+            justify="left",
+        )
+        self.dashboard_live_input_label.pack(fill="x", padx=12, pady=(0, 8))
+
+        dashboard_live_actions = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        dashboard_live_actions.pack(fill="x", padx=12, pady=(0, 10))
+        for column in range(3):
+            dashboard_live_actions.grid_columnconfigure(column, weight=1)
+
+        self.btn_start_live = ctk.CTkButton(
+            dashboard_live_actions,
+            text="Start",
+            command=self.start_live_transcription,
+            height=36,
+            font=("Arial", 10, "bold"),
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+        )
+        self.btn_start_live.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.btn_stop_live = ctk.CTkButton(
+            dashboard_live_actions,
+            text="Stop",
+            command=self.stop_live_transcription,
+            height=36,
+            font=("Arial", 10, "bold"),
+            fg_color="#B71C1C",
+            hover_color="#7F1010",
+            state="disabled",
+        )
+        self.btn_stop_live.grid(row=0, column=1, sticky="ew", padx=4)
 
         self.mute_button = ctk.CTkButton(
-            button_frame,
-            text="Mute Toggle",
+            dashboard_live_actions,
+            text="Mute",
             command=self.toggle_mute,
-            height=35,
+            height=36,
             font=("Arial", 10),
-            fg_color="#d32f2f",
-            hover_color="#b71c1c",
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
         )
-        self.mute_button.pack(pady=6, padx=15, fill="x")
+        self.mute_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
-        self._build_direct_device_controls()
-        self._build_transcription_controls()
-        self._build_live_transcription_controls()
-
-        util_frame = ctk.CTkFrame(self.ui_parent)
-        util_frame.pack(pady=6, padx=20, fill="x")
-
-        utils_row = ctk.CTkFrame(util_frame, fg_color="transparent")
-        utils_row.pack(fill="x", padx=5, pady=4)
-
-        ctk.CTkButton(
-            utils_row,
-            text="Settings",
-            command=self.open_config,
-            height=28,
-            font=("Arial", 9),
-            width=150,
-        ).pack(side="left", padx=3, expand=True, fill="x")
-
-        ctk.CTkButton(
-            utils_row,
-            text="Help",
-            command=self.show_help,
-            height=28,
-            font=("Arial", 9),
-            width=150,
-        ).pack(side="left", padx=3, expand=True, fill="x")
-
-        self.status_label = ctk.CTkLabel(
-            self.ui_parent,
-            textvariable=self.status_var,
-            font=("Arial", 9),
-            text_color="#4CAF50",
-        )
-        self.status_label.pack(pady=6)
-
-        ctk.CTkLabel(
-            self.ui_parent,
-            textvariable=self.footer_var,
-            font=("Arial", 8),
-            text_color="#555555",
-        ).pack(pady=(0, 6))
-
-    def _build_direct_device_controls(self) -> None:
-        control_frame = ctk.CTkFrame(self.ui_parent)
-        control_frame.pack(pady=6, padx=20, fill="x")
-
-        ctk.CTkLabel(
-            control_frame,
-            text="Direct Audio Device Control",
-            font=("Arial", 12, "bold"),
-        ).pack(anchor="w", padx=12, pady=(8, 4))
-
-        ctk.CTkLabel(
-            control_frame,
-            text="Change Windows recording and playback devices directly from here.",
-            font=("Arial", 9),
-            text_color="#C6C6C6",
-            wraplength=460,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 8))
+    def _build_routing_tab(self) -> None:
+        routing_frame = ctk.CTkFrame(self.routing_tab)
+        routing_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(routing_frame, "Windows Audio Routing", "Device selection only. Diagnostics moved to Advanced.")
 
         self.direct_recording_menu = self._add_device_selector(
-            control_frame,
+            routing_frame,
             "Recording input",
             self.direct_recording_var,
             self.detected_input_devices,
         )
 
-        direct_recording_actions = ctk.CTkFrame(control_frame, fg_color="transparent")
-        direct_recording_actions.pack(fill="x", padx=10, pady=(0, 6))
+        direct_recording_actions = ctk.CTkFrame(routing_frame, fg_color="transparent")
+        direct_recording_actions.pack(fill="x", padx=10, pady=(0, 8))
         ctk.CTkButton(
             direct_recording_actions,
             text="Set Input",
             command=self.apply_selected_recording_device,
-            height=28,
-            font=("Arial", 9, "bold"),
+            height=32,
+            font=("Arial", 10, "bold"),
         ).pack(side="left", expand=True, fill="x")
 
         self.direct_playback_menu = self._add_device_selector(
-            control_frame,
+            routing_frame,
             "Playback output",
             self.direct_playback_var,
             self.detected_output_devices,
         )
 
-        direct_playback_actions = ctk.CTkFrame(control_frame, fg_color="transparent")
-        direct_playback_actions.pack(fill="x", padx=10, pady=(0, 6))
+        direct_playback_actions = ctk.CTkFrame(routing_frame, fg_color="transparent")
+        direct_playback_actions.pack(fill="x", padx=10, pady=(0, 8))
         ctk.CTkButton(
             direct_playback_actions,
             text="Set Output",
             command=self.apply_selected_playback_device,
-            height=28,
-            font=("Arial", 9, "bold"),
+            height=32,
+            font=("Arial", 10, "bold"),
         ).pack(side="left", expand=True, fill="x")
 
-        preset_row = ctk.CTkFrame(control_frame, fg_color="transparent")
-        preset_row.pack(fill="x", padx=10, pady=(0, 8))
+        self.route_vac_playback_menu = self._add_device_selector(
+            routing_frame,
+            "VAC playback target",
+            self.vac_playback_var,
+            self.detected_output_devices,
+        )
+        self.route_mix_menu = self._add_device_selector(
+            routing_frame,
+            "Voicemeeter input",
+            self.mix_var,
+            self.detected_input_devices,
+        )
+
+        preset_row = ctk.CTkFrame(routing_frame, fg_color="transparent")
+        preset_row.pack(fill="x", padx=10, pady=(4, 8))
 
         ctk.CTkButton(
             preset_row,
-            text="Normal",
+            text="Normal Preset",
             command=lambda: self.apply_device_preset("normal"),
-            height=30,
+            height=34,
             font=("Arial", 9, "bold"),
         ).pack(side="left", padx=(0, 6), expand=True, fill="x")
 
         ctk.CTkButton(
             preset_row,
-            text="VAC",
+            text="VAC Preset",
             command=lambda: self.apply_device_preset("vac"),
-            height=30,
+            height=34,
             font=("Arial", 9, "bold"),
             fg_color="#2E7D32",
             hover_color="#1B5E20",
-        ).pack(side="left", padx=3, expand=True, fill="x")
+        ).pack(side="left", padx=6, expand=True, fill="x")
 
         ctk.CTkButton(
             preset_row,
-            text="Voicemeeter",
+            text="Voicemeeter Preset",
             command=lambda: self.apply_device_preset("mixed"),
-            height=30,
+            height=34,
             font=("Arial", 9, "bold"),
         ).pack(side="left", padx=(6, 0), expand=True, fill="x")
 
-        utility_row = ctk.CTkFrame(control_frame, fg_color="transparent")
-        utility_row.pack(fill="x", padx=10, pady=(0, 10))
+        utility_row = ctk.CTkFrame(routing_frame, fg_color="transparent")
+        utility_row.pack(fill="x", padx=10, pady=(0, 12))
+
         ctk.CTkButton(
             utility_row,
             text="Refresh Devices",
             command=self.refresh_detected_devices,
-            height=28,
-            font=("Arial", 9),
+            height=34,
+            font=("Arial", 10),
         ).pack(side="left", expand=True, fill="x")
 
-    def _build_transcription_controls(self) -> None:
-        transcription_frame = ctk.CTkFrame(self.ui_parent)
-        transcription_frame.pack(pady=6, padx=20, fill="x")
-
-        ctk.CTkLabel(
-            transcription_frame,
-            text="Deepgram File Transcription",
-            font=("Arial", 12, "bold"),
-        ).pack(anchor="w", padx=12, pady=(8, 4))
-
-        ctk.CTkLabel(
-            transcription_frame,
-            text="Use saved Zoom recordings, YouTube downloads, and other media files.",
-            font=("Arial", 9),
-            text_color="#C6C6C6",
-            wraplength=460,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 4))
-
+    def _build_transcribe_tab(self) -> None:
         api_key_ready = bool(get_deepgram_api_key())
+
+        file_frame = ctk.CTkFrame(self.transcribe_tab)
+        file_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(file_frame, "File Transcription")
+
         self.transcription_status_label = ctk.CTkLabel(
-            transcription_frame,
+            file_frame,
             text=(
                 ("Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env")
                 + "\n"
                 + self._deepgram_options_summary()
             ),
-            font=("Arial", 9, "bold"),
-            text_color="#66BB6A" if api_key_ready else "#F9A825",
-            wraplength=460,
-            justify="left",
-        )
-        self.transcription_status_label.pack(anchor="w", padx=12, pady=(0, 8))
-
-        options_frame = ctk.CTkFrame(transcription_frame, fg_color="transparent")
-        options_frame.pack(fill="x", padx=10, pady=(0, 8))
-
-        ctk.CTkLabel(
-            options_frame,
-            text="Deepgram Options",
             font=("Arial", 10, "bold"),
-        ).pack(anchor="w", padx=2, pady=(0, 4))
+            text_color="#66BB6A" if api_key_ready else "#F9A825",
+            wraplength=760,
+            justify="left",
+            anchor="w",
+        )
+        self.transcription_status_label.pack(fill="x", padx=14, pady=(0, 10))
 
-        ctk.CTkSwitch(
-            options_frame,
-            text="Smart Format",
-            variable=self.deepgram_smart_format_var,
-            command=self._save_deepgram_options,
-        ).pack(anchor="w", padx=2, pady=2)
-
-        ctk.CTkSwitch(
-            options_frame,
-            text="Diarization",
-            variable=self.deepgram_diarize_var,
-            command=self._save_deepgram_options,
-        ).pack(anchor="w", padx=2, pady=2)
-
-        ctk.CTkSwitch(
-            options_frame,
-            text="Paragraphs",
-            variable=self.deepgram_paragraphs_var,
-            command=self._save_deepgram_options,
-        ).pack(anchor="w", padx=2, pady=2)
-
-        ctk.CTkSwitch(
-            options_frame,
-            text="Filler Words",
-            variable=self.deepgram_filler_words_var,
-            command=self._save_deepgram_options,
-        ).pack(anchor="w", padx=2, pady=2)
-
-        ctk.CTkSwitch(
-            options_frame,
-            text="Numerals",
-            variable=self.deepgram_numerals_var,
-            command=self._save_deepgram_options,
-        ).pack(anchor="w", padx=2, pady=2)
-
-        transcription_actions = ctk.CTkFrame(transcription_frame, fg_color="transparent")
-        transcription_actions.pack(fill="x", padx=10, pady=(0, 10))
+        transcription_actions = ctk.CTkFrame(file_frame, fg_color="transparent")
+        transcription_actions.pack(fill="x", padx=12, pady=(0, 12))
+        for column in range(2):
+            transcription_actions.grid_columnconfigure(column, weight=1)
 
         self.btn_transcribe_file = ctk.CTkButton(
             transcription_actions,
             text="Transcribe File",
             command=self.transcribe_media_file,
-            height=34,
+            height=36,
             font=("Arial", 10, "bold"),
             fg_color="#1565C0",
             hover_color="#0D47A1",
         )
-        self.btn_transcribe_file.pack(side="left", padx=(0, 6), expand=True, fill="x")
+        self.btn_transcribe_file.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ctk.CTkButton(
             transcription_actions,
             text="Open Transcripts Folder",
             command=self.open_transcripts_folder,
-            height=34,
+            height=36,
             font=("Arial", 10),
-        ).pack(side="left", padx=(6, 0), expand=True, fill="x")
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-    def _build_live_transcription_controls(self) -> None:
-        live_frame = ctk.CTkFrame(self.ui_parent)
-        live_frame.pack(pady=6, padx=20, fill="x")
-
-        ctk.CTkLabel(
-            live_frame,
-            text="Live Transcription",
-            font=("Arial", 12, "bold"),
-        ).pack(anchor="w", padx=12, pady=(8, 4))
-
-        ctk.CTkLabel(
-            live_frame,
-            text="Streams the currently active recording device to Deepgram and saves the session transcript automatically.",
-            font=("Arial", 9),
-            text_color="#C6C6C6",
-            wraplength=460,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 6))
+        live_frame = ctk.CTkFrame(self.transcribe_tab)
+        live_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(live_frame, "Live Transcription")
 
         self.live_transcription_device_label = ctk.CTkLabel(
             live_frame,
             text="Live input source: " + self._current_live_input_device_name(),
-            font=("Arial", 9, "bold"),
+            font=("Arial", 10, "bold"),
             text_color="#8AB4F8",
-            wraplength=460,
+            wraplength=760,
             justify="left",
+            anchor="w",
         )
-        self.live_transcription_device_label.pack(anchor="w", padx=12, pady=(0, 6))
+        self.live_transcription_device_label.pack(fill="x", padx=14, pady=(0, 6))
 
-        api_key_ready = bool(get_deepgram_api_key())
         self.live_transcription_key_label = ctk.CTkLabel(
             live_frame,
             text=(
@@ -1567,17 +1746,20 @@ class App:
                 + "\n"
                 + self._deepgram_options_summary()
             ),
-            font=("Arial", 9, "bold"),
+            font=("Arial", 10, "bold"),
             text_color="#66BB6A" if api_key_ready else "#F9A825",
-            wraplength=460,
+            wraplength=760,
             justify="left",
+            anchor="w",
         )
-        self.live_transcription_key_label.pack(anchor="w", padx=12, pady=(0, 6))
+        self.live_transcription_key_label.pack(fill="x", padx=14, pady=(0, 6))
 
         live_actions = ctk.CTkFrame(live_frame, fg_color="transparent")
-        live_actions.pack(fill="x", padx=10, pady=(0, 8))
+        live_actions.pack(fill="x", padx=12, pady=(0, 8))
+        for column in range(2):
+            live_actions.grid_columnconfigure(column, weight=1)
 
-        self.btn_start_live = ctk.CTkButton(
+        self.transcribe_btn_start_live = ctk.CTkButton(
             live_actions,
             text="Start Live Transcription",
             command=self.start_live_transcription,
@@ -1586,9 +1768,9 @@ class App:
             fg_color="#2E7D32",
             hover_color="#1B5E20",
         )
-        self.btn_start_live.pack(side="left", padx=(0, 6), expand=True, fill="x")
+        self.transcribe_btn_start_live.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-        self.btn_stop_live = ctk.CTkButton(
+        self.transcribe_btn_stop_live = ctk.CTkButton(
             live_actions,
             text="Stop Live Transcription",
             command=self.stop_live_transcription,
@@ -1598,35 +1780,175 @@ class App:
             hover_color="#7F1010",
             state="disabled",
         )
-        self.btn_stop_live.pack(side="left", padx=(6, 0), expand=True, fill="x")
+        self.transcribe_btn_stop_live.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         self.live_transcription_status_label = ctk.CTkLabel(
             live_frame,
             text="Idle",
-            font=("Arial", 9, "bold"),
+            font=("Arial", 10, "bold"),
             text_color="#C6C6C6",
-            wraplength=460,
+            wraplength=760,
             justify="left",
+            anchor="w",
         )
-        self.live_transcription_status_label.pack(anchor="w", padx=12, pady=(0, 6))
+        self.live_transcription_status_label.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.live_signal_status_label = ctk.CTkLabel(
+            live_frame,
+            text="Input signal: " + self.live_signal_status_text,
+            font=("Arial", 10, "bold"),
+            text_color="#C6C6C6",
+            wraplength=760,
+            justify="left",
+            anchor="w",
+        )
+        self.live_signal_status_label.pack(fill="x", padx=14, pady=(0, 10))
+
+        output_frame = ctk.CTkFrame(self.transcribe_tab)
+        output_frame.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+        self._add_section_title(output_frame, "Transcript Output")
 
         self.live_transcript_box = ctk.CTkTextbox(
-            live_frame,
-            height=180,
+            output_frame,
+            height=260,
             font=("Consolas", 10),
             wrap="word",
         )
-        self.live_transcript_box.pack(fill="x", padx=12, pady=(0, 10))
+        self.live_transcript_box.pack(fill="both", expand=True, padx=14, pady=(0, 12))
         self.live_transcript_box.insert("1.0", "Live transcript will appear here.")
         self.live_transcript_box.configure(state="disabled")
 
-        ctk.CTkButton(
-            live_frame,
-            text="Open Transcripts Folder",
-            command=self.open_transcripts_folder,
-            height=30,
+        advanced_frame = ctk.CTkFrame(self.transcribe_tab)
+        advanced_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(advanced_frame, "Advanced Options")
+
+        self.deepgram_options_visible = False
+        self.deepgram_options_toggle = ctk.CTkButton(
+            advanced_frame,
+            text="Show Deepgram Options",
+            command=self.toggle_deepgram_options,
+            height=32,
+            font=("Arial", 10, "bold"),
+        )
+        self.deepgram_options_toggle.pack(fill="x", padx=14, pady=(0, 8))
+
+        self.deepgram_options_frame = ctk.CTkFrame(advanced_frame, fg_color="transparent")
+        for label, variable in (
+            ("Smart Format", self.deepgram_smart_format_var),
+            ("Diarization", self.deepgram_diarize_var),
+            ("Paragraphs", self.deepgram_paragraphs_var),
+            ("Filler Words", self.deepgram_filler_words_var),
+            ("Numerals", self.deepgram_numerals_var),
+        ):
+            ctk.CTkSwitch(
+                self.deepgram_options_frame,
+                text=label,
+                variable=variable,
+                command=self._save_deepgram_options,
+            ).pack(anchor="w", padx=2, pady=2)
+
+    def _build_settings_tab(self) -> None:
+        settings_frame = ctk.CTkFrame(self.settings_tab)
+        settings_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(settings_frame, "Device Defaults", "Saved values used by mode switching and live transcription.")
+
+        self.detected_devices_label = ctk.CTkLabel(
+            settings_frame,
+            text="Detected input devices: checking...",
+            font=("Arial", 10),
+            wraplength=760,
+            justify="left",
+            text_color="#C6C6C6",
+            anchor="w",
+        )
+        self.detected_devices_label.pack(fill="x", padx=14, pady=(0, 10))
+        self._refresh_detection_summary()
+
+        self.mic_menu = self._add_device_selector(settings_frame, "Microphone device", self.mic_var, self.detected_input_devices)
+        self.vac_menu = self._add_device_selector(settings_frame, "VAC recording device", self.vac_var, self.detected_input_devices)
+        self.speaker_menu = self._add_device_selector(settings_frame, "Speaker playback device", self.speaker_var, self.detected_output_devices)
+        self.vac_playback_menu = self._add_device_selector(settings_frame, "VAC playback target", self.vac_playback_var, self.detected_output_devices)
+        self.mix_menu = self._add_device_selector(settings_frame, "Voicemeeter device", self.mix_var, self.detected_input_devices)
+
+        actions = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(10, 12))
+        for column in range(3):
+            actions.grid_columnconfigure(column, weight=1)
+
+        ctk.CTkButton(actions, text="Refresh Devices", command=self.refresh_detected_devices, height=34).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(actions, text="Open config.json", command=self.open_config_file, height=34).grid(row=0, column=1, sticky="ew", padx=6)
+        ctk.CTkButton(actions, text="Save Settings", command=self.save_settings, height=34).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+        help_frame = ctk.CTkFrame(self.settings_tab)
+        help_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(help_frame, "Help")
+        ctk.CTkLabel(
+            help_frame,
+            text=(
+                "1. Set Zoom microphone to 'Same as System'.\n"
+                "2. Mode buttons change the Windows default recording device for all audio roles.\n"
+                "3. VAC mode also switches Windows playback to the configured CABLE Input target.\n"
+                "4. Mixed mode expects Voicemeeter routing to be configured before use.\n"
+                "5. Use the Advanced tab to run VAC routing diagnostics.\n"
+                "6. Use the Dashboard for day-to-day operation and the Routing tab for setup."
+            ),
+            font=("Arial", 10),
+            text_color="#C6C6C6",
+            justify="left",
+            anchor="w",
+            wraplength=760,
+        ).pack(fill="x", padx=14, pady=(0, 14))
+
+    def _build_advanced_tab(self) -> None:
+        advanced_frame = ctk.CTkFrame(self.advanced_tab)
+        advanced_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(advanced_frame, "Diagnostics", "Use this tab for routing checks and low-level troubleshooting.")
+
+        ctk.CTkLabel(
+            advanced_frame,
+            text="VAC routing test sends a short tone through the configured cable path so you can verify playback and capture are aligned.",
             font=("Arial", 9),
-        ).pack(fill="x", padx=12, pady=(0, 10))
+            text_color="#C6C6C6",
+            justify="left",
+            anchor="w",
+            wraplength=760,
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        self.btn_vac_test = ctk.CTkButton(
+            advanced_frame,
+            text="Test VAC Routing",
+            command=self.test_vac_routing,
+            height=36,
+            font=("Arial", 10, "bold"),
+            fg_color="#1565C0",
+            hover_color="#0D47A1",
+        )
+        self.btn_vac_test.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkButton(
+            advanced_frame,
+            text="Open App Folder",
+            command=self.open_app_folder,
+            height=34,
+            font=("Arial", 10),
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkButton(
+            advanced_frame,
+            text="Open README",
+            command=self.open_readme,
+            height=34,
+            font=("Arial", 10),
+        ).pack(fill="x", padx=12, pady=(0, 12))
+
+    def toggle_deepgram_options(self) -> None:
+        self.deepgram_options_visible = not self.deepgram_options_visible
+        if self.deepgram_options_visible:
+            self.deepgram_options_frame.pack(fill="x", padx=14, pady=(0, 12))
+            self.deepgram_options_toggle.configure(text="Hide Deepgram Options")
+        else:
+            self.deepgram_options_frame.pack_forget()
+            self.deepgram_options_toggle.configure(text="Show Deepgram Options")
 
     def _add_device_selector(self, parent, label: str, variable: ctk.StringVar, devices: list[str]):
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=10)
@@ -1715,7 +2037,9 @@ class App:
             ("vac_menu", self.vac_var, self.detected_input_devices),
             ("speaker_menu", self.speaker_var, self.detected_output_devices),
             ("vac_playback_menu", self.vac_playback_var, self.detected_output_devices),
+            ("route_vac_playback_menu", self.vac_playback_var, self.detected_output_devices),
             ("mix_menu", self.mix_var, self.detected_input_devices),
+            ("route_mix_menu", self.mix_var, self.detected_input_devices),
             ("direct_recording_menu", self.direct_recording_var, self.detected_input_devices),
             ("direct_playback_menu", self.direct_playback_var, self.detected_output_devices),
         ]
@@ -1766,14 +2090,9 @@ class App:
     def save_settings(self) -> None:
         self.save_form_config()
         self.refresh_detected_devices()
-        self._close_settings_window()
+        self.tabview.set("Settings")
 
     def _close_settings_window(self) -> None:
-        if not self.settings_window:
-            return
-        if self.settings_window.winfo_exists():
-            self.settings_window.grab_release()
-            self.settings_window.destroy()
         self.settings_window = None
 
     def apply_selected_recording_device(self) -> None:
@@ -1807,59 +2126,10 @@ class App:
         self.switch_mode(mode_name, recording_device)
 
     def open_config(self) -> None:
-        if self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.focus()
-            return
-
-        self.settings_window = ctk.CTkToplevel(self.root)
-        self.settings_window.title("Settings")
-        self.settings_window.geometry("520x470")
-        self.settings_window.resizable(True, True)
-        self.settings_window.transient(self.root)
-        self.settings_window.grab_set()
-        self.settings_window.protocol("WM_DELETE_WINDOW", self._close_settings_window)
-
-        body = ctk.CTkFrame(self.settings_window)
-        body.pack(fill="both", expand=True, padx=12, pady=12)
-
-        ctk.CTkLabel(body, text="Audio Device Settings", font=("Arial", 16, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
-        self.detected_devices_label = ctk.CTkLabel(
-            body,
-            text="Detected input devices: checking...",
-            font=("Arial", 10),
-            wraplength=460,
-            justify="left",
-            text_color="#C6C6C6",
-        )
-        self.detected_devices_label.pack(anchor="w", padx=10, pady=(0, 6))
-        self._refresh_detection_summary()
-
-        self.mic_menu = self._add_device_selector(body, "Microphone device", self.mic_var, self.detected_input_devices)
-        self.vac_menu = self._add_device_selector(body, "VAC recording device", self.vac_var, self.detected_input_devices)
-        self.speaker_menu = self._add_device_selector(body, "Speaker playback device", self.speaker_var, self.detected_output_devices)
-        self.vac_playback_menu = self._add_device_selector(body, "VAC playback target", self.vac_playback_var, self.detected_output_devices)
-        self.mix_menu = self._add_device_selector(body, "Voicemeeter device", self.mix_var, self.detected_input_devices)
-
-        actions = ctk.CTkFrame(body, fg_color="transparent")
-        actions.pack(fill="x", padx=10, pady=(8, 6))
-        ctk.CTkButton(actions, text="Refresh Devices", command=self.refresh_detected_devices).pack(side="left", expand=True, fill="x")
-        ctk.CTkButton(actions, text="Open config.json", command=self.open_config_file).pack(side="left", expand=True, fill="x", padx=8)
-        ctk.CTkButton(actions, text="Save", command=self.save_settings).pack(side="left", expand=True, fill="x")
+        self.tabview.set("Settings")
 
     def show_help(self) -> None:
-        messagebox.showinfo(
-            "Help",
-            "1. Set Zoom microphone to 'Same as System'.\n"
-            "2. Mode buttons switch the Windows default recording device for all audio roles.\n"
-            "3. VAC mode also switches Windows playback to CABLE Input.\n"
-            "4. Microphone and Mixed modes restore playback to the configured speaker device.\n"
-            "5. Microphone mode is best for live speech.\n"
-            "6. VAC is best for playback-only transcription.\n"
-            "7. CABLE Output is the recording side and CABLE Input is the playback side.\n"
-            "8. Use Test VAC Routing to send a short tone through the cable.\n"
-            "9. Mixed mode needs Voicemeeter routing.\n"
-            "10. Use Settings to refresh devices or update device names.",
-        )
+        self.tabview.set("Settings")
 
     def open_config_file(self) -> None:
         if sys.platform == "win32":
@@ -1926,6 +2196,9 @@ class App:
         label = getattr(self, "live_transcription_device_label", None)
         if label is not None:
             label.configure(text="Live input source: " + self._current_live_input_device_name())
+        dashboard_label = getattr(self, "dashboard_live_input_label", None)
+        if dashboard_label is not None:
+            dashboard_label.configure(text="Live input source: " + self._current_live_input_device_name())
         key_label = getattr(self, "live_transcription_key_label", None)
         if key_label is not None:
             api_key_ready = bool(get_deepgram_api_key())
@@ -1980,6 +2253,14 @@ class App:
         except Exception:
             return
 
+    def _queue_live_signal_update(self, payload: dict[str, Any]) -> None:
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self._apply_live_signal_update(payload))
+        except Exception:
+            return
+
     def _apply_live_status_update(self, message: str) -> None:
         lowered = message.lower()
         is_problem = any(token in lowered for token in ("error", "failed", "unable"))
@@ -1989,16 +2270,33 @@ class App:
         )
         self.status_var.set(message)
 
+    def _apply_live_signal_update(self, payload: dict[str, Any]) -> None:
+        device_name = str(payload.get("device_name", "selected input"))
+        rms = float(payload.get("rms", 0.0))
+        peak = float(payload.get("peak", 0.0))
+        detail = str(payload.get("detail", "")).strip()
+        signal_text = f"Input signal: {detail} Device: {device_name}. RMS {rms:.4f}, Peak {peak:.4f}."
+        self.live_signal_status_text = signal_text
+        self.live_signal_status_label.configure(
+            text=signal_text,
+            text_color=str(payload.get("color", "#C6C6C6")),
+        )
+
     def _set_live_controls_state(self, *, running: bool = False, starting: bool = False) -> None:
         self._live_transcription_running = running
         self._live_transcription_starting = starting
-        if hasattr(self, "btn_start_live") and self.btn_start_live.winfo_exists():
-            self.btn_start_live.configure(
-                state="disabled" if (running or starting) else "normal",
-                text="Starting..." if starting else "Start Live Transcription",
-            )
-        if hasattr(self, "btn_stop_live") and self.btn_stop_live.winfo_exists():
-            self.btn_stop_live.configure(state="normal" if running else "disabled")
+        for button_name in ("btn_start_live", "transcribe_btn_start_live"):
+            button = getattr(self, button_name, None)
+            if button is not None and button.winfo_exists():
+                default_text = "Start" if button_name == "btn_start_live" else "Start Live Transcription"
+                button.configure(
+                    state="disabled" if (running or starting) else "normal",
+                    text="Starting..." if starting else default_text,
+                )
+        for button_name in ("btn_stop_live", "transcribe_btn_stop_live"):
+            button = getattr(self, button_name, None)
+            if button is not None and button.winfo_exists():
+                button.configure(state="normal" if running else "disabled")
 
     def start_live_transcription(self) -> None:
         if self._live_transcription_running or self._live_transcription_starting:
@@ -2022,6 +2320,8 @@ class App:
         self._set_live_controls_state(starting=True)
         self.live_transcript_final_text = ""
         self.live_transcript_interim_text = ""
+        self.live_signal_status_text = f"Waiting for audio on {input_device_name} before sending to Deepgram."
+        self.live_signal_status_label.configure(text="Input signal: " + self.live_signal_status_text, text_color="#F9A825")
         self._render_live_transcript()
         self.live_transcription_status_label.configure(text="Connecting to Deepgram live transcription...", text_color="#F9A825")
         self.status_var.set(f"Starting live transcription from {input_device_name}...")
@@ -2063,6 +2363,7 @@ class App:
             numerals=numerals,
             on_transcript=self._queue_live_transcript_update,
             on_status=self._queue_live_status_update,
+            on_signal=self._queue_live_signal_update,
         )
         success, message = session.start()
         if self._closing:
@@ -2082,6 +2383,8 @@ class App:
             self.live_transcription_session = None
             self._set_live_controls_state(running=False, starting=False)
             self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
+            self.live_signal_status_text = "No live input signal available because the session did not start."
+            self.live_signal_status_label.configure(text="Input signal: " + self.live_signal_status_text, text_color="#F57C00")
             messagebox.showerror("Live Transcription Failed", message)
             self.status_var.set(message)
             return
@@ -2109,6 +2412,8 @@ class App:
             text=message,
             text_color="#66BB6A" if success else "#F57C00",
         )
+        self.live_signal_status_text = "Stopped. Start live transcription to sample the selected input again."
+        self.live_signal_status_label.configure(text="Input signal: " + self.live_signal_status_text, text_color="#C6C6C6")
         self.status_var.set(message)
 
     def transcribe_media_file(self) -> None:
@@ -2290,7 +2595,7 @@ class App:
         if self.is_muted:
             self.mute_button.configure(text="Muted", fg_color="#5F2120", hover_color="#471816")
         else:
-            self.mute_button.configure(text="Mute Toggle", fg_color="#d32f2f", hover_color="#b71c1c")
+            self.mute_button.configure(text="Mute", fg_color="#d32f2f", hover_color="#b71c1c")
         self.status_var.set(message)
 
     def toggle_wer_monitoring(self) -> None:
@@ -2308,6 +2613,7 @@ class App:
             self.monitor_status_label.configure(text="Starting", text_color="#8AB4F8")
             self.monitor_stability_label.configure(text="Sampling", text_color="#8AB4F8")
             self.monitor_wer_label.configure(text="...", text_color="#8AB4F8")
+            self.mode_badge_label.configure(fg_color="#8AB4F8")
             self.meter.set_levels("RMS: sampling", "Peak: sampling", "Starting", "#8AB4F8", 0.0)
             self.status_var.set("WER monitoring enabled.")
         else:
@@ -2319,6 +2625,7 @@ class App:
             self.monitor_status_label.configure(text="Disabled", text_color="#9E9E9E")
             self.monitor_stability_label.configure(text="Paused", text_color="#9E9E9E")
             self.monitor_wer_label.configure(text="--", text_color="#9E9E9E")
+            self.mode_badge_label.configure(fg_color="#4A4A4A")
             self.meter.set_levels("RMS: -∞ dB", "Peak: -∞ dB", "Paused", "#9E9E9E", 0.0)
             self._set_warnings_text(self.monitor_recommendation_var.get())
             self.status_var.set("WER monitoring disabled.")
@@ -2337,6 +2644,7 @@ class App:
         if self._closing or not self.wer_enabled_var.get():
             return
         quality = result["quality"]
+        ui_config = MODE_UI.get(self.current_mode, MODE_UI["Microphone"])
         self.monitor_status_var.set(result["status_text"])
         self.monitor_level_var.set(result["level_text"])
         self.monitor_detail_var.set(result["detail_text"])
@@ -2359,6 +2667,7 @@ class App:
         status_text = "Monitoring" if quality != "error" else "Unavailable"
         self.meter.set_levels(rms_text, peak_text, status_text, color, progress)
         self.monitor_recommendation_var.set(self._recommendation_text(quality, result["detail_text"]))
+        self.mode_badge_label.configure(text=ui_config["badge"], fg_color=color)
         self._set_warnings_text(self.monitor_recommendation_var.get())
 
     def _split_levels(self, level_text: str) -> tuple[str, str]:
@@ -2391,6 +2700,8 @@ class App:
         self.mode_badge_label.configure(text=ui_config["badge"], fg_color=ui_config["accent"])
         self.mode_route_label.configure(text=ui_config["route"])
         self.mode_device_label.configure(text=self._current_mode_device_summary())
+        if hasattr(self, "header_mode_chip") and self.header_mode_chip.winfo_exists():
+            self.header_mode_chip.configure(text=self.current_mode, fg_color=ui_config["accent"])
         self._refresh_live_transcription_labels()
 
     def _current_mode_device_summary(self) -> str:
