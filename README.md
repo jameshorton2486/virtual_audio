@@ -29,7 +29,19 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-5. Run the app:
+5. Add your Deepgram API key in a local `.env` file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Then edit `.env` and set:
+
+```text
+DEEPGRAM_API_KEY=your_real_key_here
+```
+
+6. Run the app:
 
 ```powershell
 .\.venv\Scripts\python.exe app.py
@@ -53,6 +65,12 @@ In Zoom, set `Microphone` to `Same as System`. Otherwise Windows default-device 
 ## Configure Device Names
 
 Edit the values in `config.json` or use the fields in the app. The app also has a `Refresh Devices` button that re-scans Windows input and output devices and updates the dropdowns.
+
+## Environment Variables
+
+- Store local secrets such as `DEEPGRAM_API_KEY` in `.env`
+- `.env` is ignored by Git
+- Use `.env.example` as the template
 
 ## WER Notes
 

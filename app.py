@@ -12,6 +12,28 @@ from typing import Any
 
 APP_DIR = Path(__file__).resolve().parent
 VENV_PYTHON = APP_DIR / ".venv" / "Scripts" / "python.exe"
+ENV_PATH = APP_DIR / ".env"
+
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            os.environ.setdefault(key, value)
 
 
 def ensure_local_venv() -> None:
@@ -30,6 +52,7 @@ def ensure_local_venv() -> None:
     os.execv(str(target_python), [str(target_python), str(APP_DIR / "app.py"), *sys.argv[1:]])
 
 
+load_dotenv_file(ENV_PATH)
 ensure_local_venv()
 
 import customtkinter as ctk
