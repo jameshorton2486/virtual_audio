@@ -521,8 +521,14 @@ class App:
 
     def _build_ui(self) -> None:
         self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        header_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.main_scroll_frame = ctk.CTkScrollableFrame(self.root, fg_color="transparent")
+        self.main_scroll_frame.pack(fill="both", expand=True)
+        self.main_scroll_frame.grid_columnconfigure(0, weight=1)
+        self.ui_parent = self.main_scroll_frame
+
+        header_frame = ctk.CTkFrame(self.ui_parent, fg_color="transparent")
         header_frame.pack(pady=8, padx=20, fill="x")
 
         ctk.CTkLabel(
@@ -538,10 +544,10 @@ class App:
             text_color="#888888",
         ).pack(pady=(2, 0))
 
-        self.meter = AudioLevelMeter(self.root, width=480, height=80)
+        self.meter = AudioLevelMeter(self.ui_parent, width=480, height=80)
         self.meter.pack(pady=6, padx=20, fill="x")
 
-        self.wer_status_frame = ctk.CTkFrame(self.root, fg_color="#1a1a1a")
+        self.wer_status_frame = ctk.CTkFrame(self.ui_parent, fg_color="#1a1a1a")
         self.wer_status_frame.pack(pady=6, padx=20, fill="x")
 
         status_header = ctk.CTkFrame(self.wer_status_frame, fg_color="transparent")
@@ -610,7 +616,7 @@ class App:
         self.warnings_box.pack(pady=6, padx=10, fill="x")
         self._set_warnings_text(self.monitor_recommendation_var.get())
 
-        mode_frame = ctk.CTkFrame(self.root)
+        mode_frame = ctk.CTkFrame(self.ui_parent)
         mode_frame.pack(pady=6, padx=20, fill="x")
 
         ctk.CTkLabel(
@@ -686,7 +692,7 @@ class App:
         )
         self.mode_route_label.pack(pady=(0, 8), padx=12)
 
-        button_frame = ctk.CTkFrame(self.root)
+        button_frame = ctk.CTkFrame(self.ui_parent)
         button_frame.pack(pady=6, padx=20, fill="x")
 
         self.btn_mic = ctk.CTkButton(
@@ -742,7 +748,7 @@ class App:
 
         self._build_direct_device_controls()
 
-        util_frame = ctk.CTkFrame(self.root)
+        util_frame = ctk.CTkFrame(self.ui_parent)
         util_frame.pack(pady=6, padx=20, fill="x")
 
         utils_row = ctk.CTkFrame(util_frame, fg_color="transparent")
@@ -767,7 +773,7 @@ class App:
         ).pack(side="left", padx=3, expand=True, fill="x")
 
         self.status_label = ctk.CTkLabel(
-            self.root,
+            self.ui_parent,
             textvariable=self.status_var,
             font=("Arial", 9),
             text_color="#4CAF50",
@@ -775,14 +781,14 @@ class App:
         self.status_label.pack(pady=6)
 
         ctk.CTkLabel(
-            self.root,
+            self.ui_parent,
             textvariable=self.footer_var,
             font=("Arial", 8),
             text_color="#555555",
         ).pack(pady=(0, 6))
 
     def _build_direct_device_controls(self) -> None:
-        control_frame = ctk.CTkFrame(self.root)
+        control_frame = ctk.CTkFrame(self.ui_parent)
         control_frame.pack(pady=6, padx=20, fill="x")
 
         ctk.CTkLabel(
