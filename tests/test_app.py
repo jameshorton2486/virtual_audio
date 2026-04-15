@@ -1,6 +1,7 @@
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -28,6 +29,32 @@ class DeviceHelpersTests(unittest.TestCase):
 
     def test_extract_transcript_text_handles_missing_data(self) -> None:
         self.assertEqual(app.extract_transcript_text({}), "")
+
+    def test_format_deepgram_payload_text_uses_speaker_labels_when_words_present(self) -> None:
+        payload = {
+            "results": {
+                "channels": [
+                    {
+                        "alternatives": [
+                            {
+                                "transcript": "hello world",
+                                "words": [
+                                    {"speaker": 0, "punctuated_word": "Hello"},
+                                    {"speaker": 0, "punctuated_word": "there."},
+                                    {"speaker": 1, "punctuated_word": "General"},
+                                    {"speaker": 1, "punctuated_word": "Kenobi."},
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+        self.assertEqual(
+            app.format_deepgram_payload_text(payload),
+            "Speaker 0: Hello there.\nSpeaker 1: General Kenobi.",
+        )
 
     def test_build_transcript_output_paths_uses_transcripts_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -240,6 +267,97 @@ class AudioQualityMonitorTests(unittest.TestCase):
 
         self.assertNotEqual(result["quality"], "error")
         self.assertIn("RMS", result["level_text"])
+
+
+class LiveSignalTests(unittest.TestCase):
+    def test_analyze_live_input_signal_detects_silence(self) -> None:
+        raw_bytes = (np.zeros(1024, dtype=np.int16)).tobytes()
+
+        result = app.analyze_live_input_signal(raw_bytes)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "silent")
+
+    def test_analyze_live_input_signal_detects_low_signal(self) -> None:
+        raw_bytes = (np.full(1024, 100, dtype=np.int16)).tobytes()
+
+        result = app.analyze_live_input_signal(raw_bytes)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "low")
+
+    def test_analyze_live_input_signal_detects_active_signal(self) -> None:
+        raw_bytes = (np.full(1024, 2500, dtype=np.int16)).tobytes()
+
+        result = app.analyze_live_input_signal(raw_bytes)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "active")
+
+    def test_analyze_live_input_signal_detects_clipping(self) -> None:
+        raw_bytes = (np.full(1024, 32000, dtype=np.int16)).tobytes()
+
+        result = app.analyze_live_input_signal(raw_bytes)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "clipping")
+
+    def test_report_input_signal_emits_signal_callback_before_deepgram_send(self) -> None:
+        transcript_updates: list[tuple[str, str]] = []
+        status_updates: list[str] = []
+        signal_updates: list[dict[str, object]] = []
+        session = app.LiveTranscriptionSession(
+            api_key="test-key",
+            input_device_name="CABLE Output (VB-Audio Virtual Cable)",
+            sample_rate_hz=24000,
+            mode_name="VAC",
+            smart_format=True,
+            diarize=True,
+            paragraphs=True,
+            filler_words=True,
+            numerals=True,
+            on_transcript=transcript_updates.append,
+            on_status=status_updates.append,
+            on_signal=signal_updates.append,
+        )
+        session.actual_device_name = "CABLE Output (VB-Audio Virtual Cable)"
+        raw_bytes = (np.full(1024, 2500, dtype=np.int16)).tobytes()
+
+        with patch("app.time.time", return_value=10.0):
+            session._report_input_signal(raw_bytes)
+
+        self.assertEqual(len(signal_updates), 1)
+        self.assertEqual(signal_updates[0]["state"], "active")
+        self.assertEqual(signal_updates[0]["device_name"], "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(signal_updates[0]["mode_name"], "VAC")
+        self.assertEqual(len(status_updates), 1)
+        self.assertIn("Live input active", status_updates[0])
+
+    def test_format_live_result_text_uses_speaker_labels_when_words_present(self) -> None:
+        result = SimpleNamespace(
+            channel=SimpleNamespace(
+                alternatives=[
+                    SimpleNamespace(
+                        transcript="hello there general kenobi",
+                        words=[
+                            SimpleNamespace(speaker=0, punctuated_word="Hello"),
+                            SimpleNamespace(speaker=0, punctuated_word="there."),
+                            SimpleNamespace(speaker=1, punctuated_word="General"),
+                            SimpleNamespace(speaker=1, punctuated_word="Kenobi."),
+                        ],
+                    )
+                ]
+            )
+        )
+
+        self.assertEqual(
+            app.format_live_result_text(result),
+            "Speaker 0: Hello there.\nSpeaker 1: General Kenobi.",
+        )
 
 
 if __name__ == "__main__":

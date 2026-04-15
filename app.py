@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Any
+from typing import Any, Final, Literal, Mapping, TypedDict
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -94,7 +94,27 @@ SUPPORTED_TRANSCRIPTION_SUFFIXES = {
     ".wma",
 }
 
-DEFAULT_CONFIG = {
+ModeName = Literal["Microphone", "VAC", "Mixed"]
+
+
+class ConfigDict(TypedDict):
+    mic_device: str
+    vac_device: str
+    speaker_device: str
+    vac_playback_device: str
+    voicemeeter_device: str
+    deepgram_smart_format: bool
+    deepgram_diarize: bool
+    deepgram_paragraphs: bool
+    deepgram_filler_words: bool
+    deepgram_numerals: bool
+    wer_mode_enabled: bool
+    quality_check_interval_seconds: float
+    sample_rate_hz: int
+    last_mode: ModeName
+
+
+DEFAULT_CONFIG: Final[ConfigDict] = {
     "mic_device": "Microphone (Realtek Audio)",
     "vac_device": "CABLE Output (VB-Audio Virtual Cable)",
     "speaker_device": "Speakers (Realtek Audio)",
@@ -205,13 +225,44 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
-def sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
-    sanitized = DEFAULT_CONFIG.copy()
-    sanitized.update({k: v for k, v in config.items() if k in DEFAULT_CONFIG})
+def sanitize_config(config: dict[str, Any]) -> ConfigDict:
+    sanitized: ConfigDict = {**DEFAULT_CONFIG}
+    sanitized["mic_device"] = config.get("mic_device", sanitized["mic_device"])
+    sanitized["vac_device"] = config.get("vac_device", sanitized["vac_device"])
+    sanitized["speaker_device"] = config.get("speaker_device", sanitized["speaker_device"])
+    sanitized["vac_playback_device"] = config.get("vac_playback_device", sanitized["vac_playback_device"])
+    sanitized["voicemeeter_device"] = config.get("voicemeeter_device", sanitized["voicemeeter_device"])
+    sanitized["wer_mode_enabled"] = config.get("wer_mode_enabled", sanitized["wer_mode_enabled"])
+    sanitized["deepgram_smart_format"] = config.get("deepgram_smart_format", sanitized["deepgram_smart_format"])
+    sanitized["deepgram_diarize"] = config.get("deepgram_diarize", sanitized["deepgram_diarize"])
+    sanitized["deepgram_paragraphs"] = config.get("deepgram_paragraphs", sanitized["deepgram_paragraphs"])
+    sanitized["deepgram_filler_words"] = config.get("deepgram_filler_words", sanitized["deepgram_filler_words"])
+    sanitized["deepgram_numerals"] = config.get("deepgram_numerals", sanitized["deepgram_numerals"])
+    sanitized["quality_check_interval_seconds"] = config.get(
+        "quality_check_interval_seconds",
+        sanitized["quality_check_interval_seconds"],
+    )
+    sanitized["sample_rate_hz"] = config.get("sample_rate_hz", sanitized["sample_rate_hz"])
+    sanitized["last_mode"] = config.get("last_mode", sanitized["last_mode"])
 
-    for key in ("mic_device", "vac_device", "speaker_device", "vac_playback_device", "voicemeeter_device"):
-        value = sanitized.get(key, DEFAULT_CONFIG[key])
-        sanitized[key] = value.strip() if isinstance(value, str) and value.strip() else DEFAULT_CONFIG[key]
+    mic_device: Any = sanitized["mic_device"]
+    sanitized["mic_device"] = mic_device.strip() if isinstance(mic_device, str) and mic_device.strip() else DEFAULT_CONFIG["mic_device"]
+    vac_device: Any = sanitized["vac_device"]
+    sanitized["vac_device"] = vac_device.strip() if isinstance(vac_device, str) and vac_device.strip() else DEFAULT_CONFIG["vac_device"]
+    speaker_device: Any = sanitized["speaker_device"]
+    sanitized["speaker_device"] = speaker_device.strip() if isinstance(speaker_device, str) and speaker_device.strip() else DEFAULT_CONFIG["speaker_device"]
+    vac_playback_device: Any = sanitized["vac_playback_device"]
+    sanitized["vac_playback_device"] = (
+        vac_playback_device.strip()
+        if isinstance(vac_playback_device, str) and vac_playback_device.strip()
+        else DEFAULT_CONFIG["vac_playback_device"]
+    )
+    voicemeeter_device: Any = sanitized["voicemeeter_device"]
+    sanitized["voicemeeter_device"] = (
+        voicemeeter_device.strip()
+        if isinstance(voicemeeter_device, str) and voicemeeter_device.strip()
+        else DEFAULT_CONFIG["voicemeeter_device"]
+    )
 
     sanitized["wer_mode_enabled"] = _coerce_bool(
         sanitized.get("wer_mode_enabled"),
@@ -239,7 +290,8 @@ def sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     try:
-        interval = float(sanitized.get("quality_check_interval_seconds", DEFAULT_CONFIG["quality_check_interval_seconds"]))
+        raw_interval: Any = sanitized["quality_check_interval_seconds"]
+        interval = float(raw_interval)
         if interval <= 0:
             raise ValueError
         sanitized["quality_check_interval_seconds"] = interval
@@ -247,20 +299,21 @@ def sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
         sanitized["quality_check_interval_seconds"] = float(DEFAULT_CONFIG["quality_check_interval_seconds"])
 
     try:
-        sample_rate = int(sanitized.get("sample_rate_hz", DEFAULT_CONFIG["sample_rate_hz"]))
+        raw_sample_rate: Any = sanitized["sample_rate_hz"]
+        sample_rate = int(raw_sample_rate)
         if sample_rate <= 0:
             raise ValueError
         sanitized["sample_rate_hz"] = sample_rate
     except (TypeError, ValueError):
         sanitized["sample_rate_hz"] = int(DEFAULT_CONFIG["sample_rate_hz"])
 
-    last_mode = sanitized.get("last_mode", DEFAULT_CONFIG["last_mode"])
+    last_mode: Any = sanitized["last_mode"]
     sanitized["last_mode"] = last_mode if last_mode in MODE_TEXT else DEFAULT_CONFIG["last_mode"]
 
     return sanitized
 
 
-def load_config() -> dict[str, Any]:
+def load_config() -> ConfigDict:
     if not CONFIG_PATH.exists():
         save_config(DEFAULT_CONFIG.copy())
         return DEFAULT_CONFIG.copy()
@@ -270,13 +323,13 @@ def load_config() -> dict[str, Any]:
     except (json.JSONDecodeError, OSError):
         stored = {}
 
-    merged = DEFAULT_CONFIG.copy()
+    merged: dict[str, Any] = {**DEFAULT_CONFIG}
     merged.update({k: v for k, v in stored.items() if k in DEFAULT_CONFIG})
     return sanitize_config(merged)
 
 
-def save_config(config: dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(json.dumps(sanitize_config(config), indent=2), encoding="utf-8")
+def save_config(config: Mapping[str, Any]) -> None:
+    CONFIG_PATH.write_text(json.dumps(sanitize_config(dict(config)), indent=2), encoding="utf-8")
 
 
 def get_deepgram_api_key() -> str:
@@ -922,11 +975,12 @@ class LiveTranscriptionSession:
         self.transcript_path = build_live_transcript_output_path()
         self.metadata_path = build_live_transcript_metadata_path(self.transcript_path)
         deepgram = DeepgramClient(self.api_key)
-        self.connection = deepgram.listen.websocket.v("1")
-        self.connection.on(LiveTranscriptionEvents.Open, self._on_open)
-        self.connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
-        self.connection.on(LiveTranscriptionEvents.Error, self._on_error)
-        self.connection.on(LiveTranscriptionEvents.Close, self._on_close)
+        connection = deepgram.listen.websocket.v("1")
+        self.connection = connection
+        connection.on(LiveTranscriptionEvents.Open, self._on_open)
+        connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
+        connection.on(LiveTranscriptionEvents.Error, self._on_error)
+        connection.on(LiveTranscriptionEvents.Close, self._on_close)
 
         requested_live_options = {
             "model": "nova-3",
@@ -956,12 +1010,12 @@ class LiveTranscriptionSession:
 
         options = LiveOptions(**live_options_payload)
 
-        if not self.connection.start(options):
+        if not connection.start(options):
             debug_log("[LiveTranscriptionSession] Deepgram websocket start returned false", level="error")
             return False, "Failed to start Deepgram live transcription connection."
 
         try:
-            self.stream = sd.RawInputStream(
+            stream = sd.RawInputStream(
                 samplerate=self.sample_rate_hz,
                 blocksize=1024,
                 device=device_index,
@@ -969,10 +1023,11 @@ class LiveTranscriptionSession:
                 dtype="int16",
                 callback=self._audio_callback,
             )
-            self.stream.start()
+            self.stream = stream
+            stream.start()
         except Exception as exc:
             try:
-                self.connection.finish()
+                connection.finish()
             except Exception:
                 pass
             self.connection = None
@@ -1159,7 +1214,7 @@ class App:
             interval_seconds=float(self.config["quality_check_interval_seconds"]),
             callback=self._queue_quality_update,
         )
-        self.current_mode = self.config.get("last_mode", DEFAULT_CONFIG["last_mode"])
+        self.current_mode: ModeName = self.config["last_mode"]
         self.is_muted = False
         self.settings_window: ctk.CTkToplevel | None = None
         self.setup_notes_label = None
@@ -1173,6 +1228,7 @@ class App:
         self.live_transcript_final_text = ""
         self.live_transcript_interim_text = ""
         self.live_signal_status_text = "Waiting to sample the selected input."
+        self._vac_test_forced_monitoring = False
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -1589,7 +1645,7 @@ class App:
     def _build_routing_tab(self) -> None:
         routing_frame = ctk.CTkFrame(self.routing_tab)
         routing_frame.pack(fill="x", padx=8, pady=(0, 12))
-        self._add_section_title(routing_frame, "Windows Audio Routing", "Device selection only. Diagnostics moved to Advanced.")
+        self._add_section_title(routing_frame, "Windows Audio Routing", "Device setup plus inline VAC route verification.")
 
         self.direct_recording_menu = self._add_device_selector(
             routing_frame,
@@ -1670,13 +1726,33 @@ class App:
         utility_row = ctk.CTkFrame(routing_frame, fg_color="transparent")
         utility_row.pack(fill="x", padx=10, pady=(0, 12))
 
+        self.btn_vac_test = ctk.CTkButton(
+            utility_row,
+            text="Test VAC Routing",
+            command=self.test_vac_routing,
+            height=34,
+            font=("Arial", 10, "bold"),
+            fg_color="#1565C0",
+            hover_color="#0D47A1",
+        )
+        self.btn_vac_test.pack(side="left", padx=(0, 6), expand=True, fill="x")
+
         ctk.CTkButton(
             utility_row,
             text="Refresh Devices",
             command=self.refresh_detected_devices,
             height=34,
             font=("Arial", 10),
-        ).pack(side="left", expand=True, fill="x")
+        ).pack(side="left", padx=(6, 0), expand=True, fill="x")
+
+        self.routing_meter = AudioLevelMeter(
+            routing_frame,
+            width=720,
+            height=62,
+            title="ROUTING SIGNAL",
+            compact=True,
+        )
+        self.routing_meter.pack(fill="x", padx=12, pady=(0, 10))
 
     def _build_transcribe_tab(self) -> None:
         api_key_ready = bool(get_deepgram_api_key())
@@ -1906,24 +1982,13 @@ class App:
 
         ctk.CTkLabel(
             advanced_frame,
-            text="VAC routing test sends a short tone through the configured cable path so you can verify playback and capture are aligned.",
+            text="VAC routing verification now lives in the Routing tab so the signal can be confirmed inline with a compact meter.",
             font=("Arial", 9),
             text_color="#C6C6C6",
             justify="left",
             anchor="w",
             wraplength=760,
         ).pack(fill="x", padx=12, pady=(0, 8))
-
-        self.btn_vac_test = ctk.CTkButton(
-            advanced_frame,
-            text="Test VAC Routing",
-            command=self.test_vac_routing,
-            height=36,
-            font=("Arial", 10, "bold"),
-            fg_color="#1565C0",
-            hover_color="#0D47A1",
-        )
-        self.btn_vac_test.pack(fill="x", padx=12, pady=(0, 8))
 
         ctk.CTkButton(
             advanced_frame,
@@ -1969,6 +2034,12 @@ class App:
         self.warnings_box.delete("1.0", "end")
         self.warnings_box.insert("1.0", text)
         self.warnings_box.configure(state="disabled")
+
+    def _set_meter_levels(self, rms_text: str, peak_text: str, status_text: str, color: str, progress: float) -> None:
+        self.meter.set_levels(rms_text, peak_text, status_text, color, progress)
+        routing_meter = getattr(self, "routing_meter", None)
+        if routing_meter is not None and routing_meter.winfo_exists():
+            routing_meter.set_levels(rms_text, peak_text, status_text, color, progress)
 
     def _menu_values_for(self, current_value: str, devices: list[str]) -> list[str]:
         values = list(devices)
@@ -2114,7 +2185,7 @@ class App:
         self.status_var.set(message)
 
     def apply_device_preset(self, preset_name: str) -> None:
-        presets = {
+        presets: dict[str, tuple[str, str, ModeName]] = {
             "normal": (self.mic_var.get().strip(), self.speaker_var.get().strip(), "Microphone"),
             "vac": (self.vac_var.get().strip(), self.vac_playback_var.get().strip(), "VAC"),
             "mixed": (self.mix_var.get().strip(), self.speaker_var.get().strip(), "Mixed"),
@@ -2487,7 +2558,7 @@ class App:
             self.setup_notes_visible = True
             self.status_var.set("Setup notes shown.")
 
-    def switch_mode(self, mode_name: str, device_name: str) -> None:
+    def switch_mode(self, mode_name: ModeName, device_name: str) -> None:
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Stop live transcription before switching modes.")
             return
@@ -2548,9 +2619,17 @@ class App:
         save_config(self.config)
         self.mode_var.set("VAC")
         self._refresh_mode_hint()
+        self.tabview.set("Routing")
+
+        self._vac_test_forced_monitoring = False
+        if not self.wer_enabled_var.get():
+            self._vac_test_forced_monitoring = True
+            self.wer_enabled_var.set(True)
+            self.toggle_wer_monitoring()
+
         self._vac_test_running = True
         self.btn_vac_test.configure(state="disabled", text="Testing VAC...")
-        self.status_var.set("VAC routing test started. A short tone is being sent through CABLE Input.")
+        self.status_var.set("VAC routing test started. Watch the inline Routing meter for movement while the tone plays through CABLE Input.")
         threading.Thread(target=self._run_vac_test_tone, daemon=True).start()
 
     def _run_vac_test_tone(self) -> None:
@@ -2582,6 +2661,10 @@ class App:
     def _finish_vac_test(self, message: str) -> None:
         self._vac_test_running = False
         self.btn_vac_test.configure(state="normal", text="Test VAC Routing")
+        if self._vac_test_forced_monitoring:
+            self._vac_test_forced_monitoring = False
+            self.wer_enabled_var.set(False)
+            self.toggle_wer_monitoring()
         debug_log(f"[App] VAC routing test finished: {message}")
         self.status_var.set(message)
 
@@ -2614,7 +2697,7 @@ class App:
             self.monitor_stability_label.configure(text="Sampling", text_color="#8AB4F8")
             self.monitor_wer_label.configure(text="...", text_color="#8AB4F8")
             self.mode_badge_label.configure(fg_color="#8AB4F8")
-            self.meter.set_levels("RMS: sampling", "Peak: sampling", "Starting", "#8AB4F8", 0.0)
+            self._set_meter_levels("RMS: sampling", "Peak: sampling", "Starting", "#8AB4F8", 0.0)
             self.status_var.set("WER monitoring enabled.")
         else:
             self.monitor.stop()
@@ -2626,7 +2709,7 @@ class App:
             self.monitor_stability_label.configure(text="Paused", text_color="#9E9E9E")
             self.monitor_wer_label.configure(text="--", text_color="#9E9E9E")
             self.mode_badge_label.configure(fg_color="#4A4A4A")
-            self.meter.set_levels("RMS: -∞ dB", "Peak: -∞ dB", "Paused", "#9E9E9E", 0.0)
+            self._set_meter_levels("RMS: -∞ dB", "Peak: -∞ dB", "Paused", "#9E9E9E", 0.0)
             self._set_warnings_text(self.monitor_recommendation_var.get())
             self.status_var.set("WER monitoring disabled.")
 
@@ -2665,7 +2748,7 @@ class App:
         progress = QUALITY_PROGRESS.get(quality, 0.0)
         rms_text, peak_text = self._split_levels(result["level_text"])
         status_text = "Monitoring" if quality != "error" else "Unavailable"
-        self.meter.set_levels(rms_text, peak_text, status_text, color, progress)
+        self._set_meter_levels(rms_text, peak_text, status_text, color, progress)
         self.monitor_recommendation_var.set(self._recommendation_text(quality, result["detail_text"]))
         self.mode_badge_label.configure(text=ui_config["badge"], fg_color=color)
         self._set_warnings_text(self.monitor_recommendation_var.get())

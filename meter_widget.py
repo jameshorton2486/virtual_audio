@@ -4,12 +4,14 @@ import customtkinter as ctk
 
 
 class AudioLevelMeter(ctk.CTkFrame):
-    def __init__(self, parent, width=480, height=80, **kwargs):
-        """Compact audio level meter for the main dashboard."""
+    def __init__(self, parent, width=480, height=80, title="AUDIO LEVEL", compact=False, **kwargs):
+        """Reusable audio level meter for dashboard and inline routing feedback."""
         super().__init__(parent, width=width, height=height, **kwargs)
 
         self.meter_width = width - 20
-        self.meter_height = 22
+        self.meter_height = 16 if compact else 22
+        self.title = title
+        self.compact = compact
         self._progress = 0.0
         self._color = "#4CAF50"
 
@@ -21,13 +23,13 @@ class AudioLevelMeter(ctk.CTkFrame):
         """Build meter UI components."""
         self.title_label = ctk.CTkLabel(
             self,
-            text="AUDIO LEVEL",
-            font=("Arial", 12, "bold"),
+            text=self.title,
+            font=("Arial", 10 if self.compact else 12, "bold"),
         )
-        self.title_label.pack(pady=(4, 2))
+        self.title_label.pack(pady=((2, 1) if self.compact else (4, 2)))
 
         self.meter_frame = ctk.CTkFrame(self, fg_color="#1a1a1a")
-        self.meter_frame.pack(pady=4, padx=10, fill="x")
+        self.meter_frame.pack(pady=(2 if self.compact else 4), padx=10, fill="x")
 
         self.canvas = tk.Canvas(
             self.meter_frame,
@@ -37,15 +39,15 @@ class AudioLevelMeter(ctk.CTkFrame):
             highlightthickness=0,
             bd=0,
         )
-        self.canvas.pack(pady=6, padx=10)
+        self.canvas.pack(pady=(4 if self.compact else 6), padx=10)
 
         label_frame = ctk.CTkFrame(self.meter_frame, fg_color="transparent")
-        label_frame.pack(fill="x", padx=10, pady=(0, 6))
+        label_frame.pack(fill="x", padx=10, pady=(0, 4 if self.compact else 6))
 
         self.rms_label = ctk.CTkLabel(
             label_frame,
             text="RMS: -∞ dB",
-            font=("Courier New", 9),
+            font=("Courier New", 8 if self.compact else 9),
             width=110,
             anchor="w",
         )
@@ -54,7 +56,7 @@ class AudioLevelMeter(ctk.CTkFrame):
         self.peak_label = ctk.CTkLabel(
             label_frame,
             text="Peak: -∞ dB",
-            font=("Courier New", 9),
+            font=("Courier New", 8 if self.compact else 9),
             width=110,
             anchor="w",
         )
@@ -63,7 +65,7 @@ class AudioLevelMeter(ctk.CTkFrame):
         self.status_label = ctk.CTkLabel(
             label_frame,
             text="Status: Monitoring",
-            font=("Arial", 9, "bold"),
+            font=("Arial", 8 if self.compact else 9, "bold"),
             text_color="#4CAF50",
         )
         self.status_label.pack(side="right", padx=5)
