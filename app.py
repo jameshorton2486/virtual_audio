@@ -1,4 +1,5 @@
 import json
+import inspect
 import logging
 import mimetypes
 import os
@@ -814,20 +815,33 @@ class LiveTranscriptionSession:
         self.connection.on(LiveTranscriptionEvents.Error, self._on_error)
         self.connection.on(LiveTranscriptionEvents.Close, self._on_close)
 
-        options = LiveOptions(
-            model="nova-3",
-            language="en-US",
-            smart_format=self.smart_format,
-            punctuate=True,
-            interim_results=True,
-            diarize=self.diarize,
-            paragraphs=self.paragraphs,
-            filler_words=self.filler_words,
-            numerals=self.numerals,
-            encoding="linear16",
-            channels=1,
-            sample_rate=self.sample_rate_hz,
-        )
+        requested_live_options = {
+            "model": "nova-3",
+            "language": "en-US",
+            "smart_format": self.smart_format,
+            "punctuate": True,
+            "interim_results": True,
+            "diarize": self.diarize,
+            "paragraphs": self.paragraphs,
+            "filler_words": self.filler_words,
+            "numerals": self.numerals,
+            "encoding": "linear16",
+            "channels": 1,
+            "sample_rate": self.sample_rate_hz,
+        }
+        supported_names = set(inspect.signature(LiveOptions.__init__).parameters.keys())
+        live_options_payload = {
+            key: value for key, value in requested_live_options.items() if key in supported_names
+        }
+        omitted_names = sorted(set(requested_live_options.keys()) - set(live_options_payload.keys()))
+        if omitted_names:
+            debug_log(
+                f"[LiveTranscriptionSession] Live SDK does not support: {', '.join(omitted_names)}. "
+                f"Continuing with supported options only.",
+                level="warning",
+            )
+
+        options = LiveOptions(**live_options_payload)
 
         if not self.connection.start(options):
             debug_log("[LiveTranscriptionSession] Deepgram websocket start returned false", level="error")
