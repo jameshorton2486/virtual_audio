@@ -1567,7 +1567,7 @@ class App:
         self.btn_mic = ctk.CTkButton(
             mode_buttons,
             text="Microphone",
-            command=lambda: self.switch_mode("Microphone", self.mic_var.get()),
+            command=lambda: self.apply_audio_mode("Microphone"),
             height=40,
             font=("Arial", 10, "bold"),
         )
@@ -1576,7 +1576,7 @@ class App:
         self.btn_vac = ctk.CTkButton(
             mode_buttons,
             text="VAC",
-            command=lambda: self.switch_mode("VAC", self.vac_var.get()),
+            command=lambda: self.apply_audio_mode("VAC"),
             height=40,
             font=("Arial", 10, "bold"),
             fg_color="#2E7D32",
@@ -1587,7 +1587,7 @@ class App:
         self.btn_mix = ctk.CTkButton(
             mode_buttons,
             text="Mixed",
-            command=lambda: self.switch_mode("Mixed", self.mix_var.get()),
+            command=lambda: self.apply_audio_mode("Mixed"),
             height=40,
             font=("Arial", 10, "bold"),
         )
@@ -2185,16 +2185,12 @@ class App:
         self.status_var.set(message)
 
     def apply_device_preset(self, preset_name: str) -> None:
-        presets: dict[str, tuple[str, str, ModeName]] = {
-            "normal": (self.mic_var.get().strip(), self.speaker_var.get().strip(), "Microphone"),
-            "vac": (self.vac_var.get().strip(), self.vac_playback_var.get().strip(), "VAC"),
-            "mixed": (self.mix_var.get().strip(), self.speaker_var.get().strip(), "Mixed"),
+        presets: dict[str, ModeName] = {
+            "normal": "Microphone",
+            "vac": "VAC",
+            "mixed": "Mixed",
         }
-        recording_device, playback_device, mode_name = presets[preset_name]
-
-        self.direct_recording_var.set(recording_device)
-        self.direct_playback_var.set(playback_device)
-        self.switch_mode(mode_name, recording_device)
+        self.apply_audio_mode(presets[preset_name])
 
     def open_config(self) -> None:
         self.tabview.set("Settings")
@@ -2558,43 +2554,57 @@ class App:
             self.setup_notes_visible = True
             self.status_var.set("Setup notes shown.")
 
-    def switch_mode(self, mode_name: ModeName, device_name: str) -> None:
+    def _resolve_mode_devices(self, mode_name: ModeName) -> tuple[str, str]:
+        if mode_name == "Microphone":
+            return self.mic_var.get().strip(), self.speaker_var.get().strip()
+        if mode_name == "VAC":
+            return self.vac_var.get().strip(), self.vac_playback_var.get().strip()
+        return self.mix_var.get().strip(), self.speaker_var.get().strip()
+
+    def apply_audio_mode(self, mode_name: ModeName) -> None:
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Stop live transcription before switching modes.")
             return
-        debug_log(f"[App] Switching mode -> {mode_name} using recording device {device_name}")
+
+        debug_log(f"[App] Applying full audio mode -> {mode_name}")
         self.save_form_config()
-        ok_record, record_message = self.device_manager.set_default_recording_device(device_name)
+        input_device, playback_target = self._resolve_mode_devices(mode_name)
+        if not input_device:
+            self.status_var.set(f"No input device configured for {mode_name} mode.")
+            return
+        if not playback_target:
+            self.status_var.set(f"No playback device configured for {mode_name} mode.")
+            return
+
+        ok_record, record_message = self.device_manager.set_default_recording_device(input_device)
         if not ok_record:
             self.status_var.set(record_message)
             return
 
-        playback_target = None
-        if mode_name == "VAC":
-            playback_target = self.vac_playback_var.get().strip()
-        elif mode_name in {"Microphone", "Mixed"}:
-            playback_target = self.speaker_var.get().strip()
+        ok_playback, playback_message = self.device_manager.set_default_playback_device(playback_target)
+        if not ok_playback:
+            self.status_var.set(f"{record_message} Playback switch failed: {playback_message}")
+            return
 
-        playback_message = ""
-        if playback_target:
-            ok_playback, playback_message = self.device_manager.set_default_playback_device(playback_target)
-            if not ok_playback:
-                self.status_var.set(f"{record_message} Playback switch failed: {playback_message}")
-                return
+        time.sleep(0.35)
+        device_index, _device_info = resolve_input_device(input_device)
+        if device_index is None:
+            self.status_var.set(f"Switched Windows defaults, but the input is not active yet: {input_device}")
+            return
 
-        if ok_record:
-            self.current_mode = mode_name
-            self.config["last_mode"] = mode_name
-            save_config(self.config)
-            self.mode_var.set(mode_name)
-            self.direct_recording_var.set(device_name)
-            if playback_target:
-                self.direct_playback_var.set(playback_target)
-            self._refresh_mode_hint()
-            if mode_name == "VAC":
-                self.status_var.set(f"{record_message} {playback_message}")
-            else:
-                self.status_var.set(f"{record_message} {playback_message}".strip())
+        self.current_mode = mode_name
+        self.config["last_mode"] = mode_name
+        save_config(self.config)
+        self.mode_var.set(mode_name)
+        self.direct_recording_var.set(input_device)
+        self.direct_playback_var.set(playback_target)
+        self._refresh_mode_hint()
+        self.status_var.set(
+            f"{mode_name} mode active | Input: {input_device} | Output: {playback_target}"
+        )
+        debug_log(
+            f"[App] Mode applied successfully -> {mode_name} | input={input_device} | output={playback_target}"
+        )
 
     def test_vac_routing(self) -> None:
         if self._vac_test_running:
@@ -2602,23 +2612,9 @@ class App:
             return
 
         debug_log("[App] Starting VAC routing test")
-
-        self.save_form_config()
-        ok_record, record_message = self.device_manager.set_default_recording_device(self.vac_var.get().strip())
-        if not ok_record:
-            self.status_var.set(record_message)
+        self.apply_audio_mode("VAC")
+        if self.current_mode != "VAC":
             return
-
-        ok_playback, playback_message = self.device_manager.set_default_playback_device(self.vac_playback_var.get().strip())
-        if not ok_playback:
-            self.status_var.set(f"{record_message} Playback switch failed: {playback_message}")
-            return
-
-        self.current_mode = "VAC"
-        self.config["last_mode"] = "VAC"
-        save_config(self.config)
-        self.mode_var.set("VAC")
-        self._refresh_mode_hint()
         self.tabview.set("Routing")
 
         self._vac_test_forced_monitoring = False
