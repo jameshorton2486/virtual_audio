@@ -1,12 +1,48 @@
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 import app
 import numpy as np
 
 
 class DeviceHelpersTests(unittest.TestCase):
+    def test_extract_transcript_text_returns_primary_transcript(self) -> None:
+        payload = {
+            "results": {
+                "channels": [
+                    {
+                        "alternatives": [
+                            {
+                                "transcript": "hello world",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+        self.assertEqual(app.extract_transcript_text(payload), "hello world")
+
+    def test_extract_transcript_text_handles_missing_data(self) -> None:
+        self.assertEqual(app.extract_transcript_text({}), "")
+
+    def test_build_transcript_output_paths_uses_transcripts_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            media_path = Path(temp_dir) / "zoom recording.mp4"
+            media_path.write_text("placeholder", encoding="utf-8")
+            output_dir = Path(temp_dir) / "transcripts"
+
+            transcript_path, payload_path = app.build_transcript_output_paths(media_path, output_dir=output_dir)
+
+            self.assertEqual(transcript_path.parent, output_dir)
+            self.assertEqual(payload_path.parent, output_dir)
+            self.assertEqual(transcript_path.suffix, ".txt")
+            self.assertEqual(payload_path.suffix, ".json")
+            self.assertIn("zoom_recording", transcript_path.name)
+
     def test_infer_vac_recording_device_prefers_cable_output(self) -> None:
         devices = [
             "CABLE Input (VB-Audio Virtual Cable)",

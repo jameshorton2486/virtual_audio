@@ -1,12 +1,16 @@
 import json
+import mimetypes
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 from typing import Any
 
 
@@ -64,6 +68,22 @@ from meter_widget import AudioLevelMeter
 
 CONFIG_PATH = APP_DIR / "config.json"
 NIRCMD_PATH = APP_DIR / "nircmd.exe"
+TRANSCRIPTS_DIR = APP_DIR / "transcripts"
+DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
+
+SUPPORTED_TRANSCRIPTION_SUFFIXES = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".ogg",
+    ".wav",
+    ".webm",
+    ".wma",
+}
 
 DEFAULT_CONFIG = {
     "mic_device": "Microphone (Realtek Audio)",
@@ -193,6 +213,33 @@ def load_config() -> dict[str, Any]:
 
 def save_config(config: dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(sanitize_config(config), indent=2), encoding="utf-8")
+
+
+def get_deepgram_api_key() -> str:
+    return os.environ.get("DEEPGRAM_API_KEY", "").strip()
+
+
+def extract_transcript_text(payload: dict[str, Any]) -> str:
+    try:
+        channels = payload["results"]["channels"]
+        if not channels:
+            return ""
+        alternatives = channels[0].get("alternatives", [])
+        if not alternatives:
+            return ""
+        return str(alternatives[0].get("transcript", "")).strip()
+    except (KeyError, TypeError, IndexError):
+        return ""
+
+
+def build_transcript_output_paths(media_path: Path, output_dir: Path = TRANSCRIPTS_DIR) -> tuple[Path, Path]:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    stem = media_path.stem or "transcript"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "transcript"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = output_dir / f"{safe_stem}_{timestamp}.txt"
+    payload_path = output_dir / f"{safe_stem}_{timestamp}.json"
+    return transcript_path, payload_path
 
 
 def _list_devices(channel_key: str) -> list[str]:
@@ -487,6 +534,75 @@ class AudioQualityMonitor:
         }
 
 
+class DeepgramFileTranscriber:
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+
+    def transcribe_file(self, media_path: Path, output_dir: Path = TRANSCRIPTS_DIR) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "Missing DEEPGRAM_API_KEY in .env."
+
+        if not media_path.exists():
+            return False, f"File not found: {media_path}"
+
+        if media_path.suffix.lower() not in SUPPORTED_TRANSCRIPTION_SUFFIXES:
+            supported = ", ".join(sorted(SUPPORTED_TRANSCRIPTION_SUFFIXES))
+            return False, f"Unsupported media type. Supported extensions: {supported}"
+
+        mime_type, _ = mimetypes.guess_type(str(media_path))
+        content_type = mime_type or "application/octet-stream"
+        query = urllib.parse.urlencode(
+            {
+                "model": "nova-3",
+                "smart_format": "true",
+                "punctuate": "true",
+                "paragraphs": "true",
+                "diarize": "true",
+                "detect_language": "true",
+            }
+        )
+
+        try:
+            media_bytes = media_path.read_bytes()
+        except OSError as exc:
+            return False, f"Failed to read media file: {exc}"
+
+        request = urllib.request.Request(
+            url=f"{DEEPGRAM_LISTEN_URL}?{query}",
+            data=media_bytes,
+            headers={
+                "Authorization": f"Token {self.api_key}",
+                "Content-Type": content_type,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="ignore").strip()
+            return False, error_body or f"Deepgram request failed with HTTP {exc.code}."
+        except urllib.error.URLError as exc:
+            return False, f"Unable to reach Deepgram: {exc.reason}"
+        except json.JSONDecodeError as exc:
+            return False, f"Deepgram returned invalid JSON: {exc}"
+
+        transcript_text = extract_transcript_text(payload)
+        transcript_path, payload_path = build_transcript_output_paths(media_path, output_dir=output_dir)
+
+        try:
+            transcript_path.write_text(transcript_text or "[No transcript text returned]", encoding="utf-8")
+            payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            return False, f"Failed to save transcript output: {exc}"
+
+        if not transcript_text:
+            return False, f"Deepgram returned no transcript text. Saved raw response to {payload_path.name}."
+
+        return True, f"Transcript saved to {transcript_path.name}\nRaw response saved to {payload_path.name}"
+
+
 class App:
     def __init__(self) -> None:
         self.config = load_config()
@@ -506,6 +622,7 @@ class App:
         self.setup_notes_visible = False
         self._closing = False
         self._vac_test_running = False
+        self._transcription_running = False
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -770,6 +887,7 @@ class App:
         self.mute_button.pack(pady=6, padx=15, fill="x")
 
         self._build_direct_device_controls()
+        self._build_transcription_controls()
 
         util_frame = ctk.CTkFrame(self.ui_parent)
         util_frame.pack(pady=6, padx=20, fill="x")
@@ -901,6 +1019,58 @@ class App:
             height=28,
             font=("Arial", 9),
         ).pack(side="left", expand=True, fill="x")
+
+    def _build_transcription_controls(self) -> None:
+        transcription_frame = ctk.CTkFrame(self.ui_parent)
+        transcription_frame.pack(pady=6, padx=20, fill="x")
+
+        ctk.CTkLabel(
+            transcription_frame,
+            text="Deepgram File Transcription",
+            font=("Arial", 12, "bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 4))
+
+        ctk.CTkLabel(
+            transcription_frame,
+            text="Use saved Zoom recordings, YouTube downloads, and other media files.",
+            font=("Arial", 9),
+            text_color="#C6C6C6",
+            wraplength=460,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        api_key_ready = bool(get_deepgram_api_key())
+        self.transcription_status_label = ctk.CTkLabel(
+            transcription_frame,
+            text="Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env",
+            font=("Arial", 9, "bold"),
+            text_color="#66BB6A" if api_key_ready else "#F9A825",
+            wraplength=460,
+            justify="left",
+        )
+        self.transcription_status_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        transcription_actions = ctk.CTkFrame(transcription_frame, fg_color="transparent")
+        transcription_actions.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.btn_transcribe_file = ctk.CTkButton(
+            transcription_actions,
+            text="Transcribe File",
+            command=self.transcribe_media_file,
+            height=34,
+            font=("Arial", 10, "bold"),
+            fg_color="#1565C0",
+            hover_color="#0D47A1",
+        )
+        self.btn_transcribe_file.pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        ctk.CTkButton(
+            transcription_actions,
+            text="Open Transcripts Folder",
+            command=self.open_transcripts_folder,
+            height=34,
+            font=("Arial", 10),
+        ).pack(side="left", padx=(6, 0), expand=True, fill="x")
 
     def _add_device_selector(self, parent, label: str, variable: ctk.StringVar, devices: list[str]):
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=10)
@@ -1136,6 +1306,63 @@ class App:
             os.startfile(APP_DIR)  # type: ignore[attr-defined]
             return
         self.status_var.set(f"Open {APP_DIR} manually on this platform.")
+
+    def open_transcripts_folder(self) -> None:
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(TRANSCRIPTS_DIR)  # type: ignore[attr-defined]
+            return
+        self.status_var.set(f"Open {TRANSCRIPTS_DIR} manually on this platform.")
+
+    def transcribe_media_file(self) -> None:
+        if self._transcription_running:
+            self.status_var.set("A transcription job is already running.")
+            return
+
+        if not get_deepgram_api_key():
+            messagebox.showerror(
+                "Deepgram API Key Missing",
+                "Add DEEPGRAM_API_KEY to .env before starting a transcription.",
+            )
+            return
+
+        selected_path = filedialog.askopenfilename(
+            title="Select Audio or Video File",
+            filetypes=[
+                ("Media files", "*.aac *.flac *.m4a *.mp3 *.mp4 *.mpeg *.mpga *.ogg *.wav *.webm *.wma"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected_path:
+            return
+
+        self._transcription_running = True
+        self.btn_transcribe_file.configure(state="disabled", text="Transcribing...")
+        self.status_var.set(f"Uploading {Path(selected_path).name} to Deepgram for transcription...")
+        threading.Thread(
+            target=self._run_file_transcription,
+            args=(Path(selected_path),),
+            daemon=True,
+        ).start()
+
+    def _run_file_transcription(self, media_path: Path) -> None:
+        transcriber = DeepgramFileTranscriber(get_deepgram_api_key())
+        success, message = transcriber.transcribe_file(media_path)
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self._finish_file_transcription(success, message))
+        except Exception:
+            return
+
+    def _finish_file_transcription(self, success: bool, message: str) -> None:
+        self._transcription_running = False
+        self.btn_transcribe_file.configure(state="normal", text="Transcribe File")
+        self.status_var.set(message.splitlines()[0] if message else "Transcription finished.")
+        if success:
+            messagebox.showinfo("Transcription Complete", message)
+        else:
+            messagebox.showerror("Transcription Failed", message)
 
     def toggle_setup_notes(self) -> None:
         if self.setup_notes_label is None:

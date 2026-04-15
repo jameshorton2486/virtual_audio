@@ -11,6 +11,7 @@ Windows desktop utility for switching recording devices between a microphone, a 
 - Auto-detection for VAC recording and playback endpoints
 - Live audio quality panel intended to help reduce transcription errors
 - Built-in `Test VAC Routing` action that sends a short tone through the cable
+- Built-in file transcription for Zoom recordings and saved media using Deepgram
 - Packaging command for a standalone `.exe`
 
 ## Setup
@@ -71,6 +72,12 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - Store local secrets such as `DEEPGRAM_API_KEY` in `.env`
 - `.env` is ignored by Git
 - Use `.env.example` as the template
+
+## File Transcription
+
+- Use the `Transcribe File` button in the app for saved Zoom recordings, downloaded videos, and other media files
+- Supported file types include `wav`, `mp3`, `m4a`, `mp4`, `webm`, `flac`, `ogg`, and more
+- Transcript text and the full Deepgram JSON response are saved into the local `transcripts` folder
 
 ## WER Notes
 
