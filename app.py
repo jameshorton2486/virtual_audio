@@ -109,6 +109,7 @@ class ConfigDict(TypedDict):
     deepgram_paragraphs: bool
     deepgram_filler_words: bool
     deepgram_numerals: bool
+    require_signal_check: bool
     wer_mode_enabled: bool
     quality_check_interval_seconds: float
     sample_rate_hz: int
@@ -133,6 +134,7 @@ DEFAULT_CONFIG: Final[ConfigDict] = {
     "deepgram_paragraphs": True,
     "deepgram_filler_words": True,
     "deepgram_numerals": True,
+    "require_signal_check": True,
     "wer_mode_enabled": True,
     "quality_check_interval_seconds": 2.0,
     "sample_rate_hz": 24000,
@@ -246,6 +248,7 @@ def sanitize_config(config: dict[str, Any]) -> ConfigDict:
     sanitized["deepgram_paragraphs"] = config.get("deepgram_paragraphs", sanitized["deepgram_paragraphs"])
     sanitized["deepgram_filler_words"] = config.get("deepgram_filler_words", sanitized["deepgram_filler_words"])
     sanitized["deepgram_numerals"] = config.get("deepgram_numerals", sanitized["deepgram_numerals"])
+    sanitized["require_signal_check"] = config.get("require_signal_check", sanitized["require_signal_check"])
     sanitized["quality_check_interval_seconds"] = config.get(
         "quality_check_interval_seconds",
         sanitized["quality_check_interval_seconds"],
@@ -295,6 +298,10 @@ def sanitize_config(config: dict[str, Any]) -> ConfigDict:
     sanitized["deepgram_numerals"] = _coerce_bool(
         sanitized.get("deepgram_numerals"),
         bool(DEFAULT_CONFIG["deepgram_numerals"]),
+    )
+    sanitized["require_signal_check"] = _coerce_bool(
+        sanitized.get("require_signal_check"),
+        bool(DEFAULT_CONFIG["require_signal_check"]),
     )
 
     try:
@@ -485,6 +492,29 @@ def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
     }
 
 
+def evaluate_live_signal_readiness(signal: dict[str, Any] | None, device_name: str) -> tuple[bool, str, dict[str, Any] | None]:
+    normalized_name = normalize_audio_device_name(device_name)
+    if signal is None:
+        return False, f"Unable to read audio from {normalized_name} before starting live transcription.", None
+
+    state = str(signal.get("state", "")).strip().lower()
+    enriched_signal = {
+        **signal,
+        "device_name": normalized_name,
+    }
+
+    if state == "silent":
+        return False, f"No audio signal detected on {normalized_name}. Check routing before starting live transcription.", enriched_signal
+
+    if state == "low":
+        return True, f"Low input signal detected on {normalized_name}. Transcription may be weak until the level increases.", enriched_signal
+
+    if state == "clipping":
+        return True, f"Input on {normalized_name} is clipping. Transcription will start, but lower the source level for better accuracy.", enriched_signal
+
+    return True, f"Input verified on {normalized_name}.", enriched_signal
+
+
 def normalize_audio_device_name(name: str) -> str:
     return re.sub(r",\s*(MME|Windows .+|DirectSound|WDM-KS)$", "", name, flags=re.IGNORECASE).strip()
 
@@ -498,6 +528,8 @@ def resolve_input_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
 
     exact_match: tuple[int, dict[str, Any]] | None = None
     partial_match: tuple[int, dict[str, Any]] | None = None
+    token_match: tuple[int, dict[str, Any]] | None = None
+    target_tokens = [token for token in re.split(r"[^a-z0-9]+", target.lower()) if len(token) >= 4]
 
     for index, device in enumerate(devices):
         if int(device.get("max_input_channels", 0)) <= 0:
@@ -507,10 +539,51 @@ def resolve_input_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
         if normalized == target:
             exact_match = (index, device)
             break
-        if target and target.lower() in normalized.lower() and partial_match is None:
+        normalized_lower = normalized.lower()
+        target_lower = target.lower()
+        if target and (target_lower in normalized_lower or normalized_lower in target_lower) and partial_match is None:
             partial_match = (index, device)
+        if token_match is None and target_tokens:
+            overlap = sum(1 for token in target_tokens if token in normalized_lower)
+            if overlap >= max(1, min(2, len(target_tokens))):
+                token_match = (index, device)
 
-    match = exact_match or partial_match
+    match = exact_match or partial_match or token_match
+    if match is None:
+        return None, None
+    return match[0], match[1]
+
+
+def resolve_output_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
+    target = normalize_audio_device_name(name)
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None, None
+
+    exact_match: tuple[int, dict[str, Any]] | None = None
+    partial_match: tuple[int, dict[str, Any]] | None = None
+    token_match: tuple[int, dict[str, Any]] | None = None
+    target_tokens = [token for token in re.split(r"[^a-z0-9]+", target.lower()) if len(token) >= 4]
+
+    for index, device in enumerate(devices):
+        if int(device.get("max_output_channels", 0)) <= 0:
+            continue
+        raw_name = str(device.get("name", "")).strip()
+        normalized = normalize_audio_device_name(raw_name)
+        if normalized == target:
+            exact_match = (index, device)
+            break
+        normalized_lower = normalized.lower()
+        target_lower = target.lower()
+        if target and (target_lower in normalized_lower or normalized_lower in target_lower) and partial_match is None:
+            partial_match = (index, device)
+        if token_match is None and target_tokens:
+            overlap = sum(1 for token in target_tokens if token in normalized_lower)
+            if overlap >= max(1, min(2, len(target_tokens))):
+                token_match = (index, device)
+
+    match = exact_match or partial_match or token_match
     if match is None:
         return None, None
     return match[0], match[1]
@@ -558,36 +631,13 @@ def sample_input_signal(device_name: str, sample_rate_hz: int, duration_seconds:
     device_index, device_info = resolve_input_device(device_name)
     if device_index is None or device_info is None:
         return None
-
-    actual_sample_rate = int(float(device_info.get("default_samplerate", sample_rate_hz)))
-    if actual_sample_rate <= 0:
-        actual_sample_rate = int(sample_rate_hz)
-    frames = max(1, int(actual_sample_rate * duration_seconds))
-
-    try:
-        recording = sd.rec(
-            frames,
-            samplerate=actual_sample_rate,
-            channels=1,
-            dtype="float32",
-            device=device_index,
-        )
-        sd.wait()
-    except Exception:
-        return None
-
-    samples = np.asarray(np.squeeze(recording), dtype=np.float64)
-    if samples.size == 0:
-        return None
-
-    samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
-    samples = np.clip(samples, -1.0, 1.0)
-    pcm16 = np.asarray(samples * 32767.0, dtype=np.int16).tobytes()
-    signal = analyze_live_input_signal(pcm16)
-    if signal is None:
-        return None
-    signal["device_name"] = normalize_audio_device_name(str(device_info.get("name", device_name)))
-    return signal
+    return sample_resolved_input_signal(
+        device_index,
+        sample_rate_hz,
+        normalize_audio_device_name(str(device_info.get("name", device_name))),
+        duration_seconds=duration_seconds,
+        device_info=device_info,
+    )
 
 
 def sample_resolved_input_signal(
@@ -595,14 +645,45 @@ def sample_resolved_input_signal(
     sample_rate_hz: int,
     device_name: str,
     duration_seconds: float = 0.35,
+    device_info: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    frames = max(1, int(sample_rate_hz * duration_seconds))
+    resolved_info = device_info
+    if resolved_info is None:
+        try:
+            queried = sd.query_devices(device_index)
+        except Exception:
+            queried = None
+        if isinstance(queried, dict):
+            resolved_info = queried
+
+    actual_sample_rate = int(sample_rate_hz)
+    if resolved_info is not None:
+        try:
+            actual_sample_rate = int(float(resolved_info.get("default_samplerate", sample_rate_hz)))
+        except (TypeError, ValueError):
+            actual_sample_rate = int(sample_rate_hz)
+    if actual_sample_rate <= 0:
+        actual_sample_rate = int(sample_rate_hz)
+
+    capture_channels = 1
+    if resolved_info is not None:
+        try:
+            capture_channels = max(1, min(int(resolved_info.get("max_input_channels", 1)), 2))
+        except (TypeError, ValueError):
+            capture_channels = 1
+
+    frames = max(1, int(actual_sample_rate * duration_seconds))
 
     try:
+        sd.check_input_settings(
+            device=device_index,
+            samplerate=actual_sample_rate,
+            channels=capture_channels,
+        )
         recording = sd.rec(
             frames,
-            samplerate=sample_rate_hz,
-            channels=1,
+            samplerate=actual_sample_rate,
+            channels=capture_channels,
             dtype="float32",
             device=device_index,
         )
@@ -610,7 +691,10 @@ def sample_resolved_input_signal(
     except Exception:
         return None
 
-    samples = np.asarray(np.squeeze(recording), dtype=np.float64)
+    samples = np.asarray(recording, dtype=np.float64)
+    if samples.ndim == 2:
+        samples = np.mean(samples, axis=1)
+    samples = np.asarray(np.squeeze(samples), dtype=np.float64)
     if samples.size == 0:
         return None
 
@@ -1399,6 +1483,7 @@ class App:
         self._vac_test_forced_monitoring = False
         self._pending_vac_test = False
         self._audio_switch_in_progress = False
+        self._best_mode_running = False
         self._latest_signal_state = "Unknown"
         self._resume_monitor_after_live = False
 
@@ -1419,6 +1504,7 @@ class App:
         self.deepgram_paragraphs_var = ctk.BooleanVar(value=bool(self.config["deepgram_paragraphs"]))
         self.deepgram_filler_words_var = ctk.BooleanVar(value=bool(self.config["deepgram_filler_words"]))
         self.deepgram_numerals_var = ctk.BooleanVar(value=bool(self.config["deepgram_numerals"]))
+        self.require_signal_check_var = ctk.BooleanVar(value=bool(self.config["require_signal_check"]))
         self.monitor_status_var = ctk.StringVar(value="Excellent")
         self.monitor_level_var = ctk.StringVar(value="RMS: -∞ dB | Peak: -∞ dB")
         self.monitor_detail_var = ctk.StringVar(value="No issues detected")
@@ -1435,7 +1521,7 @@ class App:
         self.direct_recording_var = ctk.StringVar(value=self.config["mic_device"])
         self.direct_playback_var = ctk.StringVar(value=self.config["speaker_device"])
         self.wer_enabled_var = ctk.BooleanVar(value=bool(self.config["wer_mode_enabled"]))
-        self.resolve_active_device(self._current_live_input_device_name())
+        self.active_audio_device = self.resolve_active_device(self._current_live_input_device_name())
         self.monitor = AudioQualityMonitor(
             sample_rate_hz=int(self.config["sample_rate_hz"]),
             interval_seconds=float(self.config["quality_check_interval_seconds"]),
@@ -1454,6 +1540,7 @@ class App:
     def _build_ui(self) -> None:
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
+        self.root.minsize(900, 650)
 
         app_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         app_frame.pack(fill="both", expand=True)
@@ -1493,17 +1580,15 @@ class App:
         self.tabview = ctk.CTkTabview(app_frame)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
 
-        self.dashboard_tab = self._create_tab_scroll_frame("Dashboard")
+        self.monitor_tab = self._create_tab_scroll_frame("Monitor")
         self.routing_tab = self._create_tab_scroll_frame("Routing")
         self.transcribe_tab = self._create_tab_scroll_frame("Transcribe")
         self.settings_tab = self._create_tab_scroll_frame("Settings")
-        self.advanced_tab = self._create_tab_scroll_frame("Advanced")
 
-        self._build_dashboard_tab()
+        self._build_monitor_tab()
         self._build_routing_tab()
         self._build_transcribe_tab()
         self._build_settings_tab()
-        self._build_advanced_tab()
 
         status_bar = ctk.CTkFrame(app_frame, corner_radius=10)
         status_bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
@@ -1520,7 +1605,7 @@ class App:
 
         ctk.CTkLabel(
             status_bar,
-            text="Shortcuts: Ctrl+1 Dashboard | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | Ctrl+5 Advanced | F5 Refresh",
+            text="Shortcuts: Ctrl+1 Monitor | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | F5 Refresh",
             font=("Arial", 9),
             text_color="#A0A0A0",
             anchor="w",
@@ -1554,11 +1639,10 @@ class App:
         return scroll_frame
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind("<Control-1>", lambda event: self._select_tab("Dashboard"))
+        self.root.bind("<Control-1>", lambda event: self._select_tab("Monitor"))
         self.root.bind("<Control-2>", lambda event: self._select_tab("Routing"))
         self.root.bind("<Control-3>", lambda event: self._select_tab("Transcribe"))
         self.root.bind("<Control-4>", lambda event: self._select_tab("Settings"))
-        self.root.bind("<Control-5>", lambda event: self._select_tab("Advanced"))
         self.root.bind("<F5>", lambda event: self.refresh_detected_devices())
 
     def _select_tab(self, tab_name: str) -> str:
@@ -1583,10 +1667,11 @@ class App:
                 justify="left",
             ).pack(anchor="w", padx=12, pady=(0, 6))
 
-    def _build_dashboard_tab(self) -> None:
-        self.dashboard_tab.grid_columnconfigure(0, weight=1)
+    def _build_monitor_tab(self) -> None:
+        # --- Tab 1: Monitor ---
+        self.monitor_tab.grid_columnconfigure(0, weight=1)
 
-        mode_frame = ctk.CTkFrame(self.dashboard_tab)
+        mode_frame = ctk.CTkFrame(self.monitor_tab)
         mode_frame.pack(fill="x", padx=6, pady=(0, 8))
 
         ctk.CTkLabel(
@@ -1622,65 +1707,82 @@ class App:
         )
         self.mode_device_label.pack(anchor="w", pady=(1, 0))
 
-        self.mode_badge_label = ctk.CTkLabel(
-            mode_summary_row,
-            text="",
-            width=116,
-            height=40,
-            corner_radius=12,
-            font=("Arial", 10, "bold"),
-            fg_color="#2E7D32",
-        )
-        self.mode_badge_label.pack(side="right", padx=(10, 0))
-
-        info_grid = ctk.CTkFrame(mode_frame, fg_color="transparent")
-        info_grid.pack(fill="x", padx=12, pady=(0, 8))
-        info_grid.grid_columnconfigure(0, weight=1)
-        info_grid.grid_columnconfigure(1, weight=1)
-
-        self.mode_hint_label = ctk.CTkLabel(
-            info_grid,
-            text="",
+        self.active_device_label = ctk.CTkLabel(
+            mode_text_frame,
+            text="Active Device: Detecting...",
             text_color="#8AB4F8",
-            font=("Arial", 9),
-            wraplength=340,
-            justify="left",
+            font=("Arial", 10, "bold"),
             anchor="w",
         )
-        self.mode_hint_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.active_device_label.pack(anchor="w", pady=(6, 0))
 
-        self.mode_status_label = ctk.CTkLabel(
-            info_grid,
-            text="",
+        self.signal_label = ctk.CTkLabel(
+            mode_text_frame,
+            text="Signal: Unknown",
             text_color="#C6C6C6",
-            font=("Arial", 9),
-            wraplength=340,
-            justify="left",
-            anchor="w",
-        )
-        self.mode_status_label.grid(row=0, column=1, sticky="w", padx=(8, 0))
-
-        self.mode_route_label = ctk.CTkLabel(
-            mode_frame,
-            text="",
-            text_color="#64B5F6",
             font=("Arial", 9, "bold"),
-            wraplength=760,
-            justify="left",
             anchor="w",
         )
-        self.mode_route_label.pack(fill="x", padx=12, pady=(0, 8))
+        self.signal_label.pack(anchor="w", pady=(2, 0))
 
         self.meter = AudioLevelMeter(mode_frame, width=760, height=78)
         self.meter.pack(fill="x", padx=12, pady=(0, 10))
 
-        content_grid = ctk.CTkFrame(self.dashboard_tab, fg_color="transparent")
-        content_grid.pack(fill="x", padx=6, pady=(0, 6))
-        content_grid.grid_columnconfigure(0, weight=1)
-        content_grid.grid_columnconfigure(1, weight=1)
+        controls_frame = ctk.CTkFrame(self.monitor_tab)
+        controls_frame.pack(fill="x", padx=6, pady=(0, 8))
+        self._add_section_title(controls_frame, "Run Controls")
 
-        self.wer_status_frame = ctk.CTkFrame(content_grid, fg_color="#1A1A1A")
-        self.wer_status_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        mode_buttons = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        mode_buttons.pack(fill="x", padx=12, pady=(0, 10))
+        for column in range(4):
+            mode_buttons.grid_columnconfigure(column, weight=1)
+
+        self.btn_mic = ctk.CTkButton(
+            mode_buttons,
+            text="Microphone",
+            command=lambda: self.apply_audio_mode("Microphone"),
+            height=40,
+            font=("Arial", 10, "bold"),
+            fg_color="#1565C0",
+            hover_color="#0D47A1",
+        )
+        self.btn_mic.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.btn_vac = ctk.CTkButton(
+            mode_buttons,
+            text="VAC",
+            command=lambda: self.apply_audio_mode("VAC"),
+            height=40,
+            font=("Arial", 10, "bold"),
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+        )
+        self.btn_vac.grid(row=0, column=1, sticky="ew", padx=4)
+
+        self.btn_mix = ctk.CTkButton(
+            mode_buttons,
+            text="Mixed",
+            command=lambda: self.apply_audio_mode("Mixed"),
+            height=40,
+            font=("Arial", 10, "bold"),
+            fg_color="#8E24AA",
+            hover_color="#6A1B9A",
+        )
+        self.btn_mix.grid(row=0, column=2, sticky="ew", padx=4)
+
+        self.mute_button = ctk.CTkButton(
+            mode_buttons,
+            text="Mute Toggle",
+            command=self.toggle_mute,
+            height=40,
+            font=("Arial", 10, "bold"),
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+        )
+        self.mute_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+
+        self.wer_status_frame = ctk.CTkFrame(self.monitor_tab, fg_color="#1A1A1A")
+        self.wer_status_frame.pack(fill="x", padx=6, pady=(0, 8))
 
         status_header = ctk.CTkFrame(self.wer_status_frame, fg_color="transparent")
         status_header.pack(fill="x", padx=12, pady=(10, 6))
@@ -1734,6 +1836,17 @@ class App:
         )
         self.monitor_wer_label.pack(side="left")
 
+        self.mode_badge_label = ctk.CTkLabel(
+            status_row,
+            text="VAC",
+            width=110,
+            height=28,
+            corner_radius=12,
+            font=("Arial", 10, "bold"),
+            fg_color="#2E7D32",
+        )
+        self.mode_badge_label.pack(side="right")
+
         self.warnings_box = ctk.CTkTextbox(
             self.wer_status_frame,
             height=52,
@@ -1744,97 +1857,11 @@ class App:
         self.warnings_box.pack(fill="x", padx=12, pady=(0, 10))
         self._set_warnings_text(self.monitor_recommendation_var.get())
 
-        controls_frame = ctk.CTkFrame(content_grid)
-        controls_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        self._add_section_title(controls_frame, "Run Controls")
-
-        mode_buttons = ctk.CTkFrame(controls_frame, fg_color="transparent")
-        mode_buttons.pack(fill="x", padx=12, pady=(0, 8))
-        for column in range(3):
-            mode_buttons.grid_columnconfigure(column, weight=1)
-
-        self.btn_mic = ctk.CTkButton(
-            mode_buttons,
-            text="Microphone",
-            command=lambda: self.apply_audio_mode("Microphone"),
-            height=40,
-            font=("Arial", 10, "bold"),
-        )
-        self.btn_mic.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-
-        self.btn_vac = ctk.CTkButton(
-            mode_buttons,
-            text="VAC",
-            command=lambda: self.apply_audio_mode("VAC"),
-            height=40,
-            font=("Arial", 10, "bold"),
-            fg_color="#2E7D32",
-            hover_color="#1B5E20",
-        )
-        self.btn_vac.grid(row=0, column=1, sticky="ew", padx=4)
-
-        self.btn_mix = ctk.CTkButton(
-            mode_buttons,
-            text="Mixed",
-            command=lambda: self.apply_audio_mode("Mixed"),
-            height=40,
-            font=("Arial", 10, "bold"),
-        )
-        self.btn_mix.grid(row=0, column=2, sticky="ew", padx=(4, 0))
-
-        self.dashboard_live_input_label = ctk.CTkLabel(
-            controls_frame,
-            text="Live input source: " + self._current_live_input_device_name(),
-            font=("Arial", 9, "bold"),
-            text_color="#8AB4F8",
-            anchor="w",
-            justify="left",
-        )
-        self.dashboard_live_input_label.pack(fill="x", padx=12, pady=(0, 8))
-
-        dashboard_live_actions = ctk.CTkFrame(controls_frame, fg_color="transparent")
-        dashboard_live_actions.pack(fill="x", padx=12, pady=(0, 10))
-        for column in range(3):
-            dashboard_live_actions.grid_columnconfigure(column, weight=1)
-
-        self.btn_start_live = ctk.CTkButton(
-            dashboard_live_actions,
-            text="Start",
-            command=self.start_live_transcription,
-            height=36,
-            font=("Arial", 10, "bold"),
-            fg_color="#2E7D32",
-            hover_color="#1B5E20",
-        )
-        self.btn_start_live.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-
-        self.btn_stop_live = ctk.CTkButton(
-            dashboard_live_actions,
-            text="Stop",
-            command=self.stop_live_transcription,
-            height=36,
-            font=("Arial", 10, "bold"),
-            fg_color="#B71C1C",
-            hover_color="#7F1010",
-            state="disabled",
-        )
-        self.btn_stop_live.grid(row=0, column=1, sticky="ew", padx=4)
-
-        self.mute_button = ctk.CTkButton(
-            dashboard_live_actions,
-            text="Mute",
-            command=self.toggle_mute,
-            height=36,
-            font=("Arial", 10),
-            fg_color="#D32F2F",
-            hover_color="#B71C1C",
-        )
-        self.mute_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
-
     def _build_routing_tab(self) -> None:
+        # --- Tab 2: Routing ---
         routing_frame = ctk.CTkFrame(self.routing_tab)
         routing_frame.pack(fill="x", padx=8, pady=(0, 12))
-        self._add_section_title(routing_frame, "Windows Audio Routing", "Device setup plus inline VAC route verification.")
+        self._add_section_title(routing_frame, "Direct Audio Device Control", "Set Windows input and output devices, then verify routing inline.")
 
         self.direct_recording_menu = self._add_device_selector(
             routing_frame,
@@ -1888,7 +1915,7 @@ class App:
 
         ctk.CTkButton(
             preset_row,
-            text="Normal Preset",
+            text="Normal",
             command=lambda: self.apply_device_preset("normal"),
             height=34,
             font=("Arial", 9, "bold"),
@@ -1896,7 +1923,7 @@ class App:
 
         ctk.CTkButton(
             preset_row,
-            text="VAC Preset",
+            text="VAC",
             command=lambda: self.apply_device_preset("vac"),
             height=34,
             font=("Arial", 9, "bold"),
@@ -1906,7 +1933,7 @@ class App:
 
         ctk.CTkButton(
             preset_row,
-            text="Voicemeeter Preset",
+            text="Voicemeeter",
             command=lambda: self.apply_device_preset("mixed"),
             height=34,
             font=("Arial", 9, "bold"),
@@ -1926,6 +1953,17 @@ class App:
         )
         self.btn_vac_test.pack(side="left", padx=(0, 6), expand=True, fill="x")
 
+        self.btn_auto_best_mode = ctk.CTkButton(
+            utility_row,
+            text="Auto Best Mode",
+            command=self.auto_select_best_mode,
+            height=34,
+            font=("Arial", 10, "bold"),
+            fg_color="#7B1FA2",
+            hover_color="#5E1380",
+        )
+        self.btn_auto_best_mode.pack(side="left", padx=6, expand=True, fill="x")
+
         ctk.CTkButton(
             utility_row,
             text="Refresh Devices",
@@ -1944,19 +1982,16 @@ class App:
         self.routing_meter.pack(fill="x", padx=12, pady=(0, 10))
 
     def _build_transcribe_tab(self) -> None:
+        # --- Tab 3: Transcribe ---
         api_key_ready = bool(get_deepgram_api_key())
 
-        file_frame = ctk.CTkFrame(self.transcribe_tab)
-        file_frame.pack(fill="x", padx=8, pady=(0, 12))
-        self._add_section_title(file_frame, "File Transcription")
+        options_frame = ctk.CTkFrame(self.transcribe_tab)
+        options_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(options_frame, "Deepgram Options")
 
         self.transcription_status_label = ctk.CTkLabel(
-            file_frame,
-            text=(
-                ("Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env")
-                + "\n"
-                + self._deepgram_options_summary()
-            ),
+            options_frame,
+            text=("Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env"),
             font=("Arial", 10, "bold"),
             text_color="#66BB6A" if api_key_ready else "#F9A825",
             wraplength=760,
@@ -1964,6 +1999,31 @@ class App:
             anchor="w",
         )
         self.transcription_status_label.pack(fill="x", padx=14, pady=(0, 10))
+
+        options_row = ctk.CTkFrame(options_frame, fg_color="transparent")
+        options_row.pack(fill="x", padx=12, pady=(0, 10))
+        for column in range(5):
+            options_row.grid_columnconfigure(column, weight=1)
+
+        for column, (label, variable) in enumerate(
+            (
+                ("Smart Format", self.deepgram_smart_format_var),
+                ("Diarization", self.deepgram_diarize_var),
+                ("Paragraphs", self.deepgram_paragraphs_var),
+                ("Filler Words", self.deepgram_filler_words_var),
+                ("Numerals", self.deepgram_numerals_var),
+            )
+        ):
+            ctk.CTkSwitch(
+                options_row,
+                text=label,
+                variable=variable,
+                command=self._save_deepgram_options,
+            ).grid(row=0, column=column, sticky="w", padx=4, pady=2)
+
+        file_frame = ctk.CTkFrame(self.transcribe_tab)
+        file_frame.pack(fill="x", padx=8, pady=(0, 12))
+        self._add_section_title(file_frame, "File Transcription")
 
         transcription_actions = ctk.CTkFrame(file_frame, fg_color="transparent")
         transcription_actions.pack(fill="x", padx=12, pady=(0, 12))
@@ -2069,6 +2129,31 @@ class App:
         )
         self.live_signal_status_label.pack(fill="x", padx=14, pady=(0, 10))
 
+        live_options_row = ctk.CTkFrame(live_frame, fg_color="transparent")
+        live_options_row.pack(fill="x", padx=12, pady=(0, 10))
+        live_options_row.grid_columnconfigure(0, weight=1)
+        live_options_row.grid_columnconfigure(1, weight=1)
+
+        self.signal_check_toggle = ctk.CTkSwitch(
+            live_options_row,
+            text="Signal Required to Start",
+            variable=self.require_signal_check_var,
+            command=self.save_form_config,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.signal_check_toggle.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        ctk.CTkButton(
+            live_options_row,
+            text="Auto Best Mode",
+            command=self.auto_select_best_mode,
+            height=32,
+            font=("Arial", 10, "bold"),
+            fg_color="#7B1FA2",
+            hover_color="#5E1380",
+        ).grid(row=0, column=1, sticky="e")
+
         output_frame = ctk.CTkFrame(self.transcribe_tab)
         output_frame.pack(fill="both", expand=True, padx=8, pady=(0, 12))
         self._add_section_title(output_frame, "Transcript Output")
@@ -2083,50 +2168,33 @@ class App:
         self.live_transcript_box.insert("1.0", "Live transcript will appear here.")
         self.live_transcript_box.configure(state="disabled")
 
-        advanced_frame = ctk.CTkFrame(self.transcribe_tab)
-        advanced_frame.pack(fill="x", padx=8, pady=(0, 12))
-        self._add_section_title(advanced_frame, "Advanced Options")
-
-        self.deepgram_options_visible = False
-        self.deepgram_options_toggle = ctk.CTkButton(
-            advanced_frame,
-            text="Show Deepgram Options",
-            command=self.toggle_deepgram_options,
-            height=32,
-            font=("Arial", 10, "bold"),
-        )
-        self.deepgram_options_toggle.pack(fill="x", padx=14, pady=(0, 8))
-
-        self.deepgram_options_frame = ctk.CTkFrame(advanced_frame, fg_color="transparent")
-        for label, variable in (
-            ("Smart Format", self.deepgram_smart_format_var),
-            ("Diarization", self.deepgram_diarize_var),
-            ("Paragraphs", self.deepgram_paragraphs_var),
-            ("Filler Words", self.deepgram_filler_words_var),
-            ("Numerals", self.deepgram_numerals_var),
-        ):
-            ctk.CTkSwitch(
-                self.deepgram_options_frame,
-                text=label,
-                variable=variable,
-                command=self._save_deepgram_options,
-            ).pack(anchor="w", padx=2, pady=2)
-
     def _build_settings_tab(self) -> None:
+        # --- Tab 4: Settings ---
         settings_frame = ctk.CTkFrame(self.settings_tab)
         settings_frame.pack(fill="x", padx=8, pady=(0, 12))
         self._add_section_title(settings_frame, "Device Defaults", "Saved values used by mode switching and live transcription.")
 
-        self.detected_devices_label = ctk.CTkLabel(
+        self.detected_input_devices_label = ctk.CTkLabel(
             settings_frame,
-            text="Detected input devices: checking...",
+            text="Input devices: checking...",
             font=("Arial", 10),
             wraplength=760,
             justify="left",
             text_color="#C6C6C6",
             anchor="w",
         )
-        self.detected_devices_label.pack(fill="x", padx=14, pady=(0, 10))
+        self.detected_input_devices_label.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.detected_output_devices_label = ctk.CTkLabel(
+            settings_frame,
+            text="Output devices: checking...",
+            font=("Arial", 10),
+            wraplength=760,
+            justify="left",
+            text_color="#C6C6C6",
+            anchor="w",
+        )
+        self.detected_output_devices_label.pack(fill="x", padx=14, pady=(0, 10))
         self._refresh_detection_summary()
 
         self.mic_menu = self._add_device_selector(settings_frame, "Microphone device", self.mic_var, self.detected_input_devices)
@@ -2147,62 +2215,31 @@ class App:
         help_frame = ctk.CTkFrame(self.settings_tab)
         help_frame.pack(fill="x", padx=8, pady=(0, 12))
         self._add_section_title(help_frame, "Help")
-        ctk.CTkLabel(
+        self.help_text_box = ctk.CTkTextbox(
             help_frame,
-            text=(
-                "1. Set Zoom microphone to 'Same as System'.\n"
-                "2. Mode buttons change the Windows default recording device for all audio roles.\n"
-                "3. VAC mode also switches Windows playback to the configured CABLE Input target.\n"
-                "4. Mixed mode expects Voicemeeter routing to be configured before use.\n"
-                "5. Use the Advanced tab to run VAC routing diagnostics.\n"
-                "6. Use the Dashboard for day-to-day operation and the Routing tab for setup."
+            height=220,
+            font=("Arial", 10),
+            wrap="word",
+        )
+        self.help_text_box.pack(fill="x", padx=14, pady=(0, 14))
+        self.help_text_box.insert(
+            "1.0",
+            "\n".join(
+                [
+                    "1. Set your conferencing app microphone to 'Same as System' when routing through Windows defaults.",
+                    "2. Use Monitor to confirm levels and WER health before starting a recording session.",
+                    "3. Microphone mode is best for direct speech when room noise is acceptable.",
+                    "4. VAC mode is best for playback-only transcription because the path stays digital end to end.",
+                    "5. Mixed mode expects Voicemeeter to be configured before you switch into it.",
+                    "6. The Routing tab changes Windows defaults for all roles, so stop live transcription first.",
+                    "7. Use Test VAC Routing and the inline routing meter together to confirm signal presence.",
+                    "8. Live Transcription shows the active input source, status, signal level, and transcript output.",
+                    "9. Save Settings after changing device defaults so mode switching uses the updated assignments.",
+                    "10. If monitoring or transcription fails, refresh devices and verify the active recording path first.",
+                ]
             ),
-            font=("Arial", 10),
-            text_color="#C6C6C6",
-            justify="left",
-            anchor="w",
-            wraplength=760,
-        ).pack(fill="x", padx=14, pady=(0, 14))
-
-    def _build_advanced_tab(self) -> None:
-        advanced_frame = ctk.CTkFrame(self.advanced_tab)
-        advanced_frame.pack(fill="x", padx=8, pady=(0, 12))
-        self._add_section_title(advanced_frame, "Diagnostics", "Use this tab for routing checks and low-level troubleshooting.")
-
-        ctk.CTkLabel(
-            advanced_frame,
-            text="VAC routing verification now lives in the Routing tab so the signal can be confirmed inline with a compact meter.",
-            font=("Arial", 9),
-            text_color="#C6C6C6",
-            justify="left",
-            anchor="w",
-            wraplength=760,
-        ).pack(fill="x", padx=12, pady=(0, 8))
-
-        ctk.CTkButton(
-            advanced_frame,
-            text="Open App Folder",
-            command=self.open_app_folder,
-            height=34,
-            font=("Arial", 10),
-        ).pack(fill="x", padx=12, pady=(0, 8))
-
-        ctk.CTkButton(
-            advanced_frame,
-            text="Open README",
-            command=self.open_readme,
-            height=34,
-            font=("Arial", 10),
-        ).pack(fill="x", padx=12, pady=(0, 12))
-
-    def toggle_deepgram_options(self) -> None:
-        self.deepgram_options_visible = not self.deepgram_options_visible
-        if self.deepgram_options_visible:
-            self.deepgram_options_frame.pack(fill="x", padx=14, pady=(0, 12))
-            self.deepgram_options_toggle.configure(text="Hide Deepgram Options")
-        else:
-            self.deepgram_options_frame.pack_forget()
-            self.deepgram_options_toggle.configure(text="Show Deepgram Options")
+        )
+        self.help_text_box.configure(state="disabled")
 
     def _add_device_selector(self, parent, label: str, variable: ctk.StringVar, devices: list[str]):
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=10)
@@ -2243,6 +2280,74 @@ class App:
         self.runtime_audio_var.set(
             f"Active Input: {input_name} | Active Output: {output_name} | Signal: {self._latest_signal_state}"
         )
+        active_device_label = getattr(self, "active_device_label", None)
+        if active_device_label is not None and active_device_label.winfo_exists():
+            active_device_label.configure(text=f"Active Device: {input_name}")
+        signal_label = getattr(self, "signal_label", None)
+        if signal_label is not None and signal_label.winfo_exists():
+            signal_label.configure(text=f"Signal: {self._latest_signal_state}")
+
+    def _is_mixed_mode_available(self) -> bool:
+        configured = self.mix_var.get().strip()
+        if configured and self._resolve_detected_input_name(configured, "Mixed"):
+            return True
+        return any("voicemeeter" in device.lower() for device in self.detected_input_devices)
+
+    def _resolve_detected_input_name(self, requested_name: str, mode_name: ModeName) -> str:
+        requested = requested_name.strip()
+        if not requested:
+            return ""
+        if requested in self.detected_input_devices:
+            return requested
+
+        normalized_requested = normalize_audio_device_name(requested)
+        for device in self.detected_input_devices:
+            normalized_device = normalize_audio_device_name(device)
+            if normalized_device == normalized_requested:
+                return device
+            if normalized_requested and (
+                normalized_requested.lower() in normalized_device.lower()
+                or normalized_device.lower() in normalized_requested.lower()
+            ):
+                return device
+
+        if mode_name == "Mixed":
+            candidate = infer_device(requested or DEFAULT_CONFIG["voicemeeter_device"], self.detected_input_devices, ["voicemeeter"])
+            if candidate in self.detected_input_devices:
+                return candidate
+
+        resolved_index, resolved_info = resolve_input_device(requested)
+        if resolved_index is not None and resolved_info is not None:
+            resolved_name = normalize_audio_device_name(str(resolved_info.get("name", requested)))
+            for device in self.detected_input_devices:
+                if normalize_audio_device_name(device) == resolved_name:
+                    return device
+            return resolved_name
+
+        return ""
+
+    def _refresh_run_control_buttons(self) -> None:
+        active_name = self.current_mode
+        button_map = {
+            "Microphone": getattr(self, "btn_mic", None),
+            "VAC": getattr(self, "btn_vac", None),
+            "Mixed": getattr(self, "btn_mix", None),
+        }
+        for mode_name, button in button_map.items():
+            if button is None or not button.winfo_exists():
+                continue
+            is_active = mode_name == active_name
+            button.configure(
+                border_width=2 if is_active else 0,
+                border_color="#E0E0E0" if is_active else button.cget("fg_color"),
+            )
+        mixed_button = getattr(self, "btn_mix", None)
+        if mixed_button is not None and mixed_button.winfo_exists():
+            mixed_available = self._is_mixed_mode_available()
+            mixed_button.configure(
+                state="normal" if mixed_available else "disabled",
+                text="Mixed" if mixed_available else "Mixed Unavailable",
+            )
 
     def _menu_values_for(self, current_value: str, devices: list[str]) -> list[str]:
         values = list(devices)
@@ -2331,21 +2436,28 @@ class App:
 
     def _refresh_detection_summary(self) -> None:
         if self.detected_input_devices:
-            joined = ", ".join(self.detected_input_devices[:8])
+            joined_inputs = ", ".join(self.detected_input_devices[:8])
             if len(self.detected_input_devices) > 8:
-                joined += ", ..."
-            text = f"Input devices: {joined}"
+                joined_inputs += ", ..."
+            input_text = f"Input devices: {joined_inputs}"
         else:
-            text = "Input devices: none. Check Windows audio drivers or device connection."
+            input_text = "Input devices: none. Check Windows audio drivers or device connection."
+
         if self.detected_output_devices:
-            joined_output = ", ".join(self.detected_output_devices[:6])
+            joined_outputs = ", ".join(self.detected_output_devices[:6])
             if len(self.detected_output_devices) > 6:
-                joined_output += ", ..."
-            text = f"{text}\nOutput devices: {joined_output}"
+                joined_outputs += ", ..."
+            output_text = f"Output devices: {joined_outputs}"
         else:
-            text = f"{text}\nOutput devices: none detected."
-        if hasattr(self, "detected_devices_label") and self.detected_devices_label.winfo_exists():
-            self.detected_devices_label.configure(text=text)
+            output_text = "Output devices: none detected."
+
+        input_label = getattr(self, "detected_input_devices_label", None)
+        if input_label is not None and input_label.winfo_exists():
+            input_label.configure(text=input_text)
+
+        output_label = getattr(self, "detected_output_devices_label", None)
+        if output_label is not None and output_label.winfo_exists():
+            output_label.configure(text=output_text)
 
     def save_form_config(self) -> None:
         self.config["mic_device"] = self.mic_var.get().strip()
@@ -2358,6 +2470,7 @@ class App:
         self.config["deepgram_paragraphs"] = bool(self.deepgram_paragraphs_var.get())
         self.config["deepgram_filler_words"] = bool(self.deepgram_filler_words_var.get())
         self.config["deepgram_numerals"] = bool(self.deepgram_numerals_var.get())
+        self.config["require_signal_check"] = bool(self.require_signal_check_var.get())
         self.config["wer_mode_enabled"] = bool(self.wer_enabled_var.get())
         save_config(self.config)
         self.status_var.set(f"Saved configuration to {CONFIG_PATH.name}.")
@@ -2440,19 +2553,80 @@ class App:
         if sample_rate <= 0:
             sample_rate = int(self.config["sample_rate_hz"])
 
-        self.active_audio_device = {
+        return {
             "name": normalize_audio_device_name(str(device_info.get("name", device_name))),
             "index": device_index,
             "info": device_info,
             "sample_rate": sample_rate,
         }
-        return self.active_audio_device
 
     def verify_active_device(self) -> bool:
         if self.active_audio_device is None:
             return False
         current_index, _ = resolve_input_device(self.active_audio_device["name"])
         return current_index == self.active_audio_device["index"]
+
+    def _expected_input_device_for_mode(self, mode_name: ModeName) -> str:
+        configured_input, _playback = self._resolve_mode_devices(mode_name)
+        if not configured_input:
+            return ""
+        resolved_name = self._resolve_detected_input_name(configured_input, mode_name)
+        return normalize_audio_device_name(resolved_name or configured_input)
+
+    def _active_device_matches_mode(self, mode_name: ModeName) -> bool:
+        if self.active_audio_device is None:
+            return False
+        expected_name = self._expected_input_device_for_mode(mode_name)
+        active_name = normalize_audio_device_name(self.active_audio_device["name"])
+        if not expected_name:
+            return False
+        return active_name == expected_name
+
+    def _probe_vac_route(self, duration_seconds: float = 0.35) -> tuple[dict[str, Any] | None, str]:
+        active_device = self.active_audio_device
+        playback_target = self.vac_playback_var.get().strip()
+        if active_device is None:
+            return None, "No active VAC recording device is bound."
+        if not playback_target:
+            return None, "No VAC playback target is configured."
+
+        output_index, output_info = resolve_output_device(playback_target)
+        if output_index is None or output_info is None:
+            return None, f"Failed to resolve VAC playback target: {playback_target}"
+
+        sample_rate = 48000
+        try:
+            sample_rate = int(float(output_info.get("default_samplerate", sample_rate)))
+        except (TypeError, ValueError):
+            sample_rate = 48000
+        if sample_rate <= 0:
+            sample_rate = 48000
+
+        frequency_hz = 880.0
+        amplitude = 0.22
+
+        try:
+            timeline = np.linspace(0.0, duration_seconds, int(sample_rate * duration_seconds), endpoint=False)
+            envelope = np.minimum(1.0, timeline * 6.0) * np.minimum(1.0, (duration_seconds - timeline) * 6.0)
+            tone = (np.sin(2 * np.pi * frequency_hz * timeline) * envelope * amplitude).astype(np.float32)
+            sd.play(tone, samplerate=sample_rate, device=output_index, blocking=False)
+            time.sleep(0.12)
+            signal = sample_resolved_input_signal(
+                active_device["index"],
+                active_device["sample_rate"],
+                active_device["name"],
+                duration_seconds=max(0.35, duration_seconds),
+                device_info=active_device["info"],
+            )
+            sd.wait()
+            return signal, normalize_audio_device_name(str(output_info.get("name", playback_target)))
+        except Exception as exc:
+            return None, f"VAC probe failed: {exc}"
+        finally:
+            try:
+                sd.stop()
+            except Exception:
+                pass
 
     def _current_live_input_device_name(self) -> str:
         if self.active_audio_device is not None:
@@ -2485,7 +2659,7 @@ class App:
             api_key_ready = bool(get_deepgram_api_key())
             base_text = "Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env"
             self.transcription_status_label.configure(
-                text=f"{base_text}\n{self._deepgram_options_summary()}",
+                text=base_text,
                 text_color="#66BB6A" if api_key_ready else "#F9A825",
             )
         self._refresh_live_transcription_labels()
@@ -2563,9 +2737,10 @@ class App:
     def _apply_live_status_update(self, message: str) -> None:
         lowered = message.lower()
         is_problem = any(token in lowered for token in ("error", "failed", "unable"))
+        is_warning = any(token in lowered for token in ("low input signal", "clipping", "lower the source level", "may be weak"))
         self.live_transcription_status_label.configure(
             text=message,
-            text_color="#F57C00" if is_problem else ("#66BB6A" if self._live_transcription_running else ("#F9A825" if self._live_transcription_starting else "#C6C6C6")),
+            text_color="#F57C00" if (is_problem or is_warning) else ("#66BB6A" if self._live_transcription_running else ("#F9A825" if self._live_transcription_starting else "#C6C6C6")),
         )
         self.status_var.set(message)
 
@@ -2588,6 +2763,26 @@ class App:
             "active": "Active",
         }.get(state, "Unknown")
         self._refresh_runtime_audio_status(signal_state=signal_state)
+
+    def _silent_signal_message(self, mode_name: str, device_name: str, *, relaxed: bool = False) -> str:
+        if mode_name == "VAC":
+            base = (
+                f"No audio was detected on {device_name}. VAC mode requires active system playback routed into "
+                f"{self.vac_playback_var.get().strip() or 'the configured CABLE Input target'}."
+            )
+        elif mode_name == "Mixed":
+            base = (
+                f"No audio was detected on {device_name}. Mixed mode requires Voicemeeter to be running and actively "
+                "routing mic or system audio into the selected input."
+            )
+        else:
+            base = (
+                f"No audio was detected on {device_name}. Check mute state, mic gain, and whether the selected "
+                "microphone is the active Windows recording source."
+            )
+        if relaxed:
+            return base + " Starting anyway because Signal Required to Start is turned off."
+        return base
 
     def _set_live_controls_state(self, *, running: bool = False, starting: bool = False) -> None:
         self._live_transcription_running = running
@@ -2631,6 +2826,17 @@ class App:
             self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
             self.status_var.set(message)
             messagebox.showerror("Live Input Unavailable", message)
+            return
+        if not self._active_device_matches_mode(self.current_mode):
+            expected_name = self._expected_input_device_for_mode(self.current_mode) or "the selected mode input"
+            actual_name = active_device["name"]
+            message = (
+                f"Active device mismatch. Current mode is {self.current_mode}, expected {expected_name}, "
+                f"but the active input is {actual_name}. Reapply the mode before starting live transcription."
+            )
+            self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
+            self.status_var.set(message)
+            messagebox.showerror("Live Input Mismatch", message)
             return
 
         input_device_name = active_device["name"]
@@ -2687,24 +2893,61 @@ class App:
                 return
             return
 
+        preflight_duration = 0.5 if mode_name == "VAC" else 0.25
         signal = sample_resolved_input_signal(
             active_device["index"],
             active_device["sample_rate"],
             active_device["name"],
-            duration_seconds=0.25,
+            duration_seconds=preflight_duration,
+            device_info=active_device["info"],
         )
-        if signal is None:
+        if signal is None and mode_name == "VAC":
+            time.sleep(0.2)
+            signal = sample_resolved_input_signal(
+                active_device["index"],
+                active_device["sample_rate"],
+                active_device["name"],
+                duration_seconds=0.4,
+                device_info=active_device["info"],
+            )
+        if (signal is None or str(signal.get("state", "")).lower() == "silent") and mode_name == "VAC":
+            probe_signal, probe_target = self._probe_vac_route(duration_seconds=0.4)
+            if probe_signal is not None:
+                signal = probe_signal
+            elif isinstance(probe_target, str) and probe_target.startswith("VAC probe failed:"):
+                debug_log(f"[App] {probe_target}", level="warning")
+        signal_ok, signal_message, signal_payload = evaluate_live_signal_readiness(signal, input_device_name)
+        if mode_name == "VAC" and not signal_ok:
+            probe_signal, probe_target = self._probe_vac_route(duration_seconds=0.4)
+            probe_state = "" if probe_signal is None else str(probe_signal.get("state", "")).lower()
+            if probe_state in {"active", "low", "clipping"}:
+                assert probe_signal is not None
+                signal_payload = dict(probe_signal)
+                signal_payload["detail"] = (
+                    f"The VAC cable itself is carrying signal through {probe_target}, "
+                    "but no external application audio is currently reaching the selected input."
+                )
+                signal_message = (
+                    f"VAC routing is healthy through {probe_target}, but no external playback was detected on "
+                    f"{input_device_name}. Start audio playback in the source app and try again."
+                )
+        if not signal_ok and not bool(self.require_signal_check_var.get()):
+            signal_ok = True
+            signal_message = self._silent_signal_message(mode_name, input_device_name, relaxed=True)
+            if signal_payload is None:
+                signal_payload = {
+                    "device_name": input_device_name,
+                    "state": "silent",
+                    "rms": 0.0,
+                    "peak": 0.0,
+                    "color": "#F9A825",
+                    "detail": "Preflight found silence. Start the source audio and the live stream will pick it up when input becomes active.",
+                }
+        if signal_payload is not None:
+            self._queue_live_signal_update(signal_payload)
+        if not signal_ok:
             success = False
-            message = f"Unable to read audio from {input_device_name} before starting live transcription."
-            session = None
-            try:
-                self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
-            except Exception:
-                return
-            return
-        if str(signal.get("state", "")).lower() == "silent":
-            success = False
-            message = f"No audio signal detected on {input_device_name}. Check routing before starting live transcription."
+            message = self._silent_signal_message(mode_name, input_device_name)
             session = None
             try:
                 self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
@@ -2731,7 +2974,8 @@ class App:
                 session.stop()
             return
         try:
-            self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
+            final_message = signal_message if success and signal_payload is not None and str(signal_payload.get("state", "")).lower() in {"low", "clipping"} else message
+            self.root.after(0, lambda: self._finish_start_live_transcription(success, final_message, session))
         except Exception:
             if success:
                 session.stop()
@@ -2761,8 +3005,11 @@ class App:
         self.live_transcription_session = session
         debug_log(f"[App] Live transcription started successfully: {message}")
         self._set_live_controls_state(running=True, starting=False)
-        self.live_transcription_status_label.configure(text=message, text_color="#66BB6A")
-        self._refresh_runtime_audio_status(signal_state="Active")
+        lowered = message.lower()
+        is_warning = any(token in lowered for token in ("low input signal", "clipping", "lower the source level"))
+        self.live_transcription_status_label.configure(text=message, text_color="#F57C00" if is_warning else "#66BB6A")
+        signal_state = "Clipping" if "clipping" in lowered else ("Low signal" if "low input signal" in lowered else "Active")
+        self._refresh_runtime_audio_status(signal_state=signal_state)
         self.status_var.set(message)
 
     def stop_live_transcription(self) -> None:
@@ -2874,12 +3121,30 @@ class App:
         if self._live_transcription_running or self._live_transcription_starting:
             self.status_var.set("Stop live transcription before switching modes.")
             return
+        if mode_name == "Mixed" and not self._is_mixed_mode_available():
+            self.status_var.set("Mixed mode is unavailable because no Voicemeeter input device is currently detected.")
+            return
 
         debug_log(f"[App] Applying full audio mode -> {mode_name}")
         self.save_form_config()
         input_device, playback_target = self._resolve_mode_devices(mode_name)
+        if mode_name in {"Microphone", "VAC", "Mixed"}:
+            resolved_name = self._resolve_detected_input_name(input_device, mode_name)
+            if resolved_name:
+                input_device = resolved_name
+                if mode_name == "Microphone":
+                    self.mic_var.set(resolved_name)
+                elif mode_name == "VAC":
+                    self.vac_var.set(resolved_name)
+                else:
+                    self.mix_var.set(resolved_name)
         if not input_device:
             self.status_var.set(f"No input device configured for {mode_name} mode.")
+            return
+        if mode_name == "Mixed" and input_device not in self.detected_input_devices:
+            self.status_var.set(
+                f"Mixed mode is configured for '{input_device}', but that device is not currently detected. Check Voicemeeter and refresh devices."
+            )
             return
         if not playback_target:
             self.status_var.set(f"No playback device configured for {mode_name} mode.")
@@ -2992,6 +3257,70 @@ class App:
         self._pending_vac_test = True
         self.apply_audio_mode("VAC")
 
+    def auto_select_best_mode(self) -> None:
+        if self._best_mode_running:
+            self.status_var.set("Best mode detection is already running.")
+            return
+        if self._audio_switch_in_progress:
+            self.status_var.set("Wait for the current audio device switch to finish before detecting the best mode.")
+            return
+        if self._live_transcription_running or self._live_transcription_starting:
+            self.status_var.set("Stop live transcription before auto-detecting the best mode.")
+            return
+        self._best_mode_running = True
+        self.status_var.set("Sampling Microphone, VAC, and Mixed inputs to find the best mode...")
+        best_button = getattr(self, "btn_auto_best_mode", None)
+        if best_button is not None and best_button.winfo_exists():
+            best_button.configure(state="disabled", text="Sampling...")
+        threading.Thread(target=self._auto_best_mode_worker, daemon=True).start()
+
+    def _auto_best_mode_worker(self) -> None:
+        state_rank = {"active": 3, "low": 2, "clipping": 1, "silent": 0}
+        samples: list[tuple[int, float, ModeName, str, dict[str, Any] | None]] = []
+
+        for mode_name in ("Microphone", "VAC", "Mixed"):
+            input_name, _playback_target = self._resolve_mode_devices(mode_name)
+            resolved_name = self._resolve_detected_input_name(input_name, mode_name)
+            if not resolved_name:
+                continue
+            signal = sample_input_signal(
+                resolved_name,
+                LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ,
+                duration_seconds=0.5 if mode_name == "VAC" else 0.35,
+            )
+            state = "" if signal is None else str(signal.get("state", "")).lower()
+            rms = 0.0 if signal is None else float(signal.get("rms", 0.0))
+            samples.append((state_rank.get(state, -1), rms, mode_name, resolved_name, signal))
+
+        if not samples:
+            success = False
+            message = "No usable input devices were available to evaluate the best mode."
+            best_mode = None
+        else:
+            samples.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            _rank, _rms, best_mode, resolved_name, signal = samples[0]
+            if signal is None or str(signal.get("state", "")).lower() == "silent":
+                success = False
+                message = "All sampled modes are currently silent. Start audio or speak into the mic, then try Auto Best Mode again."
+            else:
+                success = True
+                detail = "" if signal is None else str(signal.get("detail", "")).strip()
+                message = f"Best mode detected: {best_mode} using {resolved_name}. {detail}".strip()
+
+        try:
+            self.root.after(0, lambda: self._finish_auto_best_mode(success, best_mode, message))
+        except Exception:
+            return
+
+    def _finish_auto_best_mode(self, success: bool, best_mode: ModeName | None, message: str) -> None:
+        self._best_mode_running = False
+        best_button = getattr(self, "btn_auto_best_mode", None)
+        if best_button is not None and best_button.winfo_exists():
+            best_button.configure(state="normal", text="Auto Best Mode")
+        self.status_var.set(message)
+        if success and best_mode is not None:
+            self.apply_audio_mode(best_mode)
+
     def _start_verified_vac_test(self) -> None:
         self.tabview.set("Routing")
 
@@ -3026,16 +3355,28 @@ class App:
                     active_device["sample_rate"],
                     active_device["name"],
                     duration_seconds=0.35,
+                    device_info=active_device["info"],
                 )
             sd.wait()
+            signal_ok, signal_message, signal_payload = evaluate_live_signal_readiness(
+                signal,
+                active_device["name"] if active_device is not None else "selected VAC input",
+            )
+            if signal_payload is not None:
+                try:
+                    self._queue_live_signal_update(signal_payload)
+                except Exception:
+                    pass
             if signal is None:
                 result_message = "VAC routing test completed, but the app could not verify input signal on the selected VAC device."
+            elif not signal_ok:
+                result_message = "VAC routing test finished, but no audio was detected on the selected input. Do not assume routing is working."
             else:
                 state = str(signal.get("state", "")).lower()
-                if state == "silent":
-                    result_message = "VAC routing test finished, but no audio was detected on the selected input. Do not assume routing is working."
-                elif state == "low":
+                if state == "low":
                     result_message = "VAC routing test finished with only low signal on the selected input. Routing may be weak or misconfigured."
+                elif state == "clipping":
+                    result_message = "VAC routing test completed, but the selected input is clipping. Lower playback or mixer output."
                 else:
                     result_message = "VAC routing test completed with confirmed signal on the selected input."
         except Exception as exc:
@@ -3093,7 +3434,7 @@ class App:
             self.monitor_status_label.configure(text="Starting", text_color="#8AB4F8")
             self.monitor_stability_label.configure(text="Sampling", text_color="#8AB4F8")
             self.monitor_wer_label.configure(text="...", text_color="#8AB4F8")
-            self.mode_badge_label.configure(fg_color="#8AB4F8")
+            self.mode_badge_label.configure(text=self.current_mode, fg_color=MODE_UI.get(self.current_mode, MODE_UI["Microphone"])["accent"])
             self._set_meter_levels("RMS: sampling", "Peak: sampling", "Starting", "#8AB4F8", 0.0)
             self._refresh_runtime_audio_status(signal_state="Sampling")
             self.status_var.set("WER monitoring enabled.")
@@ -3105,8 +3446,8 @@ class App:
             self.monitor_recommendation_var.set("Monitoring disabled\nEnable Monitor to resume live analysis")
             self.monitor_status_label.configure(text="Disabled", text_color="#9E9E9E")
             self.monitor_stability_label.configure(text="Paused", text_color="#9E9E9E")
-            self.monitor_wer_label.configure(text="--", text_color="#9E9E9E")
-            self.mode_badge_label.configure(fg_color="#4A4A4A")
+            self.monitor_wer_label.configure(text=MODE_UI.get(self.current_mode, MODE_UI["Microphone"])["badge"].replace("WER ", ""), text_color="#9E9E9E")
+            self.mode_badge_label.configure(text=self.current_mode, fg_color="#4A4A4A")
             self._set_meter_levels("RMS: -∞ dB", "Peak: -∞ dB", "Paused", "#9E9E9E", 0.0)
             self._refresh_runtime_audio_status(signal_state="Monitoring off")
             self._set_warnings_text(self.monitor_recommendation_var.get())
@@ -3157,7 +3498,7 @@ class App:
         }.get(quality, "Unknown")
         self._set_meter_levels(rms_text, peak_text, status_text, color, progress)
         self.monitor_recommendation_var.set(self._recommendation_text(quality, result["detail_text"]))
-        self.mode_badge_label.configure(text=ui_config["badge"], fg_color=color)
+        self.mode_badge_label.configure(text=self.current_mode, fg_color=ui_config["accent"])
         self._refresh_runtime_audio_status(signal_state=signal_state)
         self._set_warnings_text(self.monitor_recommendation_var.get())
 
@@ -3180,19 +3521,13 @@ class App:
 
     def _refresh_mode_hint(self) -> None:
         ui_config = MODE_UI.get(self.current_mode, MODE_UI["Microphone"])
-        hint = {
-            "Microphone": "Best when you are speaking live. Expect more room noise than direct digital audio.",
-            "VAC": "Best WER path for playback-only transcription because the signal stays fully digital.",
-            "Mixed": "Use when you need narration over playback. Quality depends on Voicemeeter routing and gain staging.",
-        }.get(self.current_mode, "")
-        self.mode_hint_label.configure(text=hint)
-        self.mode_status_label.configure(text=MODE_STATUS.get(self.current_mode, ""))
         self.mode_display.configure(text=ui_config["title"], text_color=ui_config["accent"])
-        self.mode_badge_label.configure(text=ui_config["badge"], fg_color=ui_config["accent"])
-        self.mode_route_label.configure(text=ui_config["route"])
+        self.mode_badge_label.configure(text=self.current_mode, fg_color=ui_config["accent"])
         self.mode_device_label.configure(text=self._current_mode_device_summary())
         if hasattr(self, "header_mode_chip") and self.header_mode_chip.winfo_exists():
             self.header_mode_chip.configure(text=self.current_mode, fg_color=ui_config["accent"])
+        self.monitor_wer_label.configure(text=ui_config["badge"].replace("WER ", ""))
+        self._refresh_run_control_buttons()
         self._refresh_live_transcription_labels()
 
     def _current_mode_device_summary(self) -> str:
