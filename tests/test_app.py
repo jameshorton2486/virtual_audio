@@ -3,12 +3,63 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+import logging
+import re
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 import app
 import numpy as np
+
+
+class DummyVar:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value) -> None:
+        self.value = value
+
+
+class DummyButton:
+    def __init__(self, fg_color="#111111"):
+        self.props = {"fg_color": fg_color, "text": "", "state": "normal", "border_width": 0, "border_color": fg_color}
+
+    def winfo_exists(self) -> bool:
+        return True
+
+    def cget(self, name):
+        return self.props[name]
+
+    def configure(self, **kwargs) -> None:
+        self.props.update(kwargs)
+
+
+class DummyRoot:
+    def __init__(self):
+        self.exists = True
+
+    def after(self, _delay, callback) -> None:
+        callback()
+
+    def winfo_exists(self) -> bool:
+        return self.exists
+
+
+class CaptureHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def bind_app_method(obj, method_name: str):
+    return getattr(app.App, method_name).__get__(obj, app.App)
 
 
 class DeviceHelpersTests(unittest.TestCase):
@@ -384,7 +435,7 @@ class LiveSignalTests(unittest.TestCase):
         raw_bytes = (np.full(1024, 2500, dtype=np.int16)).tobytes()
 
         with patch("app.time.time", return_value=10.0):
-            session._report_input_signal(raw_bytes)
+            session._report_input_signal(raw_bytes, 1024)
 
         self.assertEqual(len(signal_updates), 1)
         self.assertEqual(signal_updates[0]["state"], "active")
@@ -440,6 +491,215 @@ class LiveSignalTests(unittest.TestCase):
             app.format_live_result_text(result),
             "Q: Can you state your name?\nA: Yes I can",
         )
+
+
+class AppBehaviorTests(unittest.TestCase):
+    def _make_app_stub(self):
+        stub = app.App.__new__(app.App)
+        stub.current_mode = "Microphone"
+        stub.config = {"last_mode": "Microphone"}
+        stub.is_muted = False
+        stub._audio_switch_in_progress = False
+        stub._pending_mode_button = None
+        stub._closing = False
+        stub.detected_input_devices = [
+            "Microphone (Realtek HD Audio Mic input)",
+            "CABLE Output (VB-Audio Virtual Cable)",
+        ]
+        stub.detected_output_devices = ["Speakers (Realtek Audio)", "CABLE Input (VB-Audio Virtual Cable)"]
+        stub.mix_var = DummyVar("VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)")
+        stub.mic_var = DummyVar("Microphone (Realtek HD Audio Mic input)")
+        stub.vac_var = DummyVar("CABLE Output (VB-Audio Virtual Cable)")
+        stub.speaker_var = DummyVar("Speakers (Realtek Audio)")
+        stub.vac_playback_var = DummyVar("CABLE Input (VB-Audio Virtual Cable)")
+        stub.require_signal_check_var = DummyVar(True)
+        stub.status_var = DummyVar("")
+        stub.mode_var = DummyVar("Microphone")
+        stub.direct_recording_var = DummyVar("")
+        stub.direct_playback_var = DummyVar("")
+        stub.runtime_audio_var = DummyVar("")
+        stub.live_transcription_status_label = DummyButton()
+        stub.btn_mic = DummyButton("#1565C0")
+        stub.btn_vac = DummyButton("#2E7D32")
+        stub.btn_mix = DummyButton("#8E24AA")
+        stub.mute_button = DummyButton("#D32F2F")
+        stub.root = DummyRoot()
+        stub._queue_live_signal_update = lambda payload: None
+        stub._refresh_mode_hint = lambda: None
+        stub._refresh_runtime_audio_status = lambda signal_state=None: None
+        stub._refresh_live_transcription_labels = lambda: None
+        stub.save_form_config = lambda: None
+        stub._wait_for_active_input_device = lambda expected: True
+        stub.device_manager = SimpleNamespace(
+            set_default_recording_device=lambda device: (True, f"record {device}"),
+            set_default_playback_device=lambda device: (True, f"play {device}"),
+        )
+        stub._probe_vac_route = lambda duration_seconds=0.4: (None, "probe")
+        stub._resolve_mode_devices = bind_app_method(stub, "_resolve_mode_devices")
+        stub._expected_input_device_for_mode = bind_app_method(stub, "_expected_input_device_for_mode")
+        stub._resolve_detected_input_name = bind_app_method(stub, "_resolve_detected_input_name")
+        stub._is_mixed_mode_available = bind_app_method(stub, "_is_mixed_mode_available")
+        stub._refresh_run_control_buttons = bind_app_method(stub, "_refresh_run_control_buttons")
+        stub._run_preflight = bind_app_method(stub, "_run_preflight")
+        stub._finish_apply_audio_mode_hot = bind_app_method(stub, "_finish_apply_audio_mode_hot")
+        stub.resolve_active_device = lambda name: {
+            "name": name,
+            "index": 1,
+            "info": {"name": name, "max_input_channels": 1},
+            "sample_rate": 24000,
+        }
+        stub.active_audio_device = {
+            "name": "Microphone (Realtek HD Audio Mic input)",
+            "index": 0,
+            "info": {"name": "Microphone (Realtek HD Audio Mic input)", "max_input_channels": 1},
+            "sample_rate": 24000,
+        }
+        stub.live_transcription_session = SimpleNamespace(switch_input_device=Mock(return_value=(True, "switched")))
+        return stub
+
+    def test_refresh_run_control_buttons_includes_mute(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.is_muted = True
+
+        app_stub._refresh_run_control_buttons()
+
+        self.assertEqual(app_stub.mute_button.props["text"], "Muted — Click to Unmute")
+        self.assertEqual(app_stub.mute_button.props["border_width"], 2)
+
+    def test_mixed_mode_requires_voicemeeter_keyword(self) -> None:
+        app_stub = self._make_app_stub()
+
+        self.assertFalse(app_stub._is_mixed_mode_available())
+        self.assertEqual(app_stub._resolve_detected_input_name(app_stub.mix_var.get(), "Mixed"), "")
+
+    def test_mixed_mode_resolver_logs_failure_code(self) -> None:
+        app_stub = self._make_app_stub()
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            app_stub._resolve_detected_input_name(app_stub.mix_var.get(), "Mixed")
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        self.assertTrue(any(message.startswith("[Failure: ROUTING]") for message in handler.messages))
+
+    def test_preflight_emits_all_steps(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.detected_input_devices.append("VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)")
+        active_device = {
+            "name": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+            "index": 2,
+            "info": {"name": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)", "max_input_channels": 1},
+            "sample_rate": 24000,
+        }
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            with patch("app.sd.check_input_settings", return_value=None), patch(
+                "app.sample_resolved_input_signal",
+                return_value={"state": "active", "rms": 0.01, "peak": 0.1, "color": "#66BB6A", "detail": "ok"},
+            ):
+                ok, failure_code, _diagnostics = app_stub._run_preflight("Mixed", active_device)
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        self.assertTrue(ok)
+        self.assertEqual(failure_code, "")
+        for step in range(1, 10):
+            self.assertTrue(any(f"step={step}_" in message or f"step={step}" in message for message in handler.messages), msg=f"missing step {step}")
+
+    def test_apply_audio_mode_hot_switch_invokes_session_swap(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._live_transcription_running = True
+        app_stub.live_transcription_session = SimpleNamespace(switch_input_device=Mock(return_value=(True, "switched")))
+
+        with patch.object(app, "save_config", return_value=None), patch.object(
+            app_stub, "_run_preflight", return_value=(True, "", {})
+        ):
+            app.App._apply_audio_mode_hot_worker(app_stub, "VAC", "CABLE Output (VB-Audio Virtual Cable)", "CABLE Input (VB-Audio Virtual Cable)")
+
+        app_stub.live_transcription_session.switch_input_device.assert_called_once()
+        args = app_stub.live_transcription_session.switch_input_device.call_args[0]
+        self.assertEqual(args[0]["name"], "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(args[1], "VAC")
+
+    def test_no_silent_excepts(self) -> None:
+        source = Path(app.APP_DIR / "app.py").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"except Exception:\s*(?:pass|return)", source)), 0)
+
+    def test_log_format_tagged(self) -> None:
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            app.log_event("App", event="test")
+            app.log_failure("DEVICE", mode="VAC", device="CABLE Output", reason="test")
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        self.assertTrue(handler.messages)
+        self.assertTrue(all(message.startswith("[") for message in handler.messages))
+
+
+class LiveSessionSwitchTests(unittest.TestCase):
+    def test_switch_input_device_restores_old_stream_on_failure(self) -> None:
+        transcript_updates: list[tuple[str, str]] = []
+        status_updates: list[str] = []
+        signal_updates: list[dict[str, object]] = []
+        session = app.LiveTranscriptionSession(
+            api_key="test-key",
+            input_device={
+                "name": "Microphone (Realtek HD Audio Mic input)",
+                "index": 1,
+                "info": {"name": "Microphone (Realtek HD Audio Mic input)", "max_input_channels": 1},
+                "sample_rate": 24000,
+            },
+            mode_name="Microphone",
+            on_transcript=transcript_updates.append,
+            on_status=status_updates.append,
+            on_signal=signal_updates.append,
+        )
+
+        class DummyStream:
+            def __init__(self, device):
+                self.device = device
+
+            def start(self):
+                return None
+
+            def stop(self):
+                return None
+
+            def close(self):
+                return None
+
+        session.connection = object()
+        session.running = True
+        session.stream = DummyStream(1)
+        old_stream = session.stream
+
+        def stream_factory(**kwargs):
+            if kwargs["device"] == 2:
+                raise RuntimeError("new device failed")
+            return DummyStream(kwargs["device"])
+
+        session._input_stream_factory = stream_factory
+
+        with patch("app.sd.check_input_settings", return_value=None):
+            ok, message = session.switch_input_device(
+                {
+                    "name": "CABLE Output (VB-Audio Virtual Cable)",
+                    "index": 2,
+                    "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1},
+                    "sample_rate": 24000,
+                },
+                "VAC",
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("restored", message.lower())
+        self.assertTrue(session.running)
+        self.assertEqual(session.input_device_index, 1)
+        self.assertNotEqual(session.stream, old_stream)
 
 
 if __name__ == "__main__":

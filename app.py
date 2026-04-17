@@ -10,9 +10,11 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Any, Final, Literal, Mapping, TypedDict
@@ -80,8 +82,10 @@ NIRCMD_PATH = APP_DIR / "nircmd.exe"
 TRANSCRIPTS_DIR = APP_DIR / "transcripts"
 LOGS_DIR = APP_DIR / "logs"
 LOG_PATH = LOGS_DIR / "virtual_audio.log"
+ERROR_LOG_PATH = LOGS_DIR / "errors.log"
 DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ = 16000
+PREFLIGHT_SIGNAL_THRESHOLD_RMS = 0.001
 
 SUPPORTED_TRANSCRIPTION_SUFFIXES = {
     ".aac",
@@ -196,20 +200,50 @@ MODE_UI = {
 }
 
 
+def _quote_log_value(value: Any) -> str:
+    text = str(value)
+    if not text:
+        return "''"
+    if any(char.isspace() for char in text):
+        return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return text
+
+
+def _log_message(tag: str, **fields: Any) -> str:
+    parts = [f"{key}={_quote_log_value(value)}" for key, value in fields.items()]
+    return f"[{tag}]" + (f" {' '.join(parts)}" if parts else "")
+
+
+def log_event(tag: str, *, level: str = "info", **fields: Any) -> None:
+    debug_log(_log_message(tag, **fields), level=level)
+
+
+def log_failure(code: str, *, level: str = "error", **fields: Any) -> None:
+    debug_log(_log_message(f"Failure: {code}", **fields), level=level)
+
+
 def setup_logging() -> logging.Logger:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("virtual_audio")
     if logger.handlers:
         return logger
 
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    debug_enabled = os.environ.get("VIRTUAL_AUDIO_DEBUG", "").strip() == "1"
+    logger.setLevel(logging.DEBUG if debug_enabled else logging.INFO)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
 
-    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG if debug_enabled else logging.INFO)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
+    error_handler = RotatingFileHandler(ERROR_LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    error_handler.setLevel(logging.WARNING)
+    error_handler.setFormatter(formatter)
+    logger.addHandler(error_handler)
+
     stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.DEBUG if debug_enabled else (logging.WARNING if getattr(sys, "frozen", False) else logging.INFO))
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
@@ -221,9 +255,41 @@ LOGGER = setup_logging()
 
 
 def debug_log(message: str, level: str = "info") -> None:
-    print(message)
     log_fn = getattr(LOGGER, level, LOGGER.info)
     log_fn(message)
+
+
+def _log_uncaught_exception(tag: str, exc_type, exc_value, exc_traceback, **fields: Any) -> None:
+    LOGGER.critical(
+        _log_message(tag, **fields),
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
+def install_global_exception_hooks() -> None:
+    def _sys_excepthook(exc_type, exc_value, exc_traceback) -> None:
+        _log_uncaught_exception(
+            "TkCallback",
+            exc_type,
+            exc_value,
+            exc_traceback,
+            event="sys_excepthook",
+            reason=str(exc_value or exc_type.__name__),
+        )
+
+    def _thread_excepthook(args) -> None:
+        _log_uncaught_exception(
+            "TkCallback",
+            args.exc_type,
+            args.exc_value,
+            args.exc_traceback,
+            event="threading_excepthook",
+            thread_name=getattr(args.thread, "name", "unknown"),
+            reason=str(args.exc_value or args.exc_type.__name__),
+        )
+
+    sys.excepthook = _sys_excepthook
+    threading.excepthook = _thread_excepthook
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -572,8 +638,8 @@ def format_deepgram_payload_text(payload: dict[str, Any]) -> str:
         speaker_text = _deepgram_words_to_speaker_lines(words)
         if speaker_text:
             return speaker_text
-    except (KeyError, TypeError, IndexError, AttributeError):
-        pass
+    except (KeyError, TypeError, IndexError, AttributeError) as exc:
+        log_event("FileSession", level="warning", event="payload_format_fallback", reason=str(exc))
     return extract_transcript_text(payload)
 
 
@@ -599,7 +665,8 @@ def format_live_result_text(result: Any) -> str:
         if speaker_text:
             return speaker_text
         return str(_deepgram_value(primary, "transcript", "")).strip()
-    except Exception:
+    except Exception as exc:
+        log_event("LiveSession", level="warning", event="live_result_format_failed", reason=str(exc))
         return ""
 
 
@@ -626,7 +693,8 @@ def build_live_transcript_metadata_path(transcript_path: Path) -> Path:
 def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
     try:
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
-    except Exception:
+    except Exception as exc:
+        log_event("DeviceManager", level="warning", event="analyze_live_input_signal_failed", reason=str(exc))
         return None
     if samples.size == 0:
         return None
@@ -692,7 +760,8 @@ def resolve_input_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
     target = normalize_audio_device_name(name)
     try:
         devices = sd.query_devices()
-    except Exception:
+    except Exception as exc:
+        log_event("Resolver", level="warning", event="query_input_devices_failed", requested=name, reason=str(exc))
         return None, None
 
     exact_match: tuple[int, dict[str, Any]] | None = None
@@ -727,7 +796,8 @@ def resolve_output_device(name: str) -> tuple[int | None, dict[str, Any] | None]
     target = normalize_audio_device_name(name)
     try:
         devices = sd.query_devices()
-    except Exception:
+    except Exception as exc:
+        log_event("Resolver", level="warning", event="query_output_devices_failed", requested=name, reason=str(exc))
         return None, None
 
     exact_match: tuple[int, dict[str, Any]] | None = None
@@ -761,7 +831,8 @@ def resolve_output_device(name: str) -> tuple[int | None, dict[str, Any] | None]
 def get_default_input_device() -> tuple[int | None, dict[str, Any] | None]:
     try:
         device_info = sd.query_devices(kind="input")
-    except Exception:
+    except Exception as exc:
+        log_event("DeviceManager", level="warning", event="default_input_query_failed", reason=str(exc))
         return None, None
 
     if not isinstance(device_info, dict):
@@ -780,7 +851,8 @@ def get_default_input_device() -> tuple[int | None, dict[str, Any] | None]:
 def get_default_output_device() -> tuple[int | None, dict[str, Any] | None]:
     try:
         device_info = sd.query_devices(kind="output")
-    except Exception:
+    except Exception as exc:
+        log_event("DeviceManager", level="warning", event="default_output_query_failed", reason=str(exc))
         return None, None
 
     if not isinstance(device_info, dict):
@@ -820,7 +892,8 @@ def sample_resolved_input_signal(
     if resolved_info is None:
         try:
             queried = sd.query_devices(device_index)
-        except Exception:
+        except Exception as exc:
+            log_event("Preflight", level="warning", event="resolved_device_query_failed", device=device_name, reason=str(exc))
             queried = None
         if isinstance(queried, dict):
             resolved_info = queried
@@ -857,7 +930,8 @@ def sample_resolved_input_signal(
             device=device_index,
         )
         sd.wait()
-    except Exception:
+    except Exception as exc:
+        log_event("Preflight", level="warning", event="sample_input_signal_failed", device=device_name, reason=str(exc))
         return None
 
     samples = np.asarray(recording, dtype=np.float64)
@@ -883,7 +957,8 @@ def _list_devices(channel_key: str) -> list[str]:
 
     try:
         query = sd.query_devices()
-    except Exception:
+    except Exception as exc:
+        log_event("Resolver", level="warning", event="list_devices_failed", channel_key=channel_key, reason=str(exc))
         return devices
 
     for device in query:
@@ -1034,7 +1109,7 @@ class AudioDeviceManager:
             raise FileNotFoundError(f"Missing {NIRCMD_PATH.name} in {APP_DIR}.")
 
         for role in ("0", "1", "2"):
-            debug_log(f"[AudioDeviceManager] Setting default device role={role} name={device_name}")
+            log_event("DeviceManager", event="set_default_device", role=role, device=device_name)
             subprocess.run(
                 [str(NIRCMD_PATH), "setdefaultsounddevice", device_name, role],
                 check=True,
@@ -1045,29 +1120,29 @@ class AudioDeviceManager:
     @classmethod
     def set_default_recording_device(cls, device_name: str) -> tuple[bool, str]:
         try:
-            debug_log(f"[AudioDeviceManager] Request to switch recording device -> {device_name}")
+            log_event("DeviceManager", event="switch_recording_requested", device=device_name)
             cls._set_default_device(device_name)
             return True, f"Switched recording device to {device_name} for all Windows audio roles."
         except subprocess.CalledProcessError as exc:
             error_text = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
-            debug_log(f"[AudioDeviceManager] Recording device switch failed: {error_text or exc}", level="error")
+            log_failure("DEVICE", mode="recording", device=device_name, reason=error_text or str(exc))
             return False, error_text or f"Failed to switch to {device_name}."
         except Exception as exc:
-            debug_log(f"[AudioDeviceManager] Recording device switch exception: {exc}", level="error")
+            LOGGER.exception(_log_message("Failure: DEVICE", mode="recording", device=device_name, reason=str(exc)))
             return False, str(exc)
 
     @classmethod
     def set_default_playback_device(cls, device_name: str) -> tuple[bool, str]:
         try:
-            debug_log(f"[AudioDeviceManager] Request to switch playback device -> {device_name}")
+            log_event("DeviceManager", event="switch_playback_requested", device=device_name)
             cls._set_default_device(device_name)
             return True, f"Switched playback device to {device_name} for all Windows audio roles."
         except subprocess.CalledProcessError as exc:
             error_text = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
-            debug_log(f"[AudioDeviceManager] Playback device switch failed: {error_text or exc}", level="error")
+            log_failure("DEVICE", mode="playback", device=device_name, reason=error_text or str(exc))
             return False, error_text or f"Failed to switch to {device_name}."
         except Exception as exc:
-            debug_log(f"[AudioDeviceManager] Playback device switch exception: {exc}", level="error")
+            LOGGER.exception(_log_message("Failure: DEVICE", mode="playback", device=device_name, reason=str(exc)))
             return False, str(exc)
 
     @staticmethod
@@ -1076,7 +1151,7 @@ class AudioDeviceManager:
             return False, f"Missing {NIRCMD_PATH.name} in {APP_DIR}."
 
         try:
-            debug_log("[AudioDeviceManager] Toggling mute on default recording device")
+            log_event("DeviceManager", event="toggle_mute_requested", target="default_record")
             subprocess.run(
                 [str(NIRCMD_PATH), "mutesysvolume", "2", "default_record"],
                 check=True,
@@ -1086,10 +1161,10 @@ class AudioDeviceManager:
             return True, "Toggled mute on the default recording device."
         except subprocess.CalledProcessError as exc:
             error_text = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
-            debug_log(f"[AudioDeviceManager] Toggle mute failed: {error_text or exc}", level="error")
+            log_failure("DEVICE", tag="MuteToggle", device="default_record", reason=f"nircmd mutesysvolume exited with code {exc.returncode}")
             return False, error_text or "Failed to toggle mute."
         except Exception as exc:
-            debug_log(f"[AudioDeviceManager] Toggle mute exception: {exc}", level="error")
+            LOGGER.exception(_log_message("Failure: DEVICE", tag="MuteToggle", device="default_record", reason=str(exc)))
             return False, str(exc)
 
 
@@ -1308,15 +1383,39 @@ class LiveTranscriptionSession:
         self.actual_device_name = self.input_device_name
         self.started_at = ""
         self.stopped_at = ""
+        self.mode_switches: list[dict[str, str]] = []
         self.callback_count = 0
         self.last_signal_debug_at = 0.0
         self.last_signal_status = ""
+        self._swap_lock = threading.Lock()
+        self._input_stream_factory = sd.InputStream
+
+    def _close_stream(self, stream) -> None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as exc:
+            log_event("LiveSession", level="warning", event="stream_close_warning", device=self.actual_device_name, reason=str(exc))
+
+    def _open_stream_for_device(self, device_index: int, capture_channels: int):
+        sd.check_input_settings(
+            device=device_index,
+            samplerate=self.sample_rate_hz,
+            channels=capture_channels,
+        )
+        stream = self._input_stream_factory(
+            samplerate=self.sample_rate_hz,
+            blocksize=1024,
+            device=device_index,
+            channels=capture_channels,
+            dtype="float32",
+            callback=self._audio_callback,
+        )
+        stream.start()
+        return stream
 
     def start(self) -> tuple[bool, str]:
-        debug_log(
-            f"[LiveTranscriptionSession] Start requested mode={self.mode_name} "
-            f"configured_device={self.input_device_name} fixed_config={get_deepgram_config()}"
-        )
+        log_event("LiveSession", event="start_requested", mode=self.mode_name, configured_device=self.input_device_name)
         if not self.api_key:
             return False, "Missing DEEPGRAM_API_KEY in .env."
 
@@ -1330,6 +1429,7 @@ class LiveTranscriptionSession:
         try:
             from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
         except Exception as exc:
+            log_failure("DEPENDENCY", mode=self.mode_name, device=self.input_device_name, reason=str(exc))
             return False, f"Deepgram SDK is not available in this Python environment: {exc}"
 
         self.transcript_path = build_live_transcript_output_path()
@@ -1349,78 +1449,61 @@ class LiveTranscriptionSession:
         }
         omitted_names = sorted(set(requested_live_options.keys()) - set(live_options_payload.keys()))
         if omitted_names:
-            debug_log(
-                f"[LiveTranscriptionSession] Live SDK does not support: {', '.join(omitted_names)}. "
-                "Continuing with supported options only.",
-                level="warning",
-            )
+            log_event("LiveSession", level="warning", event="sdk_options_omitted", omitted=",".join(omitted_names))
 
         options = LiveOptions(**live_options_payload)
 
         if not connection.start(options):
-            debug_log("[LiveTranscriptionSession] Deepgram websocket start returned false", level="error")
+            log_failure("DEPENDENCY", mode=self.mode_name, device=self.input_device_name, reason="Deepgram websocket start returned false")
             return False, "Failed to start Deepgram live transcription connection."
 
         try:
-            sd.check_input_settings(
-                device=self.input_device_index,
-                samplerate=self.sample_rate_hz,
-                channels=self.capture_channels,
-            )
             if self.stream is not None:
-                try:
-                    self.stream.stop()
-                    self.stream.close()
-                except Exception:
-                    pass
+                self._close_stream(self.stream)
                 self.stream = None
-
-            stream = sd.InputStream(
-                samplerate=self.sample_rate_hz,
-                blocksize=1024,
-                device=self.input_device_index,
-                channels=self.capture_channels,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
-            self.stream = stream
-            stream.start()
+            self.stream = self._open_stream_for_device(self.input_device_index, self.capture_channels)
         except Exception as exc:
             try:
                 connection.finish()
-            except Exception:
-                pass
+            except Exception as finish_exc:
+                log_event("LiveSession", level="warning", event="connection_finish_warning", reason=str(finish_exc))
             self.connection = None
-            debug_log(f"[LiveTranscriptionSession] Failed to open InputStream for {self.input_device_name}: {exc}", level="error")
+            log_failure("DEVICE", mode=self.mode_name, device=self.input_device_name, reason=str(exc))
             return False, f"Failed to open input stream on {self.input_device_name}: {exc}"
 
         self.running = True
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.actual_device_name = normalize_audio_device_name(str(self.input_device_info.get("name", self.input_device_name)))
-        debug_log(
-            f"[LiveTranscriptionSession] Running mode={self.mode_name} resolved_device={self.actual_device_name} "
-            f"device_index={self.input_device_index} sample_rate={self.sample_rate_hz}"
+        log_event(
+            "LiveSession",
+            event="running",
+            mode=self.mode_name,
+            resolved_device=self.actual_device_name,
+            device_index=self.input_device_index,
+            sample_rate=self.sample_rate_hz,
         )
         self._write_metadata(status="running")
         return True, f"Live transcription started from {self.actual_device_name}."
 
     def stop(self) -> tuple[bool, str]:
-        debug_log(f"[LiveTranscriptionSession] Stop requested mode={self.mode_name} resolved_device={self.actual_device_name}")
+        log_event("LiveSession", event="stop_requested", mode=self.mode_name, resolved_device=self.actual_device_name)
         self.running = False
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
-
-        if self.connection is not None:
-            try:
-                self.connection.finish()
-            except Exception:
-                pass
-            self.connection = None
+        acquired = self._swap_lock.acquire(timeout=5.0)
+        if not acquired:
+            log_failure("DEVICE", mode=self.mode_name, device=self.actual_device_name, reason="swap lock timeout during stop")
+        try:
+            if self.stream is not None:
+                self._close_stream(self.stream)
+                self.stream = None
+            if self.connection is not None:
+                try:
+                    self.connection.finish()
+                except Exception as exc:
+                    log_event("LiveSession", level="warning", event="connection_finish_warning", reason=str(exc))
+                self.connection = None
+        finally:
+            if acquired:
+                self._swap_lock.release()
 
         transcript_body = "\n".join(line for line in self.final_lines if line.strip()).strip()
         transcript_text = transcript_body or "[No final transcript captured]"
@@ -1429,25 +1512,125 @@ class LiveTranscriptionSession:
         try:
             output_path.write_text(transcript_text, encoding="utf-8")
         except OSError as exc:
+            log_failure("DEVICE", mode=self.mode_name, device=self.actual_device_name, reason=str(exc))
             return False, f"Failed to save live transcript: {exc}"
 
         self._write_metadata(status="error" if self.error_message else "completed")
 
         if self.error_message:
-            debug_log(f"[LiveTranscriptionSession] Stopped with error: {self.error_message}", level="warning")
+            log_event("LiveSession", level="warning", event="stopped_with_error", reason=self.error_message)
             return False, f"{self.error_message}\nPartial transcript saved to {output_path.name}"
-        debug_log(f"[LiveTranscriptionSession] Completed successfully -> {output_path.name}")
+        log_event("LiveSession", event="completed", transcript_file=output_path.name)
         return True, f"Live transcript saved to {output_path.name}"
+
+    def switch_input_device(
+        self,
+        new_device: ActiveAudioDevice,
+        new_mode_name: str,
+    ) -> tuple[bool, str]:
+        if not self.running or self.connection is None:
+            return False, "Session is not running"
+
+        if not self._swap_lock.acquire(timeout=5.0):
+            log_failure("DEVICE", tag="HotSwitch", mode=self.mode_name, device=self.actual_device_name, reason="swap lock timeout")
+            return False, "Hot switch timed out waiting for the audio stream lock."
+
+        started_at = time.time()
+        old_stream = self.stream
+        old_index = self.input_device_index
+        old_info = self.input_device_info
+        old_name = self.input_device_name
+        old_actual = self.actual_device_name
+        old_mode = self.mode_name
+        old_channels = self.capture_channels
+        try:
+            log_event(
+                "HotSwitch",
+                event="start",
+                from_mode=old_mode,
+                from_device=old_actual,
+                to_mode=new_mode_name,
+                to_device=new_device["name"],
+            )
+            if old_stream is not None:
+                self._close_stream(old_stream)
+                log_event("LiveSession", event="stream_closed", device=old_actual)
+            self.stream = None
+
+            new_info = new_device.get("info") or {}
+            new_index = int(new_device["index"])
+            new_channels = max(1, min(int(new_info.get("max_input_channels", 1)), 2))
+            new_stream = self._open_stream_for_device(new_index, new_channels)
+
+            self.stream = new_stream
+            self.input_device_index = new_index
+            self.input_device_info = new_info
+            self.input_device_name = new_device["name"].strip()
+            self.actual_device_name = normalize_audio_device_name(str(new_info.get("name", self.input_device_name)))
+            self.mode_name = new_mode_name.strip() or self.mode_name
+            self.capture_channels = new_channels
+
+            marker = f"[Switched to {self.mode_name} mode at {time.strftime('%H:%M:%S')} - {self.actual_device_name}]"
+            self.final_lines.append(marker)
+            self.mode_switches.append(
+                {
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "from_mode": old_mode,
+                    "from_device": old_actual,
+                    "to_mode": self.mode_name,
+                    "to_device": self.actual_device_name,
+                }
+            )
+            self._write_partial_transcript()
+            self._write_metadata(status="running")
+            self.on_transcript("\n".join(self.final_lines), self.current_interim)
+            self.on_status(f"Switched to {self.mode_name} - capturing from {self.actual_device_name}")
+            self.on_signal(
+                {
+                    "device_name": self.actual_device_name,
+                    "mode_name": self.mode_name,
+                    "state": "active",
+                    "rms": 0.0,
+                    "peak": 0.0,
+                    "color": "#8AB4F8",
+                    "detail": f"Capture stream moved to {self.actual_device_name}.",
+                }
+            )
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            log_event("HotSwitch", event="complete", from_mode=old_mode, to_mode=self.mode_name, elapsed_ms=elapsed_ms)
+            log_event("ModeSwitch", from_mode=old_mode, to_mode=self.mode_name, old_device=old_actual, new_device=self.actual_device_name, hot=True)
+            return True, f"Switched to {self.mode_name} - capturing from {self.actual_device_name}"
+        except Exception as exc:
+            LOGGER.exception(_log_message("Failure: DEVICE", mode=new_mode_name, device=new_device.get("name", ""), reason=str(exc)))
+            try:
+                restored_stream = self._open_stream_for_device(old_index, old_channels)
+                self.stream = restored_stream
+                self.input_device_index = old_index
+                self.input_device_info = old_info
+                self.input_device_name = old_name
+                self.actual_device_name = old_actual
+                self.mode_name = old_mode
+                self.capture_channels = old_channels
+                return False, f"Hot switch failed; restored {old_actual}."
+            except Exception as restore_exc:
+                LOGGER.exception(_log_message("Failure: DEVICE", mode=old_mode, device=old_actual, reason=str(restore_exc)))
+                self.error_message = "Hot switch failed and old device could not be restored; session ended."
+                self.connection = None
+                self.stream = None
+                self.running = False
+                return False, self.error_message
+        finally:
+            self._swap_lock.release()
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if not self.running or self.connection is None:
             return
         self.callback_count += 1
         if status:
-            debug_log(f"[LiveTranscriptionSession] Audio callback status: {status}", level="warning")
+            log_event("LiveSession", level="warning", event="audio_callback_status", status=status)
             self.on_status(f"Audio stream status: {status}")
         pcm_bytes = self._pcm16_bytes_from_input(indata)
-        self._report_input_signal(pcm_bytes)
+        self._report_input_signal(pcm_bytes, frames)
         try:
             self.connection.send(pcm_bytes)
         except Exception as exc:
@@ -1467,16 +1650,16 @@ class LiveTranscriptionSession:
         return pcm16.tobytes()
 
     def _on_open(self, client, open=None, **kwargs) -> None:
-        debug_log("[LiveTranscriptionSession] Deepgram websocket opened")
+        log_event("LiveSession", event="websocket_opened", mode=self.mode_name, device=self.actual_device_name)
         self.on_status("Deepgram live connection opened.")
 
     def _on_close(self, client, close=None, **kwargs) -> None:
-        debug_log("[LiveTranscriptionSession] Deepgram websocket closed")
+        log_event("LiveSession", event="websocket_closed", mode=self.mode_name, device=self.actual_device_name)
         self.on_status("Deepgram live connection closed.")
 
     def _on_error(self, client, error=None, **kwargs) -> None:
         self.error_message = str(error) if error else "Deepgram live transcription error."
-        debug_log(f"[LiveTranscriptionSession] Deepgram error: {self.error_message}", level="error")
+        log_failure("DEPENDENCY", mode=self.mode_name, device=self.actual_device_name, reason=self.error_message)
         self.on_status(self.error_message)
 
     def _on_transcript(self, client, result=None, **kwargs) -> None:
@@ -1490,13 +1673,13 @@ class LiveTranscriptionSession:
         if getattr(result, "is_final", False):
             self.final_lines.append(transcript)
             self.current_interim = ""
-            debug_log(f"[LiveTranscriptionSession] Final transcript segment #{len(self.final_lines)}: {transcript[:120]}")
+            log_event("LiveSession", event="final_transcript", segment_count=len(self.final_lines), preview=transcript[:120])
             self._write_partial_transcript()
             combined = "\n".join(self.final_lines)
             self.on_transcript(combined, "")
         else:
             self.current_interim = transcript
-            debug_log(f"[LiveTranscriptionSession] Interim transcript: {transcript[:120]}")
+            log_event("LiveSession", level="debug", event="interim_transcript", preview=transcript[:120])
             combined = "\n".join(self.final_lines)
             self.on_transcript(combined, self.current_interim)
 
@@ -1508,8 +1691,8 @@ class LiveTranscriptionSession:
             return
         try:
             self.transcript_path.write_text(transcript_body, encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as exc:
+            log_failure("DEVICE", mode=self.mode_name, device=self.actual_device_name, reason=str(exc), tag="LiveSession")
 
     def _write_metadata(self, status: str) -> None:
         if self.metadata_path is None:
@@ -1527,24 +1710,20 @@ class LiveTranscriptionSession:
             "final_segment_count": len(self.final_lines),
             "error_message": self.error_message,
             "transcript_file": self.transcript_path.name if self.transcript_path else "",
+            "mode_switches": self.mode_switches,
         }
         try:
             self.metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as exc:
+            log_failure("DEVICE", mode=self.mode_name, device=self.actual_device_name, reason=str(exc), tag="LiveSession")
         else:
-            debug_log(f"[LiveTranscriptionSession] Metadata updated -> {self.metadata_path.name}")
+            log_event("LiveSession", event="metadata_updated", metadata_file=self.metadata_path.name)
 
-    def _report_input_signal(self, raw_bytes: bytes) -> None:
+    def _report_input_signal(self, raw_bytes: bytes, frames: int) -> None:
         now = time.time()
-        if now - self.last_signal_debug_at < 2.0:
-            return
-
         signal = analyze_live_input_signal(raw_bytes)
         if signal is None:
             return
-
-        self.last_signal_debug_at = now
         self.on_signal(
             {
                 **signal,
@@ -1556,24 +1735,26 @@ class LiveTranscriptionSession:
         rms = float(signal["rms"])
         peak = float(signal["peak"])
         state = str(signal["state"])
-        if state == "silent":
-            status_text = f"Live input looks silent on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
-        elif state == "low":
-            status_text = f"Live input is very low on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
-        elif state == "clipping":
-            status_text = f"Live input is clipping on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
-        else:
-            status_text = f"Live input active on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})"
-
-        if status_text != self.last_signal_status:
-            self.last_signal_status = status_text
-            debug_log(f"[LiveTranscriptionSession] {status_text}")
-            self.on_status(status_text)
+        if state != self.last_signal_status:
+            log_event("AudioSignal", event="state_change", device=self.actual_device_name, from_state=self.last_signal_status or "unknown", to=state, rms=f"{rms:.5f}", peak=f"{peak:.5f}")
+            self.last_signal_status = state
+            self.on_status(f"Live input {state} on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})")
+        if now - self.last_signal_debug_at >= 2.0:
+            self.last_signal_debug_at = now
+            log_event("AudioSignal", level="debug", device=self.actual_device_name, mode=self.mode_name, rms=f"{rms:.5f}", peak=f"{peak:.5f}", frames=frames, state=state)
 
 
 class App:
     def __init__(self) -> None:
-        debug_log("[App] Initializing application")
+        log_event(
+            "App",
+            event="startup",
+            version="3.0",
+            python=sys.version.split()[0],
+            platform=sys.platform,
+            app_dir=str(APP_DIR),
+            frozen=getattr(sys, "frozen", False),
+        )
         self.config = load_config()
         self.detected_input_devices = list_input_devices()
         self.detected_output_devices = list_output_devices()
@@ -1597,6 +1778,7 @@ class App:
         self._vac_test_forced_monitoring = False
         self._pending_vac_test = False
         self._audio_switch_in_progress = False
+        self._pending_mode_button: ModeName | None = None
         self._best_mode_running = False
         self._latest_signal_state = "Unknown"
         self._resume_monitor_after_live = False
@@ -1610,6 +1792,7 @@ class App:
         self.root.minsize(820, 640)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.report_callback_exception = self._log_tk_callback_exception
 
         self.status_var = ctk.StringVar(value="Ready - Monitoring active" if self.config["wer_mode_enabled"] else "Ready")
         self.mode_var = ctk.StringVar(value=self.current_mode)
@@ -1621,6 +1804,9 @@ class App:
         self.monitor_recommendation_var = ctk.StringVar(value="No issues detected\nAll systems optimal")
         self.footer_var = ctk.StringVar(value="v3.0 Pro | Real-Time WER Optimization")
         self.runtime_audio_var = ctk.StringVar(value="Active Input: Detecting... | Active Output: Detecting... | Signal: Unknown")
+        self.shortcuts_var = ctk.StringVar(
+            value="Shortcuts: Ctrl+1 Monitor | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | Ctrl+M Mute | Ctrl+Shift+1/2/3 Modes | F5 Refresh"
+        )
 
         self.mic_var = ctk.StringVar(value=self.config["mic_device"])
         self.vac_var = ctk.StringVar(value=self.config["vac_device"])
@@ -1714,7 +1900,7 @@ class App:
 
         ctk.CTkLabel(
             status_bar,
-            text="Shortcuts: Ctrl+1 Monitor | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | F5 Refresh",
+            textvariable=self.shortcuts_var,
             font=("Arial", 9),
             text_color="#A0A0A0",
             anchor="w",
@@ -1752,11 +1938,34 @@ class App:
         self.root.bind("<Control-2>", lambda event: self._select_tab("Routing"))
         self.root.bind("<Control-3>", lambda event: self._select_tab("Transcribe"))
         self.root.bind("<Control-4>", lambda event: self._select_tab("Settings"))
+        self.root.bind("<Control-m>", lambda event: self._handle_shortcut(self.toggle_mute))
+        self.root.bind("<Control-M>", lambda event: self._handle_shortcut(self.toggle_mute))
+        self.root.bind("<Control-Shift-KeyPress-1>", lambda event: self._handle_shortcut(lambda: self.apply_audio_mode("Microphone")))
+        self.root.bind("<Control-Shift-KeyPress-2>", lambda event: self._handle_shortcut(lambda: self.apply_audio_mode("VAC")))
+        self.root.bind("<Control-Shift-KeyPress-3>", lambda event: self._handle_shortcut(lambda: self.apply_audio_mode("Mixed")))
         self.root.bind("<F5>", lambda event: self.refresh_detected_devices())
+
+    def _handle_shortcut(self, callback) -> str:
+        callback()
+        return "break"
 
     def _select_tab(self, tab_name: str) -> str:
         self.tabview.set(tab_name)
         return "break"
+
+    def _log_tk_callback_exception(self, exc, val, tb) -> None:
+        _log_uncaught_exception(
+            "TkCallback",
+            exc,
+            val,
+            tb,
+            event="report_callback_exception",
+            reason=str(val or exc.__name__),
+        )
+        try:
+            self.status_var.set("An unexpected error occurred. See logs/errors.log.")
+        except Exception as exc:
+            log_event("TkCallback", level="warning", event="status_update_failed", reason=str(exc))
 
     def _add_section_title(self, parent, title: str, subtitle: str | None = None) -> None:
         ctk.CTkLabel(
@@ -1845,6 +2054,17 @@ class App:
         mode_buttons.pack(fill="x", padx=12, pady=(0, 10))
         for column in range(4):
             mode_buttons.grid_columnconfigure(column, weight=1)
+
+        self.live_hot_switch_chip = ctk.CTkLabel(
+            controls_frame,
+            text="Live - clicking a mode will hot-switch",
+            font=("Arial", 9, "bold"),
+            text_color="#0B1F16",
+            fg_color="#7DDC9A",
+            corner_radius=10,
+            padx=10,
+            pady=4,
+        )
 
         self.btn_mic = ctk.CTkButton(
             mode_buttons,
@@ -2399,29 +2619,47 @@ class App:
         configured = self.mix_var.get().strip()
         if configured and self._resolve_detected_input_name(configured, "Mixed"):
             return True
-        return any("voicemeeter" in device.lower() for device in self.detected_input_devices)
+        return any("voicemeeter" in normalize_audio_device_name(device).lower() for device in self.detected_input_devices)
 
     def _resolve_detected_input_name(self, requested_name: str, mode_name: ModeName) -> str:
         requested = requested_name.strip()
+        log_event("Resolver", mode=mode_name, requested=requested or "<empty>", candidates_count=len(self.detected_input_devices))
         if not requested:
+            if mode_name == "Mixed":
+                log_failure("ROUTING", mode=mode_name, requested=requested, resolved="", reason="No input device configured for Mixed mode.")
             return ""
         if requested in self.detected_input_devices:
+            if mode_name == "Mixed" and "voicemeeter" not in normalize_audio_device_name(requested).lower():
+                log_failure(
+                    "ROUTING",
+                    mode=mode_name,
+                    requested=requested,
+                    resolved=requested,
+                    reason='Mixed mode must resolve to a device whose name contains "voicemeeter".',
+                )
+                return ""
+            log_event("Resolver", mode=mode_name, requested=requested, resolved=requested, match_type="exact")
             return requested
 
         normalized_requested = normalize_audio_device_name(requested)
         for device in self.detected_input_devices:
             normalized_device = normalize_audio_device_name(device)
             if normalized_device == normalized_requested:
+                if mode_name == "Mixed" and "voicemeeter" not in normalized_device.lower():
+                    continue
+                log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="normalized")
                 return device
-            if normalized_requested and (
+            if mode_name != "Mixed" and normalized_requested and (
                 normalized_requested.lower() in normalized_device.lower()
                 or normalized_device.lower() in normalized_requested.lower()
             ):
+                log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="substring")
                 return device
 
         if mode_name == "Mixed":
             candidate = infer_device(requested or DEFAULT_CONFIG["voicemeeter_device"], self.detected_input_devices, ["voicemeeter"])
-            if candidate in self.detected_input_devices:
+            if candidate in self.detected_input_devices and "voicemeeter" in normalize_audio_device_name(candidate).lower():
+                log_event("Resolver", mode=mode_name, requested=requested, resolved=candidate, match_type="voicemeeter_keyword")
                 return candidate
 
         resolved_index, resolved_info = resolve_input_device(requested)
@@ -2429,9 +2667,24 @@ class App:
             resolved_name = normalize_audio_device_name(str(resolved_info.get("name", requested)))
             for device in self.detected_input_devices:
                 if normalize_audio_device_name(device) == resolved_name:
+                    if mode_name == "Mixed" and "voicemeeter" not in resolved_name.lower():
+                        break
+                    log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="resolved")
                     return device
-            return resolved_name
+            if mode_name != "Mixed" or "voicemeeter" in resolved_name.lower():
+                log_event("Resolver", mode=mode_name, requested=requested, resolved=resolved_name, match_type="resolved_name")
+                return resolved_name
 
+        if mode_name == "Mixed":
+            log_failure(
+                "ROUTING",
+                mode=mode_name,
+                requested=requested,
+                resolved="",
+                reason='No detected input device contains "voicemeeter". Voicemeeter likely not running.',
+            )
+        else:
+            log_event("Resolver", mode=mode_name, requested=requested, resolved="", match_type="none", level="warning")
         return ""
 
     def _refresh_run_control_buttons(self) -> None:
@@ -2440,21 +2693,28 @@ class App:
             "Microphone": getattr(self, "btn_mic", None),
             "VAC": getattr(self, "btn_vac", None),
             "Mixed": getattr(self, "btn_mix", None),
+            "Mute Toggle": getattr(self, "mute_button", None),
         }
         for mode_name, button in button_map.items():
             if button is None or not button.winfo_exists():
                 continue
-            is_active = mode_name == active_name
+            is_active = (mode_name == active_name) or (mode_name == "Mute Toggle" and self.is_muted)
+            target_text = mode_name
+            if mode_name == "Mute Toggle":
+                target_text = "Muted — Click to Unmute" if self.is_muted else "Mute Toggle"
+            elif self._audio_switch_in_progress and self._pending_mode_button == mode_name:
+                target_text = "Switching..."
             button.configure(
                 border_width=2 if is_active else 0,
                 border_color="#E0E0E0" if is_active else button.cget("fg_color"),
+                text=target_text,
             )
         mixed_button = getattr(self, "btn_mix", None)
         if mixed_button is not None and mixed_button.winfo_exists():
             mixed_available = self._is_mixed_mode_available()
             mixed_button.configure(
                 state="normal" if mixed_available else "disabled",
-                text="Mixed" if mixed_available else "Mixed Unavailable",
+                text="Switching..." if self._audio_switch_in_progress and self._pending_mode_button == "Mixed" else ("Mixed" if mixed_available else "Mixed Unavailable"),
             )
 
     def _menu_values_for(self, current_value: str, devices: list[str]) -> list[str]:
@@ -2539,7 +2799,8 @@ class App:
             try:
                 if menu.winfo_exists():
                     menu.configure(values=self._menu_values_for(variable.get(), devices))
-            except Exception:
+            except Exception as exc:
+                log_event("App", level="warning", event="refresh_device_menu_failed", menu_name=menu_name, reason=str(exc))
                 continue
 
     def _refresh_detection_summary(self) -> None:
@@ -2676,11 +2937,12 @@ class App:
         resolved_name = self._resolve_detected_input_name(configured_input, mode_name)
         return normalize_audio_device_name(resolved_name or configured_input)
 
-    def _active_device_matches_mode(self, mode_name: ModeName) -> bool:
-        if self.active_audio_device is None:
+    def _active_device_matches_mode(self, mode_name: ModeName, active_device: ActiveAudioDevice | None = None) -> bool:
+        candidate_device = active_device or self.active_audio_device
+        if candidate_device is None:
             return False
         expected_name = self._expected_input_device_for_mode(mode_name)
-        active_name = normalize_audio_device_name(self.active_audio_device["name"])
+        active_name = normalize_audio_device_name(candidate_device["name"])
         if not expected_name:
             return False
         return active_name == expected_name
@@ -2728,8 +2990,124 @@ class App:
         finally:
             try:
                 sd.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("Preflight", level="warning", step="vac_probe_cleanup", reason=str(exc))
+
+    def _ask_yes_no_sync(self, title: str, message: str) -> bool:
+        decision = {"value": False}
+        ready = threading.Event()
+
+        def _prompt() -> None:
+            try:
+                decision["value"] = bool(messagebox.askyesno(title, message))
+            finally:
+                ready.set()
+
+        self.root.after(0, _prompt)
+        ready.wait()
+        return bool(decision["value"])
+
+    def _run_preflight(self, mode_name: ModeName, active_device: ActiveAudioDevice) -> tuple[bool, str, dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "mode": mode_name,
+            "device": active_device["name"],
+            "device_index": active_device["index"],
+            "sample_rate_hz": active_device["sample_rate"],
+        }
+        log_event("Preflight", step="1_start", mode=mode_name)
+
+        normalized_active = normalize_audio_device_name(active_device["name"])
+        exists = any(normalize_audio_device_name(device) == normalized_active for device in self.detected_input_devices)
+        diagnostics["exists"] = exists
+        log_event("Preflight", step="2_device_exists", device=active_device["name"], exists=exists)
+        if not exists:
+            log_failure("DEVICE", reason="Device is not present in detected_input_devices", **diagnostics)
+            return False, "DEVICE", diagnostics
+
+        try:
+            sd.check_input_settings(
+                device=active_device["index"],
+                samplerate=active_device["sample_rate"],
+                channels=1,
+            )
+            accessible = True
+            supported = True
+            check_error = ""
+        except Exception as exc:
+            accessible = False
+            supported = False
+            check_error = str(exc)
+        diagnostics["accessible"] = accessible
+        diagnostics["supported"] = supported
+        log_event("Preflight", step="3_device_accessible", device=active_device["name"], accessible=accessible)
+        log_event("Preflight", step="4_sample_rate", device=active_device["name"], supported=supported, rate_hz=active_device["sample_rate"])
+        if not accessible:
+            log_failure("DEVICE", reason=check_error or "Input settings check failed", **diagnostics)
+            return False, "DEVICE", diagnostics
+
+        signal_duration = 0.5 if mode_name == "VAC" else 0.35
+        signal = sample_resolved_input_signal(
+            active_device["index"],
+            active_device["sample_rate"],
+            active_device["name"],
+            duration_seconds=signal_duration,
+            device_info=active_device["info"],
+        )
+        if signal is None and mode_name == "VAC":
+            time.sleep(0.2)
+            signal = sample_resolved_input_signal(
+                active_device["index"],
+                active_device["sample_rate"],
+                active_device["name"],
+                duration_seconds=0.4,
+                device_info=active_device["info"],
+            )
+            log_event("Preflight", step="5b_vac_reprobe", device=active_device["name"], signal_available=bool(signal))
+        if (signal is None or str(signal.get("state", "")).lower() == "silent") and mode_name == "VAC":
+            probe_signal, probe_target = self._probe_vac_route(duration_seconds=0.4)
+            if probe_signal is not None:
+                signal = probe_signal
+            else:
+                log_event("Preflight", step="5b_vac_reprobe", device=active_device["name"], signal_available=False, probe_target=probe_target, level="warning")
+
+        rms = 0.0 if signal is None else float(signal.get("rms", 0.0))
+        peak = 0.0 if signal is None else float(signal.get("peak", 0.0))
+        signal_state = "unavailable" if signal is None else str(signal.get("state", "unknown"))
+        diagnostics["rms"] = rms
+        diagnostics["peak"] = peak
+        diagnostics["signal_state"] = signal_state
+        log_event("Preflight", step="5_signal_sample", device=active_device["name"], rms=f"{rms:.5f}", peak=f"{peak:.5f}", state=signal_state)
+
+        passes_threshold = (rms >= PREFLIGHT_SIGNAL_THRESHOLD_RMS) or not bool(self.require_signal_check_var.get())
+        diagnostics["threshold"] = PREFLIGHT_SIGNAL_THRESHOLD_RMS
+        diagnostics["passes_threshold"] = passes_threshold
+        log_event("Preflight", step="6_signal_threshold", threshold=PREFLIGHT_SIGNAL_THRESHOLD_RMS, passes=passes_threshold)
+        if signal is not None:
+            self._queue_live_signal_update({**signal, "device_name": active_device["name"]})
+        if not passes_threshold:
+            log_failure("SIGNAL", reason="Signal below required RMS threshold", **diagnostics)
+            return False, "SIGNAL", diagnostics
+
+        expected_name = self._expected_input_device_for_mode(mode_name)
+        resolved_mode_match = normalize_audio_device_name(active_device["name"]) == normalize_audio_device_name(expected_name)
+        diagnostics["resolved_mode_match"] = resolved_mode_match
+        log_event("Preflight", step="7_mode_vs_resolved", mode=mode_name, resolved_mode_match=resolved_mode_match)
+        if not resolved_mode_match:
+            log_failure("ROUTING", reason="Resolved input does not match the requested mode", **diagnostics)
+            return False, "ROUTING", diagnostics
+
+        if mode_name == "Mixed":
+            voicemeeter_running = any("voicemeeter" in normalize_audio_device_name(device).lower() for device in self.detected_input_devices)
+            diagnostics["voicemeeter_running"] = voicemeeter_running
+            log_event("Preflight", step="8_voicemeeter_required", required=True, running=voicemeeter_running)
+            if not voicemeeter_running:
+                log_failure("DEPENDENCY", reason="Voicemeeter is not running or not exposing a virtual input.", **diagnostics)
+                return False, "DEPENDENCY", diagnostics
+        else:
+            log_event("Preflight", step="8_voicemeeter_required", required=False, running=True)
+
+        log_event("Preflight", step="9_done", result="ok")
+        return True, "", diagnostics
 
     def _current_live_input_device_name(self) -> str:
         if self.active_audio_device is not None:
@@ -2779,15 +3157,16 @@ class App:
         self._set_live_transcript_box_text(rendered)
         try:
             self.live_transcript_box.see("end")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event("App", level="warning", event="live_transcript_scroll_warning", reason=str(exc))
 
     def _queue_live_transcript_update(self, final_text: str, interim_text: str) -> None:
         if self._closing:
             return
         try:
             self.root.after(0, lambda: self._apply_live_transcript_update(final_text, interim_text))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_live_transcript_update_failed", reason=str(exc))
             return
 
     def _apply_live_transcript_update(self, final_text: str, interim_text: str) -> None:
@@ -2800,7 +3179,8 @@ class App:
             return
         try:
             self.root.after(0, lambda: self._apply_live_status_update(message))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_live_status_update_failed", reason=str(exc))
             return
 
     def _queue_live_signal_update(self, payload: dict[str, Any]) -> None:
@@ -2808,7 +3188,8 @@ class App:
             return
         try:
             self.root.after(0, lambda: self._apply_live_signal_update(payload))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_live_signal_update_failed", reason=str(exc))
             return
 
     def _apply_live_status_update(self, message: str) -> None:
@@ -2868,6 +3249,12 @@ class App:
     def _set_live_controls_state(self, *, running: bool = False, starting: bool = False) -> None:
         self._live_transcription_running = running
         self._live_transcription_starting = starting
+        hot_switch_chip = getattr(self, "live_hot_switch_chip", None)
+        if hot_switch_chip is not None and hot_switch_chip.winfo_exists():
+            if running:
+                hot_switch_chip.pack(anchor="e", padx=12, pady=(0, 8))
+            else:
+                hot_switch_chip.pack_forget()
         for button_name in ("btn_start_live", "transcribe_btn_start_live"):
             button = getattr(self, button_name, None)
             if button is not None and button.winfo_exists():
@@ -2960,69 +3347,20 @@ class App:
             session = None
             try:
                 self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
-            except Exception:
+            except Exception as exc:
+                log_event("App", level="warning", event="queue_live_start_failure_failed", reason=str(exc))
                 return
             return
 
-        preflight_duration = 0.5 if mode_name == "VAC" else 0.25
-        signal = sample_resolved_input_signal(
-            active_device["index"],
-            active_device["sample_rate"],
-            active_device["name"],
-            duration_seconds=preflight_duration,
-            device_info=active_device["info"],
-        )
-        if signal is None and mode_name == "VAC":
-            time.sleep(0.2)
-            signal = sample_resolved_input_signal(
-                active_device["index"],
-                active_device["sample_rate"],
-                active_device["name"],
-                duration_seconds=0.4,
-                device_info=active_device["info"],
-            )
-        if (signal is None or str(signal.get("state", "")).lower() == "silent") and mode_name == "VAC":
-            probe_signal, probe_target = self._probe_vac_route(duration_seconds=0.4)
-            if probe_signal is not None:
-                signal = probe_signal
-            elif isinstance(probe_target, str) and probe_target.startswith("VAC probe failed:"):
-                debug_log(f"[App] {probe_target}", level="warning")
-        signal_ok, signal_message, signal_payload = evaluate_live_signal_readiness(signal, input_device_name)
-        if mode_name == "VAC" and not signal_ok:
-            probe_signal, probe_target = self._probe_vac_route(duration_seconds=0.4)
-            probe_state = "" if probe_signal is None else str(probe_signal.get("state", "")).lower()
-            if probe_state in {"active", "low", "clipping"}:
-                assert probe_signal is not None
-                signal_payload = dict(probe_signal)
-                signal_payload["detail"] = (
-                    f"The VAC cable itself is carrying signal through {probe_target}, "
-                    "but no external application audio is currently reaching the selected input."
-                )
-                signal_message = (
-                    f"VAC routing is healthy through {probe_target}, but no external playback was detected on "
-                    f"{input_device_name}. Start audio playback in the source app and try again."
-                )
-        if not signal_ok and not bool(self.require_signal_check_var.get()):
-            signal_ok = True
-            signal_message = self._silent_signal_message(mode_name, input_device_name, relaxed=True)
-            if signal_payload is None:
-                signal_payload = {
-                    "device_name": input_device_name,
-                    "state": "silent",
-                    "rms": 0.0,
-                    "peak": 0.0,
-                    "color": "#F9A825",
-                    "detail": "Preflight found silence. Start the source audio and the live stream will pick it up when input becomes active.",
-                }
-        if signal_payload is not None:
-            self._queue_live_signal_update(signal_payload)
-        if not signal_ok:
+        preflight_ok, failure_code, diagnostics = self._run_preflight(mode_name, active_device)
+        if not preflight_ok:
             success = False
             message = self._silent_signal_message(mode_name, input_device_name)
             session = None
             try:
                 self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
-            except Exception:
+            except Exception as exc:
+                log_event("App", level="warning", event="queue_live_start_failure_failed", reason=str(exc), failure_code=failure_code)
                 return
             return
 
@@ -3040,9 +3378,12 @@ class App:
                 session.stop()
             return
         try:
-            final_message = signal_message if success and signal_payload is not None and str(signal_payload.get("state", "")).lower() in {"low", "clipping"} else message
+            final_message = message
+            if diagnostics.get("signal_state") in {"low", "clipping"}:
+                final_message = f"{message} Preflight signal state={diagnostics.get('signal_state')}."
             self.root.after(0, lambda: self._finish_start_live_transcription(success, final_message, session))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_live_start_success_failed", reason=str(exc))
             if success:
                 session.stop()
             return
@@ -3140,7 +3481,8 @@ class App:
             return
         try:
             self.root.after(0, lambda: self._finish_file_transcription(success, message))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_file_transcription_finish_failed", reason=str(exc))
             return
 
     def _finish_file_transcription(self, success: bool, message: str) -> None:
@@ -3178,15 +3520,26 @@ class App:
             self.status_var.set("Audio device switch already in progress.")
             return
         if self._live_transcription_running or self._live_transcription_starting:
-            self.status_var.set("Stop live transcription before switching modes.")
+            self._apply_audio_mode_hot(mode_name)
             return
         if mode_name == "Mixed" and not self._is_mixed_mode_available():
+            message = "Voicemeeter is not running or is not exposing a virtual input. Open Voicemeeter and route mic or system audio to a virtual input, then click Refresh Devices."
+            log_failure("DEPENDENCY", mode=mode_name, device=self.mix_var.get().strip(), reason=message)
+            messagebox.showerror("Mixed Mode Unavailable", message)
             self.status_var.set("Mixed mode is unavailable because no Voicemeeter input device is currently detected.")
             return
 
-        debug_log(f"[App] Applying full audio mode -> {mode_name}")
+        log_event("ApplyMode", requested=mode_name, live=False)
         self.save_form_config()
         input_device, playback_target = self._resolve_mode_devices(mode_name)
+        log_event(
+            "ApplyMode",
+            requested=mode_name,
+            mode_available=(mode_name != "Mixed" or self._is_mixed_mode_available()),
+            resolved_input=input_device,
+            resolved_playback=playback_target,
+            detected_inputs=len(self.detected_input_devices),
+        )
         if mode_name in {"Microphone", "VAC", "Mixed"}:
             resolved_name = self._resolve_detected_input_name(input_device, mode_name)
             if resolved_name:
@@ -3209,9 +3562,43 @@ class App:
             self.status_var.set(f"No playback device configured for {mode_name} mode.")
             return
         self._audio_switch_in_progress = True
+        self._pending_mode_button = mode_name
+        self._refresh_run_control_buttons()
         self.status_var.set(f"Switching audio device... {mode_name} mode requested.")
         threading.Thread(
             target=self._apply_audio_mode_worker,
+            args=(mode_name, input_device, playback_target),
+            daemon=True,
+        ).start()
+
+    def _apply_audio_mode_hot(self, mode_name: ModeName) -> None:
+        if self.live_transcription_session is None:
+            self.status_var.set("Live session is not available for hot switching.")
+            return
+        if mode_name == self.current_mode:
+            self.status_var.set(f"{mode_name} is already the active mode.")
+            return
+        if mode_name == "Mixed" and not self._is_mixed_mode_available():
+            message = "Voicemeeter is not running or is not exposing a virtual input. Open Voicemeeter and route mic or system audio to a virtual input, then click Refresh Devices."
+            log_failure("DEPENDENCY", mode=mode_name, device=self.mix_var.get().strip(), reason=message)
+            messagebox.showerror("Mixed Mode Unavailable", message)
+            return
+
+        self.save_form_config()
+        input_device, playback_target = self._resolve_mode_devices(mode_name)
+        resolved_name = self._resolve_detected_input_name(input_device, mode_name)
+        if resolved_name:
+            input_device = resolved_name
+        if not input_device or not playback_target:
+            self.status_var.set(f"Hot switch could not resolve devices for {mode_name}.")
+            return
+
+        self._audio_switch_in_progress = True
+        self._pending_mode_button = mode_name
+        self._refresh_run_control_buttons()
+        self.status_var.set(f"Hot-switching live transcription to {mode_name}...")
+        threading.Thread(
+            target=self._apply_audio_mode_hot_worker,
             args=(mode_name, input_device, playback_target),
             daemon=True,
         ).start()
@@ -3250,8 +3637,50 @@ class App:
                 0,
                 lambda: self._finish_apply_audio_mode(success, mode_name, resolved_device, playback_target, message),
             )
-        except Exception:
+        except Exception as exc:
+            log_event("ApplyMode", level="warning", event="queue_finish_failed", mode=mode_name, reason=str(exc))
             return
+
+    def _apply_audio_mode_hot_worker(self, mode_name: ModeName, input_device: str, playback_target: str) -> None:
+        message = ""
+        success = False
+        new_active_device: ActiveAudioDevice | None = None
+        continue_anyway = False
+        try:
+            ok_record, record_message = self.device_manager.set_default_recording_device(input_device)
+            if not ok_record:
+                message = record_message
+                return
+            ok_playback, playback_message = self.device_manager.set_default_playback_device(playback_target)
+            if not ok_playback:
+                message = playback_message
+                return
+            if not self._wait_for_active_input_device(input_device):
+                message = f"Windows did not switch the active input to {input_device} in time."
+                return
+            new_active_device = self.resolve_active_device(input_device)
+            preflight_ok, failure_code, _diagnostics = self._run_preflight(mode_name, new_active_device)
+            if not preflight_ok:
+                log_event("HotSwitch", level="warning", event="preflight_warning", mode=mode_name, failure_code=failure_code)
+                continue_anyway = self._ask_yes_no_sync(
+                    "Signal Issue on New Mode",
+                    f"The new {mode_name} source did not pass preflight checks. Continue the hot switch anyway?",
+                )
+                if not continue_anyway:
+                    message = f"Hot switch to {mode_name} was cancelled after preflight warning."
+                    return
+            assert self.live_transcription_session is not None
+            success, message = self.live_transcription_session.switch_input_device(new_active_device, mode_name)
+        except Exception as exc:
+            LOGGER.exception(_log_message("Failure: UNKNOWN", mode=mode_name, device=input_device, reason=str(exc)))
+            message = str(exc)
+        finally:
+            if self._closing:
+                return
+            try:
+                self.root.after(0, lambda: self._finish_apply_audio_mode_hot(success, mode_name, new_active_device, playback_target, message))
+            except Exception as exc:
+                log_event("HotSwitch", level="warning", event="queue_finish_failed", mode=mode_name, reason=str(exc))
 
     def _finish_apply_audio_mode(
         self,
@@ -3262,6 +3691,8 @@ class App:
         message: str,
     ) -> None:
         self._audio_switch_in_progress = False
+        self._pending_mode_button = None
+        self._refresh_run_control_buttons()
         if not success or resolved_device is None:
             self._pending_vac_test = False
             self._refresh_runtime_audio_status()
@@ -3293,6 +3724,35 @@ class App:
         if self._pending_vac_test and mode_name == "VAC":
             self._pending_vac_test = False
             self._start_verified_vac_test()
+
+    def _finish_apply_audio_mode_hot(
+        self,
+        success: bool,
+        mode_name: ModeName,
+        resolved_device: ActiveAudioDevice | None,
+        playback_target: str,
+        message: str,
+    ) -> None:
+        self._audio_switch_in_progress = False
+        self._pending_mode_button = None
+        self._refresh_run_control_buttons()
+        if not success or resolved_device is None:
+            if message:
+                self.status_var.set(message)
+                messagebox.showerror("Hot Switch Failed", message)
+            return
+
+        self.active_audio_device = resolved_device
+        self.current_mode = mode_name
+        self.config["last_mode"] = mode_name
+        save_config(self.config)
+        self.mode_var.set(mode_name)
+        self.direct_recording_var.set(resolved_device["name"])
+        self.direct_playback_var.set(playback_target)
+        self._refresh_mode_hint()
+        self._refresh_runtime_audio_status(signal_state="Active")
+        self.live_transcription_status_label.configure(text=message, text_color="#66BB6A")
+        self.status_var.set(f"Hot-switched to {mode_name} - transcript continuing.")
 
     def _wait_for_active_input_device(self, expected_device_name: str, timeout_seconds: float = 1.5) -> bool:
         normalized_expected = normalize_audio_device_name(expected_device_name)
@@ -3368,7 +3828,8 @@ class App:
 
         try:
             self.root.after(0, lambda: self._finish_auto_best_mode(success, best_mode, message))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_auto_best_mode_failed", reason=str(exc))
             return
 
     def _finish_auto_best_mode(self, success: bool, best_mode: ModeName | None, message: str) -> None:
@@ -3424,8 +3885,8 @@ class App:
             if signal_payload is not None:
                 try:
                     self._queue_live_signal_update(signal_payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_event("App", level="warning", event="vac_test_signal_update_failed", reason=str(exc))
             if signal is None:
                 result_message = "VAC routing test completed, but the app could not verify input signal on the selected VAC device."
             elif not signal_ok:
@@ -3443,13 +3904,14 @@ class App:
         finally:
             try:
                 sd.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("App", level="warning", event="vac_test_stop_warning", reason=str(exc))
             if self._closing:
                 return
             try:
                 self.root.after(0, lambda: self._finish_vac_test(result_message))
-            except Exception:
+            except Exception as exc:
+                log_event("App", level="warning", event="queue_vac_test_finish_failed", reason=str(exc))
                 return
 
     def _finish_vac_test(self, message: str) -> None:
@@ -3463,16 +3925,23 @@ class App:
         self.status_var.set(message)
 
     def toggle_mute(self) -> None:
+        active_device_name = self.active_audio_device["name"] if self.active_audio_device is not None else self._current_live_input_device_name()
+        log_event("MuteToggle", event="before", device=active_device_name, muted=self.is_muted, mode=self.current_mode)
         ok, message = self.device_manager.toggle_mute()
         if not ok:
+            log_failure("DEVICE", tag="MuteToggle", device=active_device_name, mode=self.current_mode, reason=message)
             self.status_var.set(message)
+            messagebox.showerror("Mute Toggle Failed", message)
             return
 
+        # nircmd default_record follows the current default recording device on purpose.
         self.is_muted = not self.is_muted
-        if self.is_muted:
-            self.mute_button.configure(text="Muted", fg_color="#5F2120", hover_color="#471816")
-        else:
-            self.mute_button.configure(text="Mute", fg_color="#d32f2f", hover_color="#b71c1c")
+        self.mute_button.configure(
+            fg_color="#5F2120" if self.is_muted else "#D32F2F",
+            hover_color="#471816" if self.is_muted else "#B71C1C",
+        )
+        self._refresh_run_control_buttons()
+        log_event("MuteToggle", event="after", device=active_device_name, muted=self.is_muted, mode=self.current_mode)
         self.status_var.set(message)
 
     def toggle_wer_monitoring(self) -> None:
@@ -3519,7 +3988,8 @@ class App:
             if not self.root.winfo_exists():
                 return
             self.root.after(0, lambda: self._apply_quality_update(result))
-        except Exception:
+        except Exception as exc:
+            log_event("App", level="warning", event="queue_quality_update_failed", reason=str(exc))
             return
 
     def _apply_quality_update(self, result: dict[str, Any]) -> None:
@@ -3621,4 +4091,5 @@ class App:
 
 if __name__ == "__main__":
     ensure_local_venv()
+    install_global_exception_hooks()
     App().run()

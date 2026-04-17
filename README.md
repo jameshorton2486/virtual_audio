@@ -89,14 +89,28 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - `Mixed` mode streams the configured Voicemeeter mixed path
 - The rolling transcript appears in the app, auto-scrolls, and is saved automatically into the local `transcripts` folder when you stop
 - Each live session also saves a matching `.json` metadata file with mode, device, timestamps, and status
-- While live transcription is running, mode and device switching are intentionally blocked so the capture source stays stable
 - Live transcription uses the same `Smart Format`, `Diarization`, `Paragraphs`, `Filler Words`, and `Numerals` options shown in the Deepgram panel
+
+## Hot Mode Switching
+
+- While live transcription is running, you can click `Microphone`, `VAC`, or `Mixed` to hot-switch the active capture source without stopping the Deepgram session.
+- The transcript stays in the same file and inserts inline markers such as `[Switched to VAC mode at 15:04:23 - CABLE Output (VB-Audio Virtual Cable)]`.
+- The matching live-session `.json` metadata file now includes a `mode_switches` array with timestamps and before/after device names.
+- If the new source fails preflight or stream open, the app keeps the current live session on the old device instead of tearing the whole session down.
 
 ## Recommended Live Workflows
 
 - Zoom deposition audio only: switch to `VAC`, make sure Windows playback is routed to `CABLE Input`, then start live transcription
 - Your own live speech: switch to `Microphone`, confirm your mic is the active recording device, then start live transcription
 - Narration over routed playback: switch to `Mixed`, verify Voicemeeter routing first, then start live transcription
+
+## Logs and Diagnostics
+
+- `logs/virtual_audio.log` is the main rotating app log. It keeps `5` files at `5 MB` each.
+- `logs/errors.log` is the warning/error log. It keeps `3` files at `2 MB` each.
+- Structured logs use the format `[Tag] key=value ...` so failures and device decisions can be filtered quickly.
+- Failure lines are classified as `SIGNAL`, `ROUTING`, `DEVICE`, `DEPENDENCY`, or `UNKNOWN`.
+- Set `VIRTUAL_AUDIO_DEBUG=1` before launching the app to include DEBUG-level diagnostics such as periodic `[AudioSignal]` entries in the main log.
 
 ## WER Notes
 
@@ -117,8 +131,16 @@ After the build finishes, copy these files together before distributing:
 - `nircmd.exe`
 - `config.json`
 
+## Shortcuts
+
+- `Ctrl+M` toggles mute on the current default recording device
+- `Ctrl+Shift+1` switches to `Microphone`
+- `Ctrl+Shift+2` switches to `VAC`
+- `Ctrl+Shift+3` switches to `Mixed`
+
 ## Troubleshooting
 
 - If switching fails, check that `nircmd.exe` is present and the device names are exact.
 - If the monitor says the signal is silent, confirm the current default recording device is actually receiving audio.
 - If the app closes but audio switching worked, review Python/package installation first.
+- If `Mixed` is greyed out or shows `Mixed Unavailable`, Voicemeeter is not currently exposing a virtual input device. Open Voicemeeter, route mic or system audio to a virtual input, then click `Refresh Devices`.
