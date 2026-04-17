@@ -1,11 +1,12 @@
 {
-  "mic_device": "Microphone (Yeti Stereo Microphone)",
+  "mic_device": "Microphone (Realtek HD Audio Mic input)",
   "vac_device": "CABLE Output (VB-Audio Virtual Cable)",
-  "speaker_device": "Speakers (Yeti Stereo Microphone)",
+  "speaker_device": "Speakers 1 (Realtek HD Audio output with SST)",
   "vac_playback_device": "CABLE Input (VB-Audio Virtual Cable)",
   "voicemeeter_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+  "require_signal_check": true,
   "wer_mode_enabled": true,
   "quality_check_interval_seconds": 2.0,
   "sample_rate_hz": 24000,
-  "last_mode": "VAC"
+  "last_mode": "Mixed"
 }

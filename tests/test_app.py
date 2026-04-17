@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 import tempfile
 import unittest
@@ -55,6 +57,66 @@ class DeviceHelpersTests(unittest.TestCase):
             app.format_deepgram_payload_text(payload),
             "Speaker 0: Hello there.\nSpeaker 1: General Kenobi.",
         )
+
+    def test_format_deepgram_payload_text_prefers_utterance_pipeline(self) -> None:
+        payload = {
+            "results": {
+                "utterances": [
+                    {
+                        "speaker": 0,
+                        "start": 0.0,
+                        "end": 0.4,
+                        "transcript": "What time did you arrive?",
+                        "words": [{"word": "What"}, {"word": "time"}, {"word": "arrive"}],
+                    },
+                    {
+                        "speaker": 1,
+                        "start": 0.6,
+                        "end": 0.9,
+                        "transcript": "Yes I did",
+                        "words": [{"word": "Yes"}, {"word": "I"}, {"word": "did"}],
+                    },
+                ],
+                "channels": [
+                    {
+                        "alternatives": [
+                            {
+                                "transcript": "fallback text",
+                                "words": [{"speaker": 0, "punctuated_word": "Fallback"}],
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+
+        self.assertEqual(
+            app.format_deepgram_payload_text(payload),
+            "Q: What time did you arrive?\nA: Yes I did",
+        )
+
+    def test_merge_utterances_drops_tiny_fragment_and_merges_close_same_speaker(self) -> None:
+        utterances = [
+            {"speaker": 0, "start": 0.0, "end": 0.5, "text": "Yes I do", "words": [1, 2, 3]},
+            {"speaker": 0, "start": 1.0, "end": 1.4, "text": "remember that", "words": [4, 5]},
+            {"speaker": 1, "start": 3.0, "end": 3.1, "text": "okay", "words": [6]},
+        ]
+
+        result = app.merge_utterances(utterances)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["speaker"], 0)
+        self.assertEqual(result[0]["text"], "Yes I do remember that")
+
+    def test_prevent_micro_speaker_switch_reverts_tiny_flip(self) -> None:
+        blocks = [
+            {"speaker": 0, "text": "Please state your name.", "words": [1, 2, 3, 4]},
+            {"speaker": 1, "text": "Yes.", "words": [5]},
+        ]
+
+        result = app.prevent_micro_speaker_switch(blocks)
+
+        self.assertEqual(result[1]["speaker"], 0)
 
     def test_build_transcript_output_paths_uses_transcripts_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -192,11 +254,6 @@ class DeviceHelpersTests(unittest.TestCase):
         self.assertEqual(result["speaker_device"], app.DEFAULT_CONFIG["speaker_device"])
         self.assertEqual(result["vac_playback_device"], app.DEFAULT_CONFIG["vac_playback_device"])
         self.assertEqual(result["voicemeeter_device"], app.DEFAULT_CONFIG["voicemeeter_device"])
-        self.assertFalse(result["deepgram_smart_format"])
-        self.assertTrue(result["deepgram_diarize"])
-        self.assertFalse(result["deepgram_paragraphs"])
-        self.assertTrue(result["deepgram_filler_words"])
-        self.assertFalse(result["deepgram_numerals"])
         self.assertFalse(result["wer_mode_enabled"])
         self.assertEqual(
             result["quality_check_interval_seconds"],
@@ -319,11 +376,6 @@ class LiveSignalTests(unittest.TestCase):
                 "sample_rate": 24000,
             },
             mode_name="VAC",
-            smart_format=True,
-            diarize=True,
-            paragraphs=True,
-            filler_words=True,
-            numerals=True,
             on_transcript=transcript_updates.append,
             on_status=status_updates.append,
             on_signal=signal_updates.append,
@@ -361,6 +413,32 @@ class LiveSignalTests(unittest.TestCase):
         self.assertEqual(
             app.format_live_result_text(result),
             "Speaker 0: Hello there.\nSpeaker 1: General Kenobi.",
+        )
+
+    def test_format_live_result_text_uses_utterances_when_available(self) -> None:
+        result = SimpleNamespace(
+            utterances=[
+                SimpleNamespace(
+                    speaker=0,
+                    start=0.0,
+                    end=0.5,
+                    transcript="Can you state your name?",
+                    words=[SimpleNamespace(word="Can"), SimpleNamespace(word="you"), SimpleNamespace(word="name")],
+                ),
+                SimpleNamespace(
+                    speaker=1,
+                    start=0.8,
+                    end=1.2,
+                    transcript="Yes I can",
+                    words=[SimpleNamespace(word="Yes"), SimpleNamespace(word="I"), SimpleNamespace(word="can")],
+                ),
+            ],
+            channel=SimpleNamespace(alternatives=[]),
+        )
+
+        self.assertEqual(
+            app.format_live_result_text(result),
+            "Q: Can you state your name?\nA: Yes I can",
         )
 
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import inspect
 import logging
@@ -104,11 +106,6 @@ class ConfigDict(TypedDict):
     speaker_device: str
     vac_playback_device: str
     voicemeeter_device: str
-    deepgram_smart_format: bool
-    deepgram_diarize: bool
-    deepgram_paragraphs: bool
-    deepgram_filler_words: bool
-    deepgram_numerals: bool
     require_signal_check: bool
     wer_mode_enabled: bool
     quality_check_interval_seconds: float
@@ -129,16 +126,22 @@ DEFAULT_CONFIG: Final[ConfigDict] = {
     "speaker_device": "Speakers (Realtek Audio)",
     "vac_playback_device": "CABLE Input (VB-Audio Virtual Cable)",
     "voicemeeter_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
-    "deepgram_smart_format": True,
-    "deepgram_diarize": True,
-    "deepgram_paragraphs": True,
-    "deepgram_filler_words": True,
-    "deepgram_numerals": True,
     "require_signal_check": True,
     "wer_mode_enabled": True,
     "quality_check_interval_seconds": 2.0,
     "sample_rate_hz": 24000,
     "last_mode": "Microphone",
+}
+
+DEEPGRAM_BASE_CONFIG: Final[dict[str, Any]] = {
+    "model": "nova-3",
+    "diarize": True,
+    "punctuate": True,
+    "smart_format": True,
+    "paragraphs": True,
+    "utterances": True,
+    "filler_words": True,
+    "numerals": True,
 }
 
 QUALITY_COLORS = {
@@ -243,11 +246,6 @@ def sanitize_config(config: dict[str, Any]) -> ConfigDict:
     sanitized["vac_playback_device"] = config.get("vac_playback_device", sanitized["vac_playback_device"])
     sanitized["voicemeeter_device"] = config.get("voicemeeter_device", sanitized["voicemeeter_device"])
     sanitized["wer_mode_enabled"] = config.get("wer_mode_enabled", sanitized["wer_mode_enabled"])
-    sanitized["deepgram_smart_format"] = config.get("deepgram_smart_format", sanitized["deepgram_smart_format"])
-    sanitized["deepgram_diarize"] = config.get("deepgram_diarize", sanitized["deepgram_diarize"])
-    sanitized["deepgram_paragraphs"] = config.get("deepgram_paragraphs", sanitized["deepgram_paragraphs"])
-    sanitized["deepgram_filler_words"] = config.get("deepgram_filler_words", sanitized["deepgram_filler_words"])
-    sanitized["deepgram_numerals"] = config.get("deepgram_numerals", sanitized["deepgram_numerals"])
     sanitized["require_signal_check"] = config.get("require_signal_check", sanitized["require_signal_check"])
     sanitized["quality_check_interval_seconds"] = config.get(
         "quality_check_interval_seconds",
@@ -278,26 +276,6 @@ def sanitize_config(config: dict[str, Any]) -> ConfigDict:
     sanitized["wer_mode_enabled"] = _coerce_bool(
         sanitized.get("wer_mode_enabled"),
         bool(DEFAULT_CONFIG["wer_mode_enabled"]),
-    )
-    sanitized["deepgram_smart_format"] = _coerce_bool(
-        sanitized.get("deepgram_smart_format"),
-        bool(DEFAULT_CONFIG["deepgram_smart_format"]),
-    )
-    sanitized["deepgram_diarize"] = _coerce_bool(
-        sanitized.get("deepgram_diarize"),
-        bool(DEFAULT_CONFIG["deepgram_diarize"]),
-    )
-    sanitized["deepgram_paragraphs"] = _coerce_bool(
-        sanitized.get("deepgram_paragraphs"),
-        bool(DEFAULT_CONFIG["deepgram_paragraphs"]),
-    )
-    sanitized["deepgram_filler_words"] = _coerce_bool(
-        sanitized.get("deepgram_filler_words"),
-        bool(DEFAULT_CONFIG["deepgram_filler_words"]),
-    )
-    sanitized["deepgram_numerals"] = _coerce_bool(
-        sanitized.get("deepgram_numerals"),
-        bool(DEFAULT_CONFIG["deepgram_numerals"]),
     )
     sanitized["require_signal_check"] = _coerce_bool(
         sanitized.get("require_signal_check"),
@@ -351,6 +329,39 @@ def get_deepgram_api_key() -> str:
     return os.environ.get("DEEPGRAM_API_KEY", "").strip()
 
 
+def get_deepgram_config() -> dict[str, Any]:
+    return dict(DEEPGRAM_BASE_CONFIG)
+
+
+def get_live_deepgram_options(sample_rate_hz: int) -> dict[str, Any]:
+    return {
+        **get_deepgram_config(),
+        "language": "en-US",
+        "interim_results": True,
+        "encoding": "linear16",
+        "channels": 1,
+        "sample_rate": sample_rate_hz,
+    }
+
+
+def get_file_deepgram_query_params() -> dict[str, str]:
+    return {
+        key: "true" if isinstance(value, bool) and value else str(value)
+        for key, value in {
+            **get_deepgram_config(),
+            "detect_language": True,
+        }.items()
+    }
+
+
+def get_deepgram_settings_message() -> str:
+    return "Deepgram Settings: Optimized (All Enhancements Enabled)"
+
+
+def get_deepgram_settings_detail() -> str:
+    return "Speaker detection, formatting, segmentation, and accuracy enhancements are always enabled."
+
+
 def _deepgram_value(node: Any, key: str, default: Any = None) -> Any:
     if isinstance(node, dict):
         return node.get(key, default)
@@ -388,6 +399,144 @@ def _deepgram_words_to_speaker_lines(words: list[Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize_utterance_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def build_blocks_from_deepgram_utterances(utterances: list[Any]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for utterance in utterances:
+        words = list(_deepgram_value(utterance, "words", []) or [])
+        blocks.append(
+            {
+                "speaker": _deepgram_value(utterance, "speaker"),
+                "start": float(_deepgram_value(utterance, "start", 0.0) or 0.0),
+                "end": float(_deepgram_value(utterance, "end", 0.0) or 0.0),
+                "text": _normalize_utterance_text(
+                    _deepgram_value(utterance, "transcript")
+                    or _deepgram_value(utterance, "text")
+                    or " ".join(
+                        str(
+                            _deepgram_value(word, "punctuated_word")
+                            or _deepgram_value(word, "word")
+                            or ""
+                        ).strip()
+                        for word in words
+                    )
+                ),
+                "words": words,
+            }
+        )
+    return [block for block in blocks if block["text"]]
+
+
+def merge_utterances(
+    utterances: list[dict[str, Any]],
+    gap_threshold_seconds: float = 1.2,
+    min_word_count: int = 3,
+) -> list[dict[str, Any]]:
+    if not utterances:
+        return []
+
+    merged: list[dict[str, Any]] = []
+    current = dict(utterances[0])
+    current_words = list(current.get("words", []) or [])
+    current["words"] = current_words
+
+    for utterance in utterances[1:]:
+        same_speaker = utterance.get("speaker") == current.get("speaker")
+        gap = float(utterance.get("start", 0.0) or 0.0) - float(current.get("end", 0.0) or 0.0)
+
+        if same_speaker and gap <= gap_threshold_seconds:
+            current["end"] = utterance.get("end", current.get("end", 0.0))
+            current_words.extend(list(utterance.get("words", []) or []))
+            current["text"] = _normalize_utterance_text(f"{current.get('text', '')} {utterance.get('text', '')}")
+            continue
+
+        if len(current_words) >= min_word_count:
+            merged.append(current)
+
+        current = dict(utterance)
+        current_words = list(current.get("words", []) or [])
+        current["words"] = current_words
+
+    if len(current_words) >= min_word_count:
+        merged.append(current)
+
+    return merged
+
+
+def smooth_speakers(utterances: list[dict[str, Any]], window: int = 2) -> list[dict[str, Any]]:
+    if not utterances:
+        return []
+
+    smoothed: list[dict[str, Any]] = []
+    for index, utterance in enumerate(utterances):
+        current = dict(utterance)
+        prev_speakers = [
+            utterances[j].get("speaker")
+            for j in range(max(0, index - window), index)
+            if utterances[j].get("speaker") is not None
+        ]
+        next_speakers = [
+            utterances[j].get("speaker")
+            for j in range(index + 1, min(len(utterances), index + 1 + window))
+            if utterances[j].get("speaker") is not None
+        ]
+        surrounding = prev_speakers + next_speakers
+        if surrounding:
+            most_common = max(set(surrounding), key=surrounding.count)
+            if surrounding.count(most_common) >= len(surrounding) * 0.7:
+                current["speaker"] = most_common
+        smoothed.append(current)
+    return smoothed
+
+
+def prevent_micro_speaker_switch(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not blocks:
+        return []
+
+    stabilized = [dict(blocks[0])]
+    for block in blocks[1:]:
+        current = dict(block)
+        previous = stabilized[-1]
+        if current.get("speaker") != previous.get("speaker") and len(list(current.get("words", []) or [])) <= 2:
+            current["speaker"] = previous.get("speaker")
+        stabilized.append(current)
+    return stabilized
+
+
+def detect_qa_patterns(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    detected: list[dict[str, Any]] = []
+    for block in blocks:
+        current = dict(block)
+        text = _normalize_utterance_text(current.get("text", "")).lower()
+        if text.startswith(("yes", "no", "uh huh", "i did", "i do")):
+            current["type"] = "A"
+        elif text.endswith("?"):
+            current["type"] = "Q"
+        detected.append(current)
+    return detected
+
+
+def format_utterance_blocks(blocks: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for block in blocks:
+        text = _normalize_utterance_text(block.get("text", ""))
+        if not text:
+            continue
+        block_type = str(block.get("type", "") or "").strip().upper()
+        if block_type in {"Q", "A"}:
+            lines.append(f"{block_type}: {text}")
+            continue
+        speaker = block.get("speaker")
+        if speaker in (None, ""):
+            lines.append(text)
+        else:
+            lines.append(f"Speaker {speaker}: {text}")
+    return "\n".join(lines).strip()
+
+
 def extract_transcript_text(payload: dict[str, Any]) -> str:
     try:
         channels = payload["results"]["channels"]
@@ -409,6 +558,16 @@ def format_deepgram_payload_text(payload: dict[str, Any]) -> str:
         alternatives = channels[0].get("alternatives", [])
         if not alternatives:
             return ""
+        utterances = payload["results"].get("utterances", [])
+        if utterances:
+            blocks = build_blocks_from_deepgram_utterances(utterances)
+            blocks = merge_utterances(blocks)
+            blocks = smooth_speakers(blocks)
+            blocks = prevent_micro_speaker_switch(blocks)
+            blocks = detect_qa_patterns(blocks)
+            utterance_text = format_utterance_blocks(blocks)
+            if utterance_text:
+                return utterance_text
         words = alternatives[0].get("words", [])
         speaker_text = _deepgram_words_to_speaker_lines(words)
         if speaker_text:
@@ -420,6 +579,16 @@ def format_deepgram_payload_text(payload: dict[str, Any]) -> str:
 
 def format_live_result_text(result: Any) -> str:
     try:
+        utterances = _deepgram_value(result, "utterances", [])
+        if utterances:
+            blocks = build_blocks_from_deepgram_utterances(utterances)
+            blocks = merge_utterances(blocks)
+            blocks = smooth_speakers(blocks)
+            blocks = prevent_micro_speaker_switch(blocks)
+            blocks = detect_qa_patterns(blocks)
+            utterance_text = format_utterance_blocks(blocks)
+            if utterance_text:
+                return utterance_text
         channel = _deepgram_value(result, "channel")
         alternatives = _deepgram_value(channel, "alternatives", [])
         if not alternatives:
@@ -1039,28 +1208,13 @@ class AudioQualityMonitor:
 
 
 class DeepgramFileTranscriber:
-    def __init__(
-        self,
-        api_key: str,
-        *,
-        smart_format: bool = True,
-        diarize: bool = True,
-        paragraphs: bool = True,
-        filler_words: bool = True,
-        numerals: bool = True,
-    ):
+    def __init__(self, api_key: str):
         self.api_key = api_key.strip()
-        self.smart_format = bool(smart_format)
-        self.diarize = bool(diarize)
-        self.paragraphs = bool(paragraphs)
-        self.filler_words = bool(filler_words)
-        self.numerals = bool(numerals)
 
     def transcribe_file(self, media_path: Path, output_dir: Path = TRANSCRIPTS_DIR) -> tuple[bool, str]:
         debug_log(
             f"[DeepgramFileTranscriber] Starting file transcription for {media_path} "
-            f"smart_format={self.smart_format} diarize={self.diarize} paragraphs={self.paragraphs} "
-            f"filler_words={self.filler_words} numerals={self.numerals}"
+            f"with fixed config={get_deepgram_config()}"
         )
         if not self.api_key:
             return False, "Missing DEEPGRAM_API_KEY in .env."
@@ -1074,18 +1228,7 @@ class DeepgramFileTranscriber:
 
         mime_type, _ = mimetypes.guess_type(str(media_path))
         content_type = mime_type or "application/octet-stream"
-        query = urllib.parse.urlencode(
-            {
-                "model": "nova-3",
-                "smart_format": "true" if self.smart_format else "false",
-                "punctuate": "true",
-                "paragraphs": "true" if self.paragraphs else "false",
-                "diarize": "true" if self.diarize else "false",
-                "filler_words": "true" if self.filler_words else "false",
-                "numerals": "true" if self.numerals else "false",
-                "detect_language": "true",
-            }
-        )
+        query = urllib.parse.urlencode(get_file_deepgram_query_params())
 
         try:
             media_bytes = media_path.read_bytes()
@@ -1140,11 +1283,6 @@ class LiveTranscriptionSession:
         api_key: str,
         input_device: ActiveAudioDevice,
         mode_name: str,
-        smart_format: bool,
-        diarize: bool,
-        paragraphs: bool,
-        filler_words: bool,
-        numerals: bool,
         on_transcript,
         on_status,
         on_signal,
@@ -1156,11 +1294,6 @@ class LiveTranscriptionSession:
         self.sample_rate_hz = LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ
         self.capture_channels = max(1, min(int(self.input_device_info.get("max_input_channels", 1)), 2))
         self.mode_name = mode_name.strip() or "Unknown"
-        self.smart_format = bool(smart_format)
-        self.diarize = bool(diarize)
-        self.paragraphs = bool(paragraphs)
-        self.filler_words = bool(filler_words)
-        self.numerals = bool(numerals)
         self.on_transcript = on_transcript
         self.on_status = on_status
         self.on_signal = on_signal
@@ -1182,9 +1315,7 @@ class LiveTranscriptionSession:
     def start(self) -> tuple[bool, str]:
         debug_log(
             f"[LiveTranscriptionSession] Start requested mode={self.mode_name} "
-            f"configured_device={self.input_device_name} smart_format={self.smart_format} "
-            f"diarize={self.diarize} paragraphs={self.paragraphs} "
-            f"filler_words={self.filler_words} numerals={self.numerals}"
+            f"configured_device={self.input_device_name} fixed_config={get_deepgram_config()}"
         )
         if not self.api_key:
             return False, "Missing DEEPGRAM_API_KEY in .env."
@@ -1211,20 +1342,7 @@ class LiveTranscriptionSession:
         connection.on(LiveTranscriptionEvents.Error, self._on_error)
         connection.on(LiveTranscriptionEvents.Close, self._on_close)
 
-        requested_live_options = {
-            "model": "nova-3",
-            "language": "en-US",
-            "smart_format": self.smart_format,
-            "punctuate": True,
-            "interim_results": True,
-            "diarize": self.diarize,
-            "paragraphs": self.paragraphs,
-            "filler_words": self.filler_words,
-            "numerals": self.numerals,
-            "encoding": "linear16",
-            "channels": 1,
-            "sample_rate": self.sample_rate_hz,
-        }
+        requested_live_options = get_live_deepgram_options(self.sample_rate_hz)
         supported_names = set(inspect.signature(LiveOptions.__init__).parameters.keys())
         live_options_payload = {
             key: value for key, value in requested_live_options.items() if key in supported_names
@@ -1233,7 +1351,7 @@ class LiveTranscriptionSession:
         if omitted_names:
             debug_log(
                 f"[LiveTranscriptionSession] Live SDK does not support: {', '.join(omitted_names)}. "
-                f"Continuing with supported options only.",
+                "Continuing with supported options only.",
                 level="warning",
             )
 
@@ -1403,11 +1521,7 @@ class LiveTranscriptionSession:
             "actual_input_device": self.actual_device_name,
             "sample_rate_hz": self.sample_rate_hz,
             "capture_channels": self.capture_channels,
-            "smart_format": self.smart_format,
-            "diarize": self.diarize,
-            "paragraphs": self.paragraphs,
-            "filler_words": self.filler_words,
-            "numerals": self.numerals,
+            "deepgram_config": get_deepgram_config(),
             "started_at": self.started_at,
             "stopped_at": self.stopped_at,
             "final_segment_count": len(self.final_lines),
@@ -1499,11 +1613,6 @@ class App:
 
         self.status_var = ctk.StringVar(value="Ready - Monitoring active" if self.config["wer_mode_enabled"] else "Ready")
         self.mode_var = ctk.StringVar(value=self.current_mode)
-        self.deepgram_smart_format_var = ctk.BooleanVar(value=bool(self.config["deepgram_smart_format"]))
-        self.deepgram_diarize_var = ctk.BooleanVar(value=bool(self.config["deepgram_diarize"]))
-        self.deepgram_paragraphs_var = ctk.BooleanVar(value=bool(self.config["deepgram_paragraphs"]))
-        self.deepgram_filler_words_var = ctk.BooleanVar(value=bool(self.config["deepgram_filler_words"]))
-        self.deepgram_numerals_var = ctk.BooleanVar(value=bool(self.config["deepgram_numerals"]))
         self.require_signal_check_var = ctk.BooleanVar(value=bool(self.config["require_signal_check"]))
         self.monitor_status_var = ctk.StringVar(value="Excellent")
         self.monitor_level_var = ctk.StringVar(value="RMS: -∞ dB | Peak: -∞ dB")
@@ -1689,7 +1798,7 @@ class App:
 
         self.mode_display = ctk.CTkLabel(
             mode_text_frame,
-            text=f"{self.current_mode}",
+            text=self.current_mode,
             font=("Arial", 20, "bold"),
             text_color="#4CAF50",
             anchor="w",
@@ -1987,7 +2096,25 @@ class App:
 
         options_frame = ctk.CTkFrame(self.transcribe_tab)
         options_frame.pack(fill="x", padx=8, pady=(0, 12))
-        self._add_section_title(options_frame, "Deepgram Options")
+        self._add_section_title(options_frame, "Deepgram")
+
+        ctk.CTkLabel(
+            options_frame,
+            text=get_deepgram_settings_message(),
+            font=("Arial", 11, "bold"),
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=14, pady=(0, 4))
+
+        ctk.CTkLabel(
+            options_frame,
+            text=get_deepgram_settings_detail(),
+            font=("Arial", 10),
+            text_color="#C6C6C6",
+            wraplength=760,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(0, 8))
 
         self.transcription_status_label = ctk.CTkLabel(
             options_frame,
@@ -1999,27 +2126,6 @@ class App:
             anchor="w",
         )
         self.transcription_status_label.pack(fill="x", padx=14, pady=(0, 10))
-
-        options_row = ctk.CTkFrame(options_frame, fg_color="transparent")
-        options_row.pack(fill="x", padx=12, pady=(0, 10))
-        for column in range(5):
-            options_row.grid_columnconfigure(column, weight=1)
-
-        for column, (label, variable) in enumerate(
-            (
-                ("Smart Format", self.deepgram_smart_format_var),
-                ("Diarization", self.deepgram_diarize_var),
-                ("Paragraphs", self.deepgram_paragraphs_var),
-                ("Filler Words", self.deepgram_filler_words_var),
-                ("Numerals", self.deepgram_numerals_var),
-            )
-        ):
-            ctk.CTkSwitch(
-                options_row,
-                text=label,
-                variable=variable,
-                command=self._save_deepgram_options,
-            ).grid(row=0, column=column, sticky="w", padx=4, pady=2)
 
         file_frame = ctk.CTkFrame(self.transcribe_tab)
         file_frame.pack(fill="x", padx=8, pady=(0, 12))
@@ -2069,7 +2175,9 @@ class App:
             text=(
                 ("Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env")
                 + "\n"
-                + self._deepgram_options_summary()
+                + get_deepgram_settings_message()
+                + "\n"
+                + get_deepgram_settings_detail()
             ),
             font=("Arial", 10, "bold"),
             text_color="#66BB6A" if api_key_ready else "#F9A825",
@@ -2465,11 +2573,6 @@ class App:
         self.config["speaker_device"] = self.speaker_var.get().strip()
         self.config["vac_playback_device"] = self.vac_playback_var.get().strip()
         self.config["voicemeeter_device"] = self.mix_var.get().strip()
-        self.config["deepgram_smart_format"] = bool(self.deepgram_smart_format_var.get())
-        self.config["deepgram_diarize"] = bool(self.deepgram_diarize_var.get())
-        self.config["deepgram_paragraphs"] = bool(self.deepgram_paragraphs_var.get())
-        self.config["deepgram_filler_words"] = bool(self.deepgram_filler_words_var.get())
-        self.config["deepgram_numerals"] = bool(self.deepgram_numerals_var.get())
         self.config["require_signal_check"] = bool(self.require_signal_check_var.get())
         self.config["wer_mode_enabled"] = bool(self.wer_enabled_var.get())
         save_config(self.config)
@@ -2637,34 +2740,6 @@ class App:
             return self.mix_var.get().strip() or "Not configured"
         return self.mic_var.get().strip() or "Not configured"
 
-    def _deepgram_options_summary(self) -> str:
-        smart_format = "On" if self.deepgram_smart_format_var.get() else "Off"
-        diarize = "On" if self.deepgram_diarize_var.get() else "Off"
-        paragraphs = "On" if self.deepgram_paragraphs_var.get() else "Off"
-        filler_words = "On" if self.deepgram_filler_words_var.get() else "Off"
-        numerals = "On" if self.deepgram_numerals_var.get() else "Off"
-        return (
-            f"Deepgram options: Smart Format {smart_format} | Diarization {diarize} | "
-            f"Paragraphs {paragraphs} | Filler Words {filler_words} | Numerals {numerals}"
-        )
-
-    def _save_deepgram_options(self) -> None:
-        self.config["deepgram_smart_format"] = bool(self.deepgram_smart_format_var.get())
-        self.config["deepgram_diarize"] = bool(self.deepgram_diarize_var.get())
-        self.config["deepgram_paragraphs"] = bool(self.deepgram_paragraphs_var.get())
-        self.config["deepgram_filler_words"] = bool(self.deepgram_filler_words_var.get())
-        self.config["deepgram_numerals"] = bool(self.deepgram_numerals_var.get())
-        save_config(self.config)
-        if hasattr(self, "transcription_status_label") and self.transcription_status_label.winfo_exists():
-            api_key_ready = bool(get_deepgram_api_key())
-            base_text = "Deepgram API key detected" if api_key_ready else "Deepgram API key missing from .env"
-            self.transcription_status_label.configure(
-                text=base_text,
-                text_color="#66BB6A" if api_key_ready else "#F9A825",
-            )
-        self._refresh_live_transcription_labels()
-        self.status_var.set(self._deepgram_options_summary())
-
     def _refresh_live_transcription_labels(self) -> None:
         label = getattr(self, "live_transcription_device_label", None)
         if label is not None:
@@ -2679,7 +2754,9 @@ class App:
                 text=(
                     ("Deepgram live key detected" if api_key_ready else "Deepgram live key missing from .env")
                     + "\n"
-                    + self._deepgram_options_summary()
+                    + get_deepgram_settings_message()
+                    + "\n"
+                    + get_deepgram_settings_detail()
                 ),
                 text_color="#66BB6A" if api_key_ready else "#F9A825",
             )
@@ -2767,8 +2844,12 @@ class App:
     def _silent_signal_message(self, mode_name: str, device_name: str, *, relaxed: bool = False) -> str:
         if mode_name == "VAC":
             base = (
-                f"No audio was detected on {device_name}. VAC mode requires active system playback routed into "
-                f"{self.vac_playback_var.get().strip() or 'the configured CABLE Input target'}."
+                f"No audio detected on {device_name}.\n\n"
+                "VAC mode requires system audio to be actively playing.\n\n"
+                "Fix:\n"
+                f"1. Set Windows Output to '{self.vac_playback_var.get().strip() or 'the configured CABLE Input target'}'\n"
+                "2. Play audio (YouTube, media, etc.)\n"
+                "3. Try again"
             )
         elif mode_name == "Mixed":
             base = (
@@ -2862,11 +2943,6 @@ class App:
                 api_key,
                 active_device,
                 self.current_mode,
-                bool(self.deepgram_smart_format_var.get()),
-                bool(self.deepgram_diarize_var.get()),
-                bool(self.deepgram_paragraphs_var.get()),
-                bool(self.deepgram_filler_words_var.get()),
-                bool(self.deepgram_numerals_var.get()),
             ),
             daemon=True,
         ).start()
@@ -2876,11 +2952,6 @@ class App:
         api_key: str,
         active_device: ActiveAudioDevice,
         mode_name: str,
-        smart_format: bool,
-        diarize: bool,
-        paragraphs: bool,
-        filler_words: bool,
-        numerals: bool,
     ) -> None:
         input_device_name = active_device["name"]
         if not self.verify_active_device():
@@ -2959,11 +3030,6 @@ class App:
             api_key=api_key,
             input_device=active_device,
             mode_name=mode_name,
-            smart_format=smart_format,
-            diarize=diarize,
-            paragraphs=paragraphs,
-            filler_words=filler_words,
-            numerals=numerals,
             on_transcript=self._queue_live_transcript_update,
             on_status=self._queue_live_status_update,
             on_signal=self._queue_live_signal_update,
@@ -3068,14 +3134,7 @@ class App:
         ).start()
 
     def _run_file_transcription(self, media_path: Path) -> None:
-        transcriber = DeepgramFileTranscriber(
-            get_deepgram_api_key(),
-            smart_format=bool(self.deepgram_smart_format_var.get()),
-            diarize=bool(self.deepgram_diarize_var.get()),
-            paragraphs=bool(self.deepgram_paragraphs_var.get()),
-            filler_words=bool(self.deepgram_filler_words_var.get()),
-            numerals=bool(self.deepgram_numerals_var.get()),
-        )
+        transcriber = DeepgramFileTranscriber(get_deepgram_api_key())
         success, message = transcriber.transcribe_file(media_path)
         if self._closing:
             return
@@ -3484,7 +3543,8 @@ class App:
         }.get(quality, "N/A")
         self.monitor_stability_label.configure(text=stability_text, text_color=color)
         self.monitor_wer_label.configure(text=wer_text, text_color=color)
-        self.monitor_summary_var.set(f"Quality: {result['status_text']} | WER mode: {'On' if self.wer_enabled_var.get() else 'Off'}")
+        self.monitor_summary_var.set(
+            f"Quality: {result['status_text']} | WER mode: {'On' if self.wer_enabled_var.get() else 'Off'}")
         progress = QUALITY_PROGRESS.get(quality, 0.0)
         rms_text, peak_text = self._split_levels(result["level_text"])
         status_text = "Monitoring" if quality != "error" else "Unavailable"
