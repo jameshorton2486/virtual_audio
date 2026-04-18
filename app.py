@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -14,6 +15,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -86,6 +88,11 @@ ERROR_LOG_PATH = LOGS_DIR / "errors.log"
 DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ = 16000
 PREFLIGHT_SIGNAL_THRESHOLD_RMS = 0.001
+RMS_DB_SILENCE_FLOOR = -45.0
+RMS_DB_TOO_QUIET = -25.0
+RMS_DB_OPTIMAL_MAX = -12.0
+PEAK_DB_CLIP_WARNING = -3.0
+PEAK_DB_CLIP_HARD = -0.1
 
 SUPPORTED_TRANSCRIPTION_SUFFIXES = {
     ".aac",
@@ -122,6 +129,19 @@ class ActiveAudioDevice(TypedDict):
     index: int
     info: dict[str, Any]
     sample_rate: int
+
+
+class DeviceVerificationResult(str, Enum):
+    CONFIRMED = "confirmed"
+    EVENTUALLY_CONFIRMED = "eventually_confirmed"
+    TIMED_OUT = "timed_out"
+    DEVICE_UNAVAILABLE = "device_unavailable"
+
+
+class ModeSwitchOutcome(str, Enum):
+    SUCCESS = "success"
+    SUCCESS_WITH_WARNING = "success_with_warning"
+    HARD_FAILURE = "hard_failure"
 
 
 DEFAULT_CONFIG: Final[ConfigDict] = {
@@ -690,6 +710,33 @@ def build_live_transcript_metadata_path(transcript_path: Path) -> Path:
     return transcript_path.with_suffix(".json")
 
 
+def linear_to_db(value: float, floor_db: float = -100.0) -> float:
+    """Convert a linear amplitude in [0.0, 1.0] to dBFS. Clamps to floor_db."""
+    if value <= 0:
+        return floor_db
+    return max(floor_db, 20.0 * math.log10(value))
+
+
+def classify_speech_signal(rms_db: float, peak_db: float) -> tuple[str, str, str]:
+    """
+    Classify a measured signal against published speech target ranges.
+
+    Returns (state, feedback, color) where:
+        state     -- one of: 'no_signal', 'too_quiet', 'optimal', 'too_loud', 'clipping'
+        feedback  -- short user-facing string
+        color     -- hex color for the meter/status text
+    """
+    if peak_db >= PEAK_DB_CLIP_WARNING:
+        return "clipping", "Clipping risk — reduce input level", "#E53935"
+    if rms_db < RMS_DB_SILENCE_FLOOR:
+        return "no_signal", "No signal detected — check routing, mute, and source playback", "#9E9E9E"
+    if rms_db < RMS_DB_TOO_QUIET:
+        return "too_quiet", "Too quiet — increase mic gain or source volume", "#F9A825"
+    if rms_db > RMS_DB_OPTIMAL_MAX:
+        return "too_loud", "Too loud — reduce input level", "#FB8C00"
+    return "optimal", "Optimal speech level", "#43A047"
+
+
 def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
     try:
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
@@ -702,6 +749,8 @@ def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
     normalized = samples / 32768.0
     rms = float(np.sqrt(np.mean(normalized * normalized)))
     peak = float(np.max(np.abs(normalized)))
+    rms_db = linear_to_db(rms)
+    peak_db = linear_to_db(peak)
 
     if rms < 0.0015:
         state = "silent"
@@ -724,6 +773,9 @@ def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
         "state": state,
         "rms": rms,
         "peak": peak,
+        "rms_db": rms_db,
+        "peak_db": peak_db,
+        "clipping_hard": peak_db >= PEAK_DB_CLIP_HARD,
         "color": color,
         "detail": detail,
     }
@@ -734,22 +786,26 @@ def evaluate_live_signal_readiness(signal: dict[str, Any] | None, device_name: s
     if signal is None:
         return False, f"Unable to read audio from {normalized_name} before starting live transcription.", None
 
-    state = str(signal.get("state", "")).strip().lower()
+    rms_db = float(signal.get("rms_db", linear_to_db(float(signal.get("rms", 0.0)))))
+    peak_db = float(signal.get("peak_db", linear_to_db(float(signal.get("peak", 0.0)))))
+    speech_state, feedback, _color = classify_speech_signal(rms_db, peak_db)
     enriched_signal = {
         **signal,
         "device_name": normalized_name,
+        "speech_state": speech_state,
+        "feedback": feedback,
     }
 
-    if state == "silent":
-        return False, f"No audio signal detected on {normalized_name}. Check routing before starting live transcription.", enriched_signal
+    if speech_state == "no_signal":
+        return False, feedback, enriched_signal
 
-    if state == "low":
-        return True, f"Low input signal detected on {normalized_name}. Transcription may be weak until the level increases.", enriched_signal
+    if speech_state == "too_quiet":
+        return True, feedback, enriched_signal
 
-    if state == "clipping":
-        return True, f"Input on {normalized_name} is clipping. Transcription will start, but lower the source level for better accuracy.", enriched_signal
+    if speech_state in {"too_loud", "clipping"}:
+        return True, feedback, enriched_signal
 
-    return True, f"Input verified on {normalized_name}.", enriched_signal
+    return True, f"Input verified on {normalized_name}. {feedback}", enriched_signal
 
 
 def normalize_audio_device_name(name: str) -> str:
@@ -1246,24 +1302,33 @@ class AudioQualityMonitor:
         except Exception as exc:
             return {
                 "quality": "error",
-                "level_text": "Unavailable",
+                "level_text": "RMS: unavailable | Peak: unavailable",
                 "status_text": "Audio monitor unavailable",
                 "detail_text": f"{requested_device_name or 'Default input'}: {exc}",
+                "rms_db": -100.0,
+                "peak_db": -100.0,
+                "meter_color": "#9E9E9E",
+                "meter_feedback": "Audio monitor unavailable",
+                "meter_progress": 0.0,
             }
 
-        if rms < 0.005:
+        rms_db = linear_to_db(rms)
+        peak_db = linear_to_db(peak)
+        speech_state, feedback, meter_color = classify_speech_signal(rms_db, peak_db)
+
+        if speech_state == "no_signal":
             quality = "too_quiet"
             status = "No usable input"
             detail = "Input is effectively silent. Check the selected recording device and gain."
-        elif rms < 0.02:
+        elif speech_state == "too_quiet":
             quality = "low"
             status = "Low signal"
             detail = "Speech may be too quiet for reliable transcription."
-        elif peak > 0.90:
+        elif speech_state == "clipping":
             quality = "clipping"
             status = "Clipping risk"
             detail = "Input is peaking too high. Lower mic gain or mixer output."
-        elif peak > 0.75:
+        elif speech_state == "too_loud":
             quality = "good"
             status = "Strong signal"
             detail = "Signal is usable but getting close to clipping."
@@ -1274,11 +1339,16 @@ class AudioQualityMonitor:
 
         return {
             "quality": quality,
-            "level_text": f"RMS {rms:.3f} | Peak {peak:.3f}",
-            "status_text": status,
+            "level_text": f"RMS: {rms_db:.1f} dB | Peak: {peak_db:.1f} dB",
+            "status_text": feedback if speech_state != "optimal" else status,
             "detail_text": (
                 f"{detail} Input: {normalize_audio_device_name(str(device_info.get('name', requested_device_name or 'Default input')))}."
             ),
+            "rms_db": rms_db,
+            "peak_db": peak_db,
+            "meter_color": meter_color,
+            "meter_feedback": feedback,
+            "meter_progress": max(0.0, min(1.0, (rms_db + 60.0) / 60.0)),
         }
 
 
@@ -1724,24 +1794,55 @@ class LiveTranscriptionSession:
         signal = analyze_live_input_signal(raw_bytes)
         if signal is None:
             return
+        rms_db = float(signal.get("rms_db", linear_to_db(float(signal.get("rms", 0.0)))))
+        peak_db = float(signal.get("peak_db", linear_to_db(float(signal.get("peak", 0.0)))))
+        speech_state, feedback, speech_color = classify_speech_signal(rms_db, peak_db)
         self.on_signal(
             {
                 **signal,
                 "device_name": self.actual_device_name,
                 "mode_name": self.mode_name,
+                "speech_state": speech_state,
+                "feedback": feedback,
+                "meter_color": speech_color,
             }
         )
 
         rms = float(signal["rms"])
         peak = float(signal["peak"])
         state = str(signal["state"])
-        if state != self.last_signal_status:
-            log_event("AudioSignal", event="state_change", device=self.actual_device_name, from_state=self.last_signal_status or "unknown", to=state, rms=f"{rms:.5f}", peak=f"{peak:.5f}")
-            self.last_signal_status = state
-            self.on_status(f"Live input {state} on {self.actual_device_name} (RMS {rms:.4f}, Peak {peak:.4f})")
+        if speech_state != self.last_signal_status:
+            log_event(
+                "AudioSignal",
+                event="state_change",
+                device=self.actual_device_name,
+                from_state=self.last_signal_status or "unknown",
+                to=speech_state,
+                rms=f"{rms:.5f}",
+                peak=f"{peak:.5f}",
+                rms_db=f"{rms_db:.1f}",
+                peak_db=f"{peak_db:.1f}",
+            )
+            self.last_signal_status = speech_state
+            status_message = f"Live input {speech_state} on {self.actual_device_name} (RMS {rms_db:.1f} dB, Peak {peak_db:.1f} dB)"
+            if speech_state != "optimal":
+                status_message = f"{feedback}. {status_message}"
+            self.on_status(status_message)
         if now - self.last_signal_debug_at >= 2.0:
             self.last_signal_debug_at = now
-            log_event("AudioSignal", level="debug", device=self.actual_device_name, mode=self.mode_name, rms=f"{rms:.5f}", peak=f"{peak:.5f}", frames=frames, state=state)
+            log_event(
+                "AudioSignal",
+                level="debug",
+                device=self.actual_device_name,
+                mode=self.mode_name,
+                rms=f"{rms:.5f}",
+                peak=f"{peak:.5f}",
+                rms_db=f"{rms_db:.1f}",
+                peak_db=f"{peak_db:.1f}",
+                frames=frames,
+                state=state,
+                speech_state=speech_state,
+            )
 
 
 class App:
@@ -1782,6 +1883,7 @@ class App:
         self._best_mode_running = False
         self._latest_signal_state = "Unknown"
         self._resume_monitor_after_live = False
+        self._last_detected_refresh_at = 0.0
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -1804,6 +1906,7 @@ class App:
         self.monitor_recommendation_var = ctk.StringVar(value="No issues detected\nAll systems optimal")
         self.footer_var = ctk.StringVar(value="v3.0 Pro | Real-Time WER Optimization")
         self.runtime_audio_var = ctk.StringVar(value="Active Input: Detecting... | Active Output: Detecting... | Signal: Unknown")
+        self.active_source_var = ctk.StringVar(value="⚠️ Source: None — Click a mode to begin.")
         self.shortcuts_var = ctk.StringVar(
             value="Shortcuts: Ctrl+1 Monitor | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | Ctrl+M Mute | Ctrl+Shift+1/2/3 Modes | F5 Refresh"
         )
@@ -1816,7 +1919,11 @@ class App:
         self.direct_recording_var = ctk.StringVar(value=self.config["mic_device"])
         self.direct_playback_var = ctk.StringVar(value=self.config["speaker_device"])
         self.wer_enabled_var = ctk.BooleanVar(value=bool(self.config["wer_mode_enabled"]))
-        self.active_audio_device = self.resolve_active_device(self._current_live_input_device_name())
+        try:
+            self.active_audio_device = self.resolve_active_device(self._current_live_input_device_name())
+        except Exception as exc:
+            log_event("Startup", level="warning", event="initial_active_device_unresolved", mode=self.current_mode, reason=str(exc))
+            self.active_audio_device = None
         self.monitor = AudioQualityMonitor(
             sample_rate_hz=int(self.config["sample_rate_hz"]),
             interval_seconds=float(self.config["quality_check_interval_seconds"]),
@@ -1825,6 +1932,7 @@ class App:
         )
 
         self._build_ui()
+        self._reconcile_startup_mode()
         self._refresh_mode_hint()
         self._refresh_detection_summary()
         self._refresh_runtime_audio_status()
@@ -1860,6 +1968,15 @@ class App:
             text_color="#888888",
             anchor="w",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        self.active_source_label = ctk.CTkLabel(
+            header_frame,
+            textvariable=self.active_source_var,
+            font=("Arial", 10, "bold"),
+            text_color="#9E9E9E",
+            anchor="w",
+        )
+        self.active_source_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
 
         self.header_mode_chip = ctk.CTkLabel(
             header_frame,
@@ -2529,7 +2646,19 @@ class App:
         self.vac_menu = self._add_device_selector(settings_frame, "VAC recording device", self.vac_var, self.detected_input_devices)
         self.speaker_menu = self._add_device_selector(settings_frame, "Speaker playback device", self.speaker_var, self.detected_output_devices)
         self.vac_playback_menu = self._add_device_selector(settings_frame, "VAC playback target", self.vac_playback_var, self.detected_output_devices)
-        self.mix_menu = self._add_device_selector(settings_frame, "Voicemeeter device", self.mix_var, self.detected_input_devices)
+        self.mix_menu = self._add_device_selector(settings_frame, "Voicemeeter device", self.mix_var, self._group_mix_device_values(self.mix_var.get()))
+        self.mix_var.trace_add("write", self._on_mix_var_changed)
+
+        self.mix_validation_label = ctk.CTkLabel(
+            settings_frame,
+            text="Voicemeeter devices are listed first. Other inputs are not recommended for Mixed mode.",
+            font=("Arial", 9),
+            text_color="#C6C6C6",
+            wraplength=760,
+            justify="left",
+            anchor="w",
+        )
+        self.mix_validation_label.pack(fill="x", padx=14, pady=(0, 6))
 
         actions = ctk.CTkFrame(settings_frame, fg_color="transparent")
         actions.pack(fill="x", padx=12, pady=(10, 12))
@@ -2583,6 +2712,50 @@ class App:
         menu.pack(fill="x", padx=10, pady=(2, 6))
         return menu
 
+    def _group_mix_device_values(self, current_value: str) -> list[str]:
+        voicemeeter_devices = [device for device in self.detected_input_devices if "voicemeeter" in normalize_audio_device_name(device).lower()]
+        other_devices = [device for device in self.detected_input_devices if device not in voicemeeter_devices]
+        ordered = [*voicemeeter_devices, *other_devices]
+        return self._menu_values_for(current_value, ordered)
+
+    def _is_voicemeeter_choice_valid(self, device_name: str) -> bool:
+        return "voicemeeter" in normalize_audio_device_name(device_name).lower()
+
+    def _warn_non_voicemeeter_choice(self, selected_device: str) -> bool:
+        choice = messagebox.askyesno(
+            "Voicemeeter Input Not Recognized",
+            (
+                "The device you selected "
+                f"({selected_device}) does not appear to be a Voicemeeter virtual input.\n\n"
+                'Mixed mode requires a Voicemeeter device (e.g., "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)"). '
+                "Without one, Mixed mode will remain unavailable.\n\n"
+                "Choose Yes to save anyway, or No to pick a different device."
+            ),
+        )
+        log_event(
+            "Settings",
+            event="voicemeeter_field_non_voicemeeter",
+            device=selected_device,
+            user_choice="save_anyway" if choice else "pick_a_different_device",
+        )
+        return bool(choice)
+
+    def _on_mix_var_changed(self, *_args) -> None:
+        selected = self.mix_var.get().strip()
+        label = getattr(self, "mix_validation_label", None)
+        if label is None or not label.winfo_exists():
+            return
+        if selected and not self._is_voicemeeter_choice_valid(selected):
+            label.configure(
+                text=f"Warning: {selected} does not appear to be a Voicemeeter virtual input. Mixed mode will remain unavailable.",
+                text_color="#F9A825",
+            )
+        else:
+            label.configure(
+                text="Voicemeeter devices are listed first. Other inputs are not recommended for Mixed mode.",
+                text_color="#C6C6C6",
+            )
+
     def _set_warnings_text(self, text: str) -> None:
         self.warnings_box.configure(state="normal")
         self.warnings_box.delete("1.0", "end")
@@ -2594,6 +2767,61 @@ class App:
         routing_meter = getattr(self, "routing_meter", None)
         if routing_meter is not None and routing_meter.winfo_exists():
             routing_meter.set_levels(rms_text, peak_text, status_text, color, progress)
+
+    def _refresh_detected_devices(self, *, force: bool = False) -> None:
+        """Refresh the cached device list. Call this before any action that needs fresh state."""
+        now = time.monotonic()
+        if not force and (now - self._last_detected_refresh_at) < 0.2:
+            return
+        new_inputs = list_input_devices()
+        new_outputs = list_output_devices()
+        if new_inputs != self.detected_input_devices:
+            LOGGER.debug(
+                "[Devices] event=inputs_changed old_count=%d new_count=%d",
+                len(self.detected_input_devices),
+                len(new_inputs),
+            )
+        self.detected_input_devices = new_inputs
+        self.detected_output_devices = new_outputs
+        self._last_detected_refresh_at = now
+
+    def _active_source_summary(self) -> tuple[str, str]:
+        if self.active_audio_device is None:
+            return "⚠️ Source: None — Click a mode to begin.", "#9E9E9E"
+
+        device_name = self.active_audio_device["name"]
+        if not self._active_device_matches_mode(self.current_mode):
+            return f"⚠️ Source: Mismatch — UI says {self.current_mode}, Windows says {device_name}", "#FB8C00"
+
+        color = MODE_UI.get(self.current_mode, MODE_UI["Microphone"])["accent"]
+        return f" Source: {self.current_mode} — {device_name}", color
+
+    def _reconcile_startup_mode(self) -> None:
+        """Validate that the loaded mode is actually available. Fall back if not."""
+        fallback_mode: ModeName | None = None
+        reason = ""
+        if self.current_mode == "Mixed" and not self._is_mixed_mode_available():
+            fallback_mode = "Microphone"
+            reason = "Voicemeeter not detected on boot"
+        elif self.current_mode == "VAC" and not any("cable output" in normalize_audio_device_name(device).lower() for device in self.detected_input_devices):
+            fallback_mode = "Microphone"
+            reason = "VAC recording device not detected on boot"
+        elif self.current_mode == "Microphone" and self.mic_var.get().strip() not in self.detected_input_devices:
+            log_event("Startup", level="warning", event="mode_warning", loaded_mode="Microphone", reason="Configured microphone not detected on boot")
+
+        if fallback_mode is not None:
+            log_event("Startup", event="mode_unavailable", loaded_mode=self.current_mode, fallback=fallback_mode, reason=reason)
+            self.current_mode = fallback_mode
+            self.config["last_mode"] = fallback_mode
+            self.mode_var.set(fallback_mode)
+            save_config(self.config)
+            try:
+                self.active_audio_device = self.resolve_active_device(self._current_live_input_device_name())
+            except Exception as exc:
+                log_event("Startup", level="warning", event="resolve_fallback_failed", mode=fallback_mode, reason=str(exc))
+                self.active_audio_device = None
+
+        self._refresh_run_control_buttons()
 
     def _refresh_runtime_audio_status(self, *, signal_state: str | None = None) -> None:
         if self.active_audio_device is not None:
@@ -2614,8 +2842,14 @@ class App:
         signal_label = getattr(self, "signal_label", None)
         if signal_label is not None and signal_label.winfo_exists():
             signal_label.configure(text=f"Signal: {self._latest_signal_state}")
+        active_source_label = getattr(self, "active_source_label", None)
+        if active_source_label is not None and active_source_label.winfo_exists():
+            summary_text, summary_color = self._active_source_summary()
+            self.active_source_var.set(summary_text)
+            active_source_label.configure(text_color=summary_color)
 
     def _is_mixed_mode_available(self) -> bool:
+        self._refresh_detected_devices()
         configured = self.mix_var.get().strip()
         if configured and self._resolve_detected_input_name(configured, "Mixed"):
             return True
@@ -2756,8 +2990,7 @@ class App:
             self.status_var.set("Stop live transcription before refreshing device lists.")
             return
         debug_log("[App] Refreshing detected input and output devices")
-        self.detected_input_devices = list_input_devices()
-        self.detected_output_devices = list_output_devices()
+        self._refresh_detected_devices(force=True)
         self._hydrate_config_from_detected_devices()
         self.mic_var.set(self.config["mic_device"])
         self.vac_var.set(self.config["vac_device"])
@@ -2786,8 +3019,8 @@ class App:
             ("speaker_menu", self.speaker_var, self.detected_output_devices),
             ("vac_playback_menu", self.vac_playback_var, self.detected_output_devices),
             ("route_vac_playback_menu", self.vac_playback_var, self.detected_output_devices),
-            ("mix_menu", self.mix_var, self.detected_input_devices),
-            ("route_mix_menu", self.mix_var, self.detected_input_devices),
+            ("mix_menu", self.mix_var, self._group_mix_device_values(self.mix_var.get())),
+            ("route_mix_menu", self.mix_var, self._group_mix_device_values(self.mix_var.get())),
             ("direct_recording_menu", self.direct_recording_var, self.detected_input_devices),
             ("direct_playback_menu", self.direct_playback_var, self.detected_output_devices),
         ]
@@ -2840,6 +3073,11 @@ class App:
         self.status_var.set(f"Saved configuration to {CONFIG_PATH.name}.")
 
     def save_settings(self) -> None:
+        selected_mix = self.mix_var.get().strip()
+        if selected_mix and not self._is_voicemeeter_choice_valid(selected_mix):
+            if not self._warn_non_voicemeeter_choice(selected_mix):
+                self.status_var.set("Pick a different Voicemeeter input before saving Mixed mode settings.")
+                return
         self.save_form_config()
         self.refresh_detected_devices()
         self.tabview.set("Settings")
@@ -3008,6 +3246,7 @@ class App:
         return bool(decision["value"])
 
     def _run_preflight(self, mode_name: ModeName, active_device: ActiveAudioDevice) -> tuple[bool, str, dict[str, Any]]:
+        self._refresh_detected_devices()
         diagnostics: dict[str, Any] = {
             "mode": mode_name,
             "device": active_device["name"],
@@ -3072,21 +3311,58 @@ class App:
 
         rms = 0.0 if signal is None else float(signal.get("rms", 0.0))
         peak = 0.0 if signal is None else float(signal.get("peak", 0.0))
+        rms_db = linear_to_db(rms) if signal is None else float(signal.get("rms_db", linear_to_db(rms)))
+        peak_db = linear_to_db(peak) if signal is None else float(signal.get("peak_db", linear_to_db(peak)))
+        speech_state, feedback, speech_color = classify_speech_signal(rms_db, peak_db)
         signal_state = "unavailable" if signal is None else str(signal.get("state", "unknown"))
         diagnostics["rms"] = rms
         diagnostics["peak"] = peak
+        diagnostics["rms_db"] = rms_db
+        diagnostics["peak_db"] = peak_db
         diagnostics["signal_state"] = signal_state
-        log_event("Preflight", step="5_signal_sample", device=active_device["name"], rms=f"{rms:.5f}", peak=f"{peak:.5f}", state=signal_state)
+        diagnostics["speech_state"] = speech_state
+        diagnostics["feedback"] = feedback
+        log_event(
+            "Preflight",
+            step="5_signal_sample",
+            device=active_device["name"],
+            rms=f"{rms:.5f}",
+            peak=f"{peak:.5f}",
+            rms_db=f"{rms_db:.1f}",
+            peak_db=f"{peak_db:.1f}",
+            state=signal_state,
+        )
 
-        passes_threshold = (rms >= PREFLIGHT_SIGNAL_THRESHOLD_RMS) or not bool(self.require_signal_check_var.get())
-        diagnostics["threshold"] = PREFLIGHT_SIGNAL_THRESHOLD_RMS
+        passes_threshold = rms_db >= RMS_DB_SILENCE_FLOOR
+        diagnostics["threshold_db"] = RMS_DB_SILENCE_FLOOR
         diagnostics["passes_threshold"] = passes_threshold
-        log_event("Preflight", step="6_signal_threshold", threshold=PREFLIGHT_SIGNAL_THRESHOLD_RMS, passes=passes_threshold)
+        log_event("Preflight", step="6_signal_threshold", threshold_db=RMS_DB_SILENCE_FLOOR, rms_db=f"{rms_db:.1f}", passes=passes_threshold)
         if signal is not None:
-            self._queue_live_signal_update({**signal, "device_name": active_device["name"]})
+            self._queue_live_signal_update(
+                {
+                    **signal,
+                    "device_name": active_device["name"],
+                    "speech_state": speech_state,
+                    "feedback": feedback,
+                    "meter_color": speech_color,
+                }
+            )
         if not passes_threshold:
-            log_failure("SIGNAL", reason="Signal below required RMS threshold", **diagnostics)
-            return False, "SIGNAL", diagnostics
+            relaxed = not bool(self.require_signal_check_var.get())
+            log_failure("SIGNAL", level="warning" if relaxed else "error", reason=feedback, **diagnostics)
+            if not relaxed:
+                return False, "SIGNAL", diagnostics
+
+        if speech_state in {"too_quiet", "too_loud", "clipping"}:
+            log_event(
+                "Preflight",
+                step="6b_signal_quality",
+                level="warning",
+                state=speech_state,
+                rms_db=f"{rms_db:.1f}",
+                peak_db=f"{peak_db:.1f}",
+                feedback=feedback,
+            )
 
         expected_name = self._expected_input_device_for_mode(mode_name)
         resolved_mode_match = normalize_audio_device_name(active_device["name"]) == normalize_audio_device_name(expected_name)
@@ -3206,20 +3482,28 @@ class App:
         device_name = str(payload.get("device_name", "selected input"))
         rms = float(payload.get("rms", 0.0))
         peak = float(payload.get("peak", 0.0))
+        rms_db = float(payload.get("rms_db", linear_to_db(rms)))
+        peak_db = float(payload.get("peak_db", linear_to_db(peak)))
         detail = str(payload.get("detail", "")).strip()
         state = str(payload.get("state", "unknown")).strip().lower()
-        signal_text = f"Input signal: {detail} Device: {device_name}. RMS {rms:.4f}, Peak {peak:.4f}."
+        speech_state = str(payload.get("speech_state", "")).strip().lower() or classify_speech_signal(rms_db, peak_db)[0]
+        feedback = str(payload.get("feedback", "")).strip() or classify_speech_signal(rms_db, peak_db)[1]
+        signal_text = f"Input signal: {feedback}. {detail} Device: {device_name}. RMS {rms_db:.1f} dB, Peak {peak_db:.1f} dB."
         self.live_signal_status_text = signal_text
         self.live_signal_status_label.configure(
             text=signal_text,
-            text_color=str(payload.get("color", "#C6C6C6")),
+            text_color=str(payload.get("meter_color", payload.get("color", "#C6C6C6"))),
         )
         signal_state = {
+            "no_signal": "No signal",
+            "too_quiet": "Low signal",
+            "too_loud": "Too loud",
+            "clipping": "Clipping",
+            "optimal": "Active",
             "silent": "No signal",
             "low": "Low signal",
-            "clipping": "Clipping",
             "active": "Active",
-        }.get(state, "Unknown")
+        }.get(speech_state or state, "Unknown")
         self._refresh_runtime_audio_status(signal_state=signal_state)
 
     def _silent_signal_message(self, mode_name: str, device_name: str, *, relaxed: bool = False) -> str:
@@ -3355,7 +3639,7 @@ class App:
         preflight_ok, failure_code, diagnostics = self._run_preflight(mode_name, active_device)
         if not preflight_ok:
             success = False
-            message = self._silent_signal_message(mode_name, input_device_name)
+            message = str(diagnostics.get("feedback", "")).strip() or self._silent_signal_message(mode_name, input_device_name)
             session = None
             try:
                 self.root.after(0, lambda: self._finish_start_live_transcription(success, message, session))
@@ -3379,8 +3663,9 @@ class App:
             return
         try:
             final_message = message
-            if diagnostics.get("signal_state") in {"low", "clipping"}:
-                final_message = f"{message} Preflight signal state={diagnostics.get('signal_state')}."
+            feedback = str(diagnostics.get("feedback", "")).strip()
+            if feedback and diagnostics.get("speech_state") != "optimal":
+                final_message = feedback
             self.root.after(0, lambda: self._finish_start_live_transcription(success, final_message, session))
         except Exception as exc:
             log_event("App", level="warning", event="queue_live_start_success_failed", reason=str(exc))
@@ -3413,9 +3698,14 @@ class App:
         debug_log(f"[App] Live transcription started successfully: {message}")
         self._set_live_controls_state(running=True, starting=False)
         lowered = message.lower()
-        is_warning = any(token in lowered for token in ("low input signal", "clipping", "lower the source level"))
+        is_warning = any(token in lowered for token in ("clipping", "too quiet", "too loud", "no signal"))
         self.live_transcription_status_label.configure(text=message, text_color="#F57C00" if is_warning else "#66BB6A")
-        signal_state = "Clipping" if "clipping" in lowered else ("Low signal" if "low input signal" in lowered else "Active")
+        signal_state = (
+            "Clipping" if "clipping" in lowered else
+            ("No signal" if "no signal" in lowered else
+             ("Too loud" if "too loud" in lowered else
+              ("Low signal" if "too quiet" in lowered else "Active")))
+        )
         self._refresh_runtime_audio_status(signal_state=signal_state)
         self.status_var.set(message)
 
@@ -3519,6 +3809,7 @@ class App:
         if self._audio_switch_in_progress:
             self.status_var.set("Audio device switch already in progress.")
             return
+        self._refresh_detected_devices()
         if self._live_transcription_running or self._live_transcription_starting:
             self._apply_audio_mode_hot(mode_name)
             return
@@ -3605,45 +3896,61 @@ class App:
 
     def _apply_audio_mode_worker(self, mode_name: ModeName, input_device: str, playback_target: str) -> None:
         resolved_device: ActiveAudioDevice | None = None
+        outcome = ModeSwitchOutcome.HARD_FAILURE
         try:
             resolved_device = self.resolve_active_device(input_device)
         except Exception as exc:
-            success = False
             message = str(exc)
         else:
             ok_record, record_message = self.device_manager.set_default_recording_device(input_device)
             if not ok_record:
-                success = False
                 message = record_message
             else:
                 ok_playback, playback_message = self.device_manager.set_default_playback_device(playback_target)
                 if not ok_playback:
-                    success = False
                     message = f"{record_message} Playback switch failed: {playback_message}"
-                elif not self._wait_for_active_input_device(resolved_device["name"]):
-                    success = False
-                    message = f"Switched Windows defaults, but the active input did not become {resolved_device['name']} in time."
                 else:
-                    success = True
-                    message = f"{mode_name} mode active | Input: {resolved_device['name']} | Output: {playback_target}"
-        if success and resolved_device is None:
-            success = False
+                    verification_result = self._wait_for_active_input_device(resolved_device["name"])
+                    if verification_result == DeviceVerificationResult.DEVICE_UNAVAILABLE:
+                        message = (
+                            f"Windows completed the switch request, but {resolved_device['name']} no longer appears "
+                            f"in the available input devices."
+                        )
+                    elif verification_result == DeviceVerificationResult.CONFIRMED:
+                        outcome = ModeSwitchOutcome.SUCCESS
+                        message = f"{mode_name} mode active | Input: {resolved_device['name']} | Output: {playback_target}"
+                    elif verification_result in (
+                        DeviceVerificationResult.EVENTUALLY_CONFIRMED,
+                        DeviceVerificationResult.TIMED_OUT,
+                    ):
+                        outcome = ModeSwitchOutcome.SUCCESS_WITH_WARNING
+                        message = (
+                            f"Switched Windows defaults, but verification for {resolved_device['name']} was slow."
+                        )
+                    else:
+                        message = f"Unable to verify that {resolved_device['name']} became the active input device."
+        if outcome != ModeSwitchOutcome.HARD_FAILURE and resolved_device is None:
+            outcome = ModeSwitchOutcome.HARD_FAILURE
             message = f"Unable to resolve an active audio device for {mode_name} mode."
 
         if self._closing:
             return
+
+        def _dispatched_finish() -> None:
+            try:
+                self._finish_apply_audio_mode(outcome, mode_name, resolved_device, playback_target, message)
+            except Exception:
+                LOGGER.exception("[ApplyMode] event=dispatched_finish_crashed mode=%s", mode_name)
+
         try:
-            self.root.after(
-                0,
-                lambda: self._finish_apply_audio_mode(success, mode_name, resolved_device, playback_target, message),
-            )
+            self.root.after(0, _dispatched_finish)
         except Exception as exc:
             log_event("ApplyMode", level="warning", event="queue_finish_failed", mode=mode_name, reason=str(exc))
             return
 
     def _apply_audio_mode_hot_worker(self, mode_name: ModeName, input_device: str, playback_target: str) -> None:
         message = ""
-        success = False
+        outcome = ModeSwitchOutcome.HARD_FAILURE
         new_active_device: ActiveAudioDevice | None = None
         continue_anyway = False
         try:
@@ -3655,117 +3962,262 @@ class App:
             if not ok_playback:
                 message = playback_message
                 return
-            if not self._wait_for_active_input_device(input_device):
-                message = f"Windows did not switch the active input to {input_device} in time."
+            verification_result = self._wait_for_active_input_device(input_device)
+            if verification_result == DeviceVerificationResult.DEVICE_UNAVAILABLE:
+                message = f"Windows completed the switch request, but {input_device} is no longer available."
                 return
             new_active_device = self.resolve_active_device(input_device)
             preflight_ok, failure_code, _diagnostics = self._run_preflight(mode_name, new_active_device)
             if not preflight_ok:
                 log_event("HotSwitch", level="warning", event="preflight_warning", mode=mode_name, failure_code=failure_code)
+                feedback = str(_diagnostics.get("feedback", "")).strip()
                 continue_anyway = self._ask_yes_no_sync(
                     "Signal Issue on New Mode",
-                    f"The new {mode_name} source did not pass preflight checks. Continue the hot switch anyway?",
+                    (feedback + "\n\n" if feedback else "") + f"The new {mode_name} source did not pass preflight checks. Continue the hot switch anyway?",
                 )
                 if not continue_anyway:
                     message = f"Hot switch to {mode_name} was cancelled after preflight warning."
                     return
             assert self.live_transcription_session is not None
             success, message = self.live_transcription_session.switch_input_device(new_active_device, mode_name)
+            if success:
+                outcome = (
+                    ModeSwitchOutcome.SUCCESS
+                    if verification_result == DeviceVerificationResult.CONFIRMED
+                    else ModeSwitchOutcome.SUCCESS_WITH_WARNING
+                )
         except Exception as exc:
             LOGGER.exception(_log_message("Failure: UNKNOWN", mode=mode_name, device=input_device, reason=str(exc)))
             message = str(exc)
         finally:
             if self._closing:
                 return
+
+            def _dispatched_finish() -> None:
+                try:
+                    self._finish_apply_audio_mode_hot(outcome, mode_name, new_active_device, playback_target, message)
+                except Exception:
+                    LOGGER.exception("[ApplyMode] event=dispatched_finish_crashed mode=%s", mode_name)
+
             try:
-                self.root.after(0, lambda: self._finish_apply_audio_mode_hot(success, mode_name, new_active_device, playback_target, message))
+                self.root.after(0, _dispatched_finish)
             except Exception as exc:
                 log_event("HotSwitch", level="warning", event="queue_finish_failed", mode=mode_name, reason=str(exc))
 
     def _finish_apply_audio_mode(
         self,
-        success: bool,
+        outcome: ModeSwitchOutcome,
         mode_name: ModeName,
         resolved_device: ActiveAudioDevice | None,
         playback_target: str,
         message: str,
     ) -> None:
-        self._audio_switch_in_progress = False
-        self._pending_mode_button = None
-        self._refresh_run_control_buttons()
-        if not success or resolved_device is None:
-            self._pending_vac_test = False
-            self._refresh_runtime_audio_status()
-            self.status_var.set(message)
-            return
+        LOGGER.info("[ApplyMode] event=finish_enter mode=%s outcome=%s worker_thread=%s", mode_name, outcome.value, threading.current_thread().name)
+        try:
+            self._audio_switch_in_progress = False
+            self._pending_mode_button = None
+            self._refresh_run_control_buttons()
+            if outcome == ModeSwitchOutcome.HARD_FAILURE or resolved_device is None:
+                self._pending_vac_test = False
+                self._refresh_runtime_audio_status()
+                if hasattr(self, "status_label") and self.status_label.winfo_exists():
+                    self.status_label.configure(text_color="#E53935")
+                self.status_var.set(message)
+                LOGGER.error("[ApplyMode] event=finish_hard_failure mode=%s reason=%s", mode_name, message)
+                LOGGER.info(
+                    "[ApplyMode] event=finish_complete mode=%s current_mode=%s active_device=%s header_chip=%s",
+                    mode_name,
+                    self.current_mode,
+                    self.active_audio_device["name"] if self.active_audio_device else "None",
+                    self.mode_var.get() if hasattr(self, "mode_var") else "unset",
+                )
+                return
 
-        self.active_audio_device = resolved_device
-        if not self.verify_active_device():
-            self._pending_vac_test = False
-            self._refresh_runtime_audio_status()
-            self.status_var.set("Device mismatch detected after switching modes.")
-            return
+            self.active_audio_device = resolved_device
+            if not self.verify_active_device():
+                self._pending_vac_test = False
+                self._refresh_runtime_audio_status()
+                if hasattr(self, "status_label") and self.status_label.winfo_exists():
+                    self.status_label.configure(text_color="#E53935")
+                self.status_var.set("Device mismatch detected after switching modes.")
+                LOGGER.error("[ApplyMode] event=finish_hard_failure mode=%s reason=%s", mode_name, "Device mismatch detected after switching modes.")
+                LOGGER.info(
+                    "[ApplyMode] event=finish_complete mode=%s current_mode=%s active_device=%s header_chip=%s",
+                    mode_name,
+                    self.current_mode,
+                    self.active_audio_device["name"] if self.active_audio_device else "None",
+                    self.mode_var.get() if hasattr(self, "mode_var") else "unset",
+                )
+                return
 
-        self.current_mode = mode_name
-        self.config["last_mode"] = mode_name
-        save_config(self.config)
-        self.mode_var.set(mode_name)
-        self.direct_recording_var.set(resolved_device["name"])
-        self.direct_playback_var.set(playback_target)
-        self._refresh_mode_hint()
-        self._refresh_runtime_audio_status()
-        self.status_var.set(
-            f"{mode_name} mode active | Input: {resolved_device['name']} | Output: {playback_target} | Signal: {self._latest_signal_state}"
-        )
-        debug_log(
-            f"[App] Mode applied successfully -> {mode_name} | input={resolved_device['name']} | "
-            f"index={resolved_device['index']} | sample_rate={resolved_device['sample_rate']} | output={playback_target}"
-        )
-        if self._pending_vac_test and mode_name == "VAC":
-            self._pending_vac_test = False
-            self._start_verified_vac_test()
+            self.current_mode = mode_name
+            self.config["last_mode"] = mode_name
+            save_config(self.config)
+            self.mode_var.set(mode_name)
+            self.active_audio_device = resolved_device
+            self.direct_recording_var.set(resolved_device["name"])
+            self.direct_playback_var.set(playback_target)
+            self.active_device_label.configure(text=f"Active Device: {resolved_device['name']}")
+            self._update_mode_badges(mode_name)
+            self._refresh_run_control_buttons()
+            self._refresh_runtime_audio_status()
+            self._refresh_mode_hint()
+            if hasattr(self, "status_label") and self.status_label.winfo_exists():
+                self.status_label.configure(text_color="#F9A825" if outcome == ModeSwitchOutcome.SUCCESS_WITH_WARNING else "#66BB6A")
+            if outcome == ModeSwitchOutcome.SUCCESS_WITH_WARNING:
+                LOGGER.warning("[ApplyMode] event=finish_success_with_warning mode=%s note=%s", mode_name, message)
+                self.status_var.set(f"⚠ {mode_name} mode active (Windows verification was slow). {message}")
+            else:
+                self.status_var.set(
+                    f"{mode_name} mode active | Input: {resolved_device['name']} | Output: {playback_target} | Signal: {self._latest_signal_state}"
+                )
+            debug_log(
+                f"[App] Mode applied successfully -> {mode_name} | input={resolved_device['name']} | "
+                f"index={resolved_device['index']} | sample_rate={resolved_device['sample_rate']} | output={playback_target}"
+            )
+            if self._pending_vac_test and mode_name == "VAC":
+                self._pending_vac_test = False
+                self._start_verified_vac_test()
+            LOGGER.info(
+                "[ApplyMode] event=finish_complete mode=%s current_mode=%s active_device=%s header_chip=%s",
+                mode_name,
+                self.current_mode,
+                self.active_audio_device["name"] if self.active_audio_device else "None",
+                self.mode_var.get() if hasattr(self, "mode_var") else "unset",
+            )
+        except Exception:
+            LOGGER.exception("[ApplyMode] event=finish_crashed mode=%s", mode_name)
 
     def _finish_apply_audio_mode_hot(
         self,
-        success: bool,
+        outcome: ModeSwitchOutcome,
         mode_name: ModeName,
         resolved_device: ActiveAudioDevice | None,
         playback_target: str,
         message: str,
     ) -> None:
-        self._audio_switch_in_progress = False
-        self._pending_mode_button = None
-        self._refresh_run_control_buttons()
-        if not success or resolved_device is None:
-            if message:
-                self.status_var.set(message)
-                messagebox.showerror("Hot Switch Failed", message)
-            return
+        LOGGER.info("[ApplyMode] event=finish_enter mode=%s outcome=%s worker_thread=%s", mode_name, outcome.value, threading.current_thread().name)
+        try:
+            self._audio_switch_in_progress = False
+            self._pending_mode_button = None
+            self._refresh_run_control_buttons()
+            if outcome == ModeSwitchOutcome.HARD_FAILURE or resolved_device is None:
+                if message:
+                    self.status_var.set(message)
+                    if hasattr(self, "status_label") and self.status_label.winfo_exists():
+                        self.status_label.configure(text_color="#E53935")
+                    messagebox.showerror("Hot Switch Failed", message)
+                LOGGER.error("[ApplyMode] event=finish_hard_failure mode=%s reason=%s", mode_name, message)
+                LOGGER.info(
+                    "[ApplyMode] event=finish_complete mode=%s current_mode=%s active_device=%s header_chip=%s",
+                    mode_name,
+                    self.current_mode,
+                    self.active_audio_device["name"] if self.active_audio_device else "None",
+                    self.mode_var.get() if hasattr(self, "mode_var") else "unset",
+                )
+                return
 
-        self.active_audio_device = resolved_device
-        self.current_mode = mode_name
-        self.config["last_mode"] = mode_name
-        save_config(self.config)
-        self.mode_var.set(mode_name)
-        self.direct_recording_var.set(resolved_device["name"])
-        self.direct_playback_var.set(playback_target)
-        self._refresh_mode_hint()
-        self._refresh_runtime_audio_status(signal_state="Active")
-        self.live_transcription_status_label.configure(text=message, text_color="#66BB6A")
-        self.status_var.set(f"Hot-switched to {mode_name} - transcript continuing.")
+            self.active_audio_device = resolved_device
+            self.current_mode = mode_name
+            self.config["last_mode"] = mode_name
+            save_config(self.config)
+            self.mode_var.set(mode_name)
+            self.direct_recording_var.set(resolved_device["name"])
+            self.direct_playback_var.set(playback_target)
+            self.active_device_label.configure(text=f"Active Device: {resolved_device['name']}")
+            self._update_mode_badges(mode_name)
+            self._refresh_run_control_buttons()
+            self._refresh_runtime_audio_status(signal_state="Active")
+            self._refresh_mode_hint()
+            live_color = "#F9A825" if outcome == ModeSwitchOutcome.SUCCESS_WITH_WARNING else "#66BB6A"
+            self.live_transcription_status_label.configure(text=message, text_color=live_color)
+            if hasattr(self, "status_label") and self.status_label.winfo_exists():
+                self.status_label.configure(text_color=live_color)
+            if outcome == ModeSwitchOutcome.SUCCESS_WITH_WARNING:
+                LOGGER.warning("[ApplyMode] event=finish_success_with_warning mode=%s note=%s", mode_name, message)
+                self.status_var.set(f"⚠ Hot-switched to {mode_name} - transcript continuing. {message}")
+            else:
+                self.status_var.set(f"Hot-switched to {mode_name} - transcript continuing.")
+            LOGGER.info(
+                "[ApplyMode] event=finish_complete mode=%s current_mode=%s active_device=%s header_chip=%s",
+                mode_name,
+                self.current_mode,
+                self.active_audio_device["name"] if self.active_audio_device else "None",
+                self.mode_var.get() if hasattr(self, "mode_var") else "unset",
+            )
+        except Exception:
+            LOGGER.exception("[ApplyMode] event=finish_crashed mode=%s", mode_name)
 
-    def _wait_for_active_input_device(self, expected_device_name: str, timeout_seconds: float = 1.5) -> bool:
+    def _update_mode_badges(self, mode_name: str) -> None:
+        mode_ui = MODE_UI.get(mode_name)
+        if mode_ui is None:
+            LOGGER.error("[ApplyMode] event=unknown_mode_in_ui_map mode=%s known=%s", mode_name, list(MODE_UI.keys()))
+            badge_color = "#616161"
+            badge_text = mode_name
+        else:
+            badge_color = str(mode_ui["accent"])
+            badge_text = mode_name
+
+        for widget_name in ("header_mode_chip", "mode_badge_label"):
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                LOGGER.warning("[ApplyMode] event=badge_widget_missing name=%s", widget_name)
+                continue
+            try:
+                widget.configure(text=badge_text, fg_color=badge_color)
+            except Exception:
+                LOGGER.exception("[ApplyMode] event=badge_configure_failed name=%s", widget_name)
+
+    def _wait_for_active_input_device(
+        self,
+        expected_device_name: str,
+        timeout_seconds: float = 1.5,
+    ) -> DeviceVerificationResult:
         normalized_expected = normalize_audio_device_name(expected_device_name)
-        deadline = time.time() + timeout_seconds
+        start_time = time.time()
+        deadline = start_time + timeout_seconds
 
         while time.time() < deadline:
             _index, device_info = get_default_input_device()
             if device_info is not None:
                 active_name = normalize_audio_device_name(str(device_info.get("name", "")))
                 if active_name == normalized_expected:
-                    return True
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    LOGGER.info("[DeviceVerify] event=confirmed device=%s elapsed_ms=%d", _quote_log_value(expected_device_name), elapsed_ms)
+                    return DeviceVerificationResult.CONFIRMED
             time.sleep(0.1)
-        return False
+
+        extended_deadline = time.time() + 2.5
+        while time.time() < extended_deadline:
+            _index, device_info = get_default_input_device()
+            if device_info is not None:
+                active_name = normalize_audio_device_name(str(device_info.get("name", "")))
+                if active_name == normalized_expected:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    LOGGER.warning(
+                        "[DeviceVerify] event=eventually_confirmed device=%s elapsed_ms=%d initial_window_exceeded=True",
+                        _quote_log_value(expected_device_name),
+                        elapsed_ms,
+                    )
+                    return DeviceVerificationResult.EVENTUALLY_CONFIRMED
+            time.sleep(0.2)
+
+        try:
+            devices = sd.query_devices()
+        except Exception as exc:
+            LOGGER.warning("[DeviceVerify] event=query_failed device=%s reason=%s", _quote_log_value(expected_device_name), _quote_log_value(exc))
+            return DeviceVerificationResult.TIMED_OUT
+
+        expected_present = any(
+            normalize_audio_device_name(str(device.get("name", ""))) == normalized_expected
+            for device in devices
+        )
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if not expected_present:
+            LOGGER.error("[DeviceVerify] event=device_unavailable device=%s elapsed_ms=%d", _quote_log_value(expected_device_name), elapsed_ms)
+            return DeviceVerificationResult.DEVICE_UNAVAILABLE
+        LOGGER.warning("[DeviceVerify] event=timed_out device=%s elapsed_ms=%d", _quote_log_value(expected_device_name), elapsed_ms)
+        return DeviceVerificationResult.TIMED_OUT
 
     def test_vac_routing(self) -> None:
         if self._vac_test_running:
@@ -4000,7 +4452,7 @@ class App:
         self.monitor_status_var.set(result["status_text"])
         self.monitor_level_var.set(result["level_text"])
         self.monitor_detail_var.set(result["detail_text"])
-        color = QUALITY_COLORS.get(quality, "#9E9E9E")
+        color = str(result.get("meter_color", QUALITY_COLORS.get(quality, "#9E9E9E")))
         self.monitor_status_label.configure(text=result["status_text"], text_color=color)
         stability_text = "Stable" if quality in {"excellent", "good"} else "Check"
         wer_text = {
@@ -4015,9 +4467,9 @@ class App:
         self.monitor_wer_label.configure(text=wer_text, text_color=color)
         self.monitor_summary_var.set(
             f"Quality: {result['status_text']} | WER mode: {'On' if self.wer_enabled_var.get() else 'Off'}")
-        progress = QUALITY_PROGRESS.get(quality, 0.0)
+        progress = float(result.get("meter_progress", QUALITY_PROGRESS.get(quality, 0.0)))
         rms_text, peak_text = self._split_levels(result["level_text"])
-        status_text = "Monitoring" if quality != "error" else "Unavailable"
+        status_text = str(result.get("meter_feedback", "Monitoring" if quality != "error" else "Unavailable"))
         signal_state = {
             "excellent": "Active",
             "good": "Active",

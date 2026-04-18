@@ -118,6 +118,23 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - `Mixed` mode is useful when you need mic narration over playback, but the final quality depends on Voicemeeter routing and levels.
 - The live meter is a basic signal-health check. It is not a true WER estimator.
 
+### Understanding the Meter
+
+| Metric | Range | Meaning |
+|---|---|---|
+| RMS | >= -45 dB | Any usable signal at all (below this = silence / no signal) |
+| RMS | -45 to -25 dB | Too quiet for reliable transcription |
+| RMS | -25 to -12 dB | Optimal speech range |
+| RMS | -12 to -3 dB | Too loud |
+| Peak | >= -3 dB | Risk of clipping |
+| Peak | >= -0.1 dB | Hard clipping |
+
+- `no_signal` means the app is effectively seeing silence, usually from mute, bad routing, or no active playback.
+- `too_quiet` means speech is present but below the target range, so raising mic gain or source volume should help.
+- `optimal` means the measured speech level is in the target window for reliable transcription.
+- `too_loud` means the level is still usable but should be reduced before it reaches clipping.
+- `clipping` means the peak level is already in the danger zone and should be turned down immediately.
+
 ## Build a Standalone EXE
 
 ```powershell
