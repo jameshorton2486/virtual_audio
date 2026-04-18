@@ -4,9 +4,11 @@
   "speaker_device": "Speakers 1 (Realtek HD Audio output with SST)",
   "vac_playback_device": "CABLE Input (VB-Audio Virtual Cable)",
   "voicemeeter_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+  "mixed_playback_device": "",
+  "restore_devices_on_exit": true,
   "require_signal_check": true,
   "wer_mode_enabled": true,
   "quality_check_interval_seconds": 2.0,
   "sample_rate_hz": 24000,
-  "last_mode": "Mixed"
+  "last_mode": "VAC"
 }

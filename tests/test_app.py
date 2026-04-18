@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import queue
 import subprocess
 import tempfile
+import threading
 import unittest
 import logging
 import re
@@ -53,6 +55,9 @@ class DummyRoot:
 
     def winfo_exists(self) -> bool:
         return self.exists
+
+    def destroy(self) -> None:
+        self.exists = False
 
 
 class CaptureHandler(logging.Handler):
@@ -294,6 +299,8 @@ class DeviceHelpersTests(unittest.TestCase):
                 "speaker_device": "",
                 "vac_playback_device": None,
                 "voicemeeter_device": None,
+                "mixed_playback_device": None,
+                "restore_devices_on_exit": None,
                 "deepgram_smart_format": "false",
                 "deepgram_diarize": "true",
                 "deepgram_paragraphs": "false",
@@ -311,6 +318,8 @@ class DeviceHelpersTests(unittest.TestCase):
         self.assertEqual(result["speaker_device"], app.DEFAULT_CONFIG["speaker_device"])
         self.assertEqual(result["vac_playback_device"], app.DEFAULT_CONFIG["vac_playback_device"])
         self.assertEqual(result["voicemeeter_device"], app.DEFAULT_CONFIG["voicemeeter_device"])
+        self.assertEqual(result["mixed_playback_device"], "")
+        self.assertTrue(result["restore_devices_on_exit"])
         self.assertFalse(result["wer_mode_enabled"])
         self.assertEqual(
             result["quality_check_interval_seconds"],
@@ -547,13 +556,24 @@ class AppBehaviorTests(unittest.TestCase):
     def _make_app_stub(self):
         stub = app.App.__new__(app.App)
         stub.current_mode = "Microphone"
-        stub.config = {"last_mode": "Microphone"}
+        stub.config = {
+            "last_mode": "Microphone",
+            "restore_devices_on_exit": True,
+            "mic_device": "Microphone (Realtek HD Audio Mic input)",
+            "speaker_device": "Speakers (Realtek Audio)",
+            "mixed_playback_device": "",
+        }
         stub.is_muted = False
         stub._audio_switch_in_progress = False
         stub._pending_mode_button = None
         stub._pending_vac_test = False
         stub._closing = False
+        stub._live_transcription_running = False
+        stub._live_transcription_starting = False
         stub._last_detected_refresh_at = 0.0
+        stub._last_mixed_unavailable_reason = None
+        stub._slow_verification_count = 0
+        stub._slow_verification_advisory_logged = False
         stub._latest_signal_state = "Unknown"
         stub.detected_input_devices = [
             "Microphone (Realtek HD Audio Mic input)",
@@ -565,6 +585,8 @@ class AppBehaviorTests(unittest.TestCase):
         stub.vac_var = DummyVar("CABLE Output (VB-Audio Virtual Cable)")
         stub.speaker_var = DummyVar("Speakers (Realtek Audio)")
         stub.vac_playback_var = DummyVar("CABLE Input (VB-Audio Virtual Cable)")
+        stub.mixed_playback_var = DummyVar("")
+        stub.restore_devices_on_exit_var = DummyVar(False)
         stub.require_signal_check_var = DummyVar(True)
         stub.status_var = DummyVar("")
         stub.mode_var = DummyVar("Microphone")
@@ -583,6 +605,8 @@ class AppBehaviorTests(unittest.TestCase):
         stub.btn_mix = DummyButton("#8E24AA")
         stub.mute_button = DummyButton("#D32F2F")
         stub.root = DummyRoot()
+        stub._original_default_input_name = "Microphone (Realtek HD Audio Mic input)"
+        stub._original_default_output_name = "Speakers (Realtek Audio)"
         stub._queue_live_signal_update = lambda payload: None
         stub._refresh_mode_hint = lambda: None
         stub._refresh_runtime_audio_status = lambda signal_state=None: None
@@ -606,7 +630,12 @@ class AppBehaviorTests(unittest.TestCase):
         stub._refresh_detected_devices = bind_app_method(stub, "_refresh_detected_devices")
         stub._active_source_summary = bind_app_method(stub, "_active_source_summary")
         stub._active_device_matches_mode = bind_app_method(stub, "_active_device_matches_mode")
-        stub._update_mode_badges = bind_app_method(stub, "_update_mode_badges")
+        stub._apply_mode_theme = bind_app_method(stub, "_apply_mode_theme")
+        stub._log_mixed_unavailable = bind_app_method(stub, "_log_mixed_unavailable")
+        stub._mark_mixed_available = bind_app_method(stub, "_mark_mixed_available")
+        stub.use_current_windows_output_for_speakers = bind_app_method(stub, "use_current_windows_output_for_speakers")
+        stub._restore_original_default_devices = bind_app_method(stub, "_restore_original_default_devices")
+        stub.reset_windows_audio = bind_app_method(stub, "reset_windows_audio")
         stub.resolve_active_device = lambda name: {
             "name": name,
             "index": 1,
@@ -887,8 +916,28 @@ class AppBehaviorTests(unittest.TestCase):
         self.assertEqual(app_stub.current_mode, "VAC")
         self.assertEqual(app_stub.header_mode_chip.props["text"], "VAC")
         self.assertEqual(app_stub.mode_badge_label.props["text"], "VAC")
+        self.assertEqual(app_stub.active_source_label.props["text_color"], "#66BB6A")
         self.assertEqual(app_stub.status_label.props["text_color"], "#F9A825")
         self.assertTrue(any("[ApplyMode] event=finish_success_with_warning mode=VAC" in message for message in handler.messages))
+
+    def test_finish_apply_audio_mode_sets_status_color_on_success(self) -> None:
+        app_stub = self._make_app_stub()
+
+        with patch.object(app, "save_config", return_value=None):
+            app_stub._finish_apply_audio_mode(
+                app.ModeSwitchOutcome.SUCCESS,
+                "VAC",
+                {
+                    "name": "CABLE Output (VB-Audio Virtual Cable)",
+                    "index": 1,
+                    "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1},
+                    "sample_rate": 24000,
+                },
+                "CABLE Input (VB-Audio Virtual Cable)",
+                "ok",
+            )
+
+        self.assertEqual(app_stub.status_label.props["text_color"], "#66BB6A")
 
     def test_finish_apply_audio_mode_does_not_repaint_on_hard_failure(self) -> None:
         app_stub = self._make_app_stub()
@@ -910,40 +959,152 @@ class AppBehaviorTests(unittest.TestCase):
         self.assertEqual(app_stub.current_mode, "Microphone")
         self.assertEqual(app_stub.header_mode_chip.props["text"], "")
 
-    def test_both_badges_update_together(self) -> None:
+    def test_apply_mode_theme_vac_sets_green(self) -> None:
         app_stub = self._make_app_stub()
 
-        with patch.object(app, "save_config", return_value=None):
-            app_stub._finish_apply_audio_mode(
-                app.ModeSwitchOutcome.SUCCESS,
-                "VAC",
-                {
-                    "name": "CABLE Output (VB-Audio Virtual Cable)",
-                    "index": 1,
-                    "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1},
-                    "sample_rate": 24000,
-                },
-                "CABLE Input (VB-Audio Virtual Cable)",
-                "ok",
-            )
+        app_stub._apply_mode_theme("VAC")
 
         self.assertEqual(app_stub.header_mode_chip.props["text"], "VAC")
         self.assertEqual(app_stub.header_mode_chip.props["fg_color"], "#2E7D32")
         self.assertEqual(app_stub.mode_badge_label.props["text"], "VAC")
         self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#2E7D32")
+        self.assertEqual(app_stub.active_source_label.props["text_color"], "#66BB6A")
 
-    def test_unknown_mode_logs_and_uses_fallback_color(self) -> None:
+    def test_apply_mode_theme_microphone_sets_blue(self) -> None:
+        app_stub = self._make_app_stub()
+
+        app_stub._apply_mode_theme("Microphone")
+
+        self.assertEqual(app_stub.header_mode_chip.props["text"], "Microphone")
+        self.assertEqual(app_stub.header_mode_chip.props["fg_color"], "#1565C0")
+        self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#1565C0")
+
+    def test_apply_mode_theme_source_label_uses_brighter_color(self) -> None:
+        app_stub = self._make_app_stub()
+
+        app_stub._apply_mode_theme("Microphone")
+
+        self.assertEqual(app_stub.active_source_label.props["text_color"], "#42A5F5")
+
+    def test_apply_mode_theme_unknown_mode_fallback(self) -> None:
         app_stub = self._make_app_stub()
         handler = CaptureHandler()
         app.LOGGER.addHandler(handler)
         try:
-            app_stub._update_mode_badges("Unknown")
+            app_stub._apply_mode_theme("Unknown")
         finally:
             app.LOGGER.removeHandler(handler)
 
         self.assertEqual(app_stub.header_mode_chip.props["fg_color"], "#616161")
         self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#616161")
+        self.assertEqual(app_stub.active_source_label.props["text_color"], "#9E9E9E")
         self.assertTrue(any("[ApplyMode] event=unknown_mode_in_ui_map mode=Unknown" in message for message in handler.messages))
+
+    def test_apply_mode_theme_missing_widget_logs_and_continues(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.header_mode_chip = None
+        handler = CaptureHandler()
+        previous_level = app.LOGGER.level
+        app.LOGGER.setLevel(logging.DEBUG)
+        app.LOGGER.addHandler(handler)
+        try:
+            app_stub._apply_mode_theme("VAC")
+        finally:
+            app.LOGGER.removeHandler(handler)
+            app.LOGGER.setLevel(previous_level)
+
+        self.assertTrue(any("[ApplyMode] event=badge_widget_missing name=header_mode_chip" in message for message in handler.messages))
+        self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#2E7D32")
+        self.assertTrue(any("[ApplyMode] event=theme_applied mode=VAC accent=#2E7D32 bright=#66BB6A" in message for message in handler.messages))
+
+    def test_mixed_unavailable_logs_error_once_then_debug(self) -> None:
+        app_stub = self._make_app_stub()
+        handler = CaptureHandler()
+        previous_level = app.LOGGER.level
+        app.LOGGER.setLevel(logging.DEBUG)
+        app.LOGGER.addHandler(handler)
+        try:
+            with patch.object(app_stub, "_refresh_detected_devices", return_value=None):
+                app_stub._is_mixed_mode_available(log_failure_level="debug")
+                app_stub._is_mixed_mode_available(log_failure_level="debug")
+                app_stub._is_mixed_mode_available(log_failure_level="debug")
+        finally:
+            app.LOGGER.removeHandler(handler)
+            app.LOGGER.setLevel(previous_level)
+
+        error_messages = [message for message in handler.messages if message.startswith("[Failure: ROUTING]")]
+        debug_messages = [message for message in handler.messages if message.startswith("[Mixed] event=still_unavailable")]
+        self.assertEqual(len(error_messages), 1)
+        self.assertEqual(len(debug_messages), 2)
+
+    def test_mixed_unavailable_user_click_always_errors(self) -> None:
+        app_stub = self._make_app_stub()
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            with patch.object(app_stub, "_refresh_detected_devices", return_value=None):
+                for _ in range(3):
+                    with patch("app.messagebox.showerror", return_value=None):
+                        app.App.apply_audio_mode(app_stub, "Mixed")
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        error_messages = [message for message in handler.messages if message.startswith("[Failure: ROUTING]")]
+        self.assertEqual(len(error_messages), 3)
+
+    def test_mixed_became_available_logs_transition(self) -> None:
+        app_stub = self._make_app_stub()
+        with patch.object(app_stub, "_refresh_detected_devices", return_value=None):
+            app_stub._is_mixed_mode_available(log_failure_level="debug")
+        app_stub.detected_input_devices.append("VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)")
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            with patch.object(app_stub, "_refresh_detected_devices", return_value=None):
+                self.assertTrue(app_stub._is_mixed_mode_available(log_failure_level="debug"))
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        self.assertTrue(any("[Mixed] event=became_available" in message for message in handler.messages))
+
+    def test_verification_extended_window_is_5000ms(self) -> None:
+        self.assertEqual(app.DEVICE_VERIFY_EXTENDED_TIMEOUT_SECONDS, 5.0)
+
+    def test_consistently_slow_advisory_fires_once(self) -> None:
+        app_stub = self._make_app_stub()
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            class FakeClock:
+                def __init__(self, step: float = 0.3):
+                    self.current = -step
+                    self.step = step
+
+                def __call__(self) -> float:
+                    self.current += self.step
+                    return self.current
+
+            responses = [(1, {"name": "Microphone (Realtek HD Audio Mic input)"})] * 6 + [
+                (1, {"name": "CABLE Output (VB-Audio Virtual Cable)"})
+            ]
+            for _ in range(3):
+                with patch("app.time.time", side_effect=FakeClock()), patch("app.time.sleep", return_value=None), patch(
+                    "app.get_default_input_device",
+                    side_effect=list(responses),
+                ):
+                    result = app.App._wait_for_active_input_device(app_stub, "CABLE Output (VB-Audio Virtual Cable)")
+                    self.assertEqual(result, app.DeviceVerificationResult.EVENTUALLY_CONFIRMED)
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        advisory_messages = [message for message in handler.messages if "[DeviceVerify] event=consistently_slow" in message]
+        self.assertEqual(len(advisory_messages), 1)
+
+    def test_vac_silent_signal_message_includes_zoom_note(self) -> None:
+        app_stub = self._make_app_stub()
+        message = app.App._silent_signal_message(app_stub, "VAC", "CABLE Output (VB-Audio Virtual Cable)")
+
+        self.assertIn("Same as System", message)
 
     def test_reconcile_startup_mode_falls_back_from_mixed_when_vm_absent(self) -> None:
         app_stub = self._make_app_stub()
@@ -968,6 +1129,79 @@ class AppBehaviorTests(unittest.TestCase):
             app.App.save_settings(app_stub)
 
         prompt.assert_called_once()
+
+    def test_use_current_windows_output_for_speakers_updates_setting(self) -> None:
+        app_stub = self._make_app_stub()
+
+        with patch(
+            "app.get_default_output_device",
+            return_value=(3, {"name": "Samsung TV (NVIDIA High Definition Audio)"}),
+        ), patch.object(app, "save_config", return_value=None):
+            app.App.use_current_windows_output_for_speakers(app_stub)
+
+        self.assertEqual(app_stub.speaker_var.get(), "Samsung TV (NVIDIA High Definition Audio)")
+        self.assertEqual(app_stub.config["speaker_device"], "Samsung TV (NVIDIA High Definition Audio)")
+        self.assertIn("Samsung TV", app_stub.status_var.get())
+
+    def test_resolve_mode_devices_uses_speaker_fallback_then_mixed_override(self) -> None:
+        app_stub = self._make_app_stub()
+
+        recording_device, playback_device = app.App._resolve_mode_devices(app_stub, "Mixed")
+        self.assertEqual(recording_device, "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)")
+        self.assertEqual(playback_device, "Speakers (Realtek Audio)")
+
+        app_stub.mixed_playback_var.set("Samsung TV (NVIDIA High Definition Audio)")
+        recording_device, playback_device = app.App._resolve_mode_devices(app_stub, "Mixed")
+        self.assertEqual(recording_device, "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)")
+        self.assertEqual(playback_device, "Samsung TV (NVIDIA High Definition Audio)")
+
+    def test_restore_original_default_devices_uses_captured_names_when_enabled(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.restore_devices_on_exit_var.set(True)
+        app_stub.device_manager = SimpleNamespace(
+            set_default_recording_device=Mock(return_value=(True, "record restored")),
+            set_default_playback_device=Mock(return_value=(True, "play restored")),
+        )
+        app_stub.config["restore_devices_on_exit"] = True
+
+        app.App._restore_original_default_devices(app_stub)
+
+        app_stub.device_manager.set_default_recording_device.assert_called_once_with("Microphone (Realtek HD Audio Mic input)")
+        app_stub.device_manager.set_default_playback_device.assert_called_once_with("Speakers (Realtek Audio)")
+
+    def test_reset_windows_audio_falls_back_to_configured_devices_when_originals_missing(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._original_default_input_name = None
+        app_stub._original_default_output_name = None
+        app_stub.device_manager = SimpleNamespace(
+            set_default_recording_device=Mock(return_value=(True, "record restored")),
+            set_default_playback_device=Mock(return_value=(True, "play restored")),
+        )
+
+        with patch("app.messagebox.showinfo", return_value=None):
+            app.App.reset_windows_audio(app_stub)
+
+        app_stub.device_manager.set_default_recording_device.assert_called_once_with("Microphone (Realtek HD Audio Mic input)")
+        app_stub.device_manager.set_default_playback_device.assert_called_once_with("Speakers (Realtek Audio)")
+        self.assertEqual(app_stub.status_var.get(), "Windows audio defaults reset.")
+
+    def test_reset_windows_audio_warns_and_skips_when_live_transcription_running(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._live_transcription_running = True
+        app_stub.device_manager = SimpleNamespace(
+            set_default_recording_device=Mock(return_value=(True, "record restored")),
+            set_default_playback_device=Mock(return_value=(True, "play restored")),
+        )
+
+        with patch("app.messagebox.showwarning", return_value=None) as warning, patch(
+            "app.messagebox.showinfo",
+            return_value=None,
+        ):
+            app.App.reset_windows_audio(app_stub)
+
+        warning.assert_called_once()
+        app_stub.device_manager.set_default_recording_device.assert_not_called()
+        app_stub.device_manager.set_default_playback_device.assert_not_called()
 
     def test_device_refresh_logs_changes(self) -> None:
         app_stub = self._make_app_stub()
@@ -1064,6 +1298,111 @@ class LiveSessionSwitchTests(unittest.TestCase):
         self.assertTrue(session.running)
         self.assertEqual(session.input_device_index, 1)
         self.assertNotEqual(session.stream, old_stream)
+
+
+class LiveSessionResilienceTests(unittest.TestCase):
+    def _make_session(self) -> app.LiveTranscriptionSession:
+        return app.LiveTranscriptionSession(
+            api_key="test-key",
+            input_device={
+                "name": "CABLE Output (VB-Audio Virtual Cable)",
+                "index": 1,
+                "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1},
+                "sample_rate": 24000,
+            },
+            mode_name="VAC",
+            on_transcript=lambda *_args: None,
+            on_status=lambda *_args: None,
+            on_signal=lambda *_args: None,
+        )
+
+    def test_audio_callback_drops_oldest_block_when_pcm_queue_is_full(self) -> None:
+        session = self._make_session()
+        session.running = True
+        session._pcm_queue = queue.Queue(maxsize=2)
+
+        with patch.object(session, "_report_input_signal", return_value=None), patch.object(
+            session,
+            "_pcm16_bytes_from_input",
+            side_effect=[b"oldest", b"middle", b"newest"],
+        ):
+            session._audio_callback(None, 1024, None, None)
+            session._audio_callback(None, 1024, None, None)
+            session._audio_callback(None, 1024, None, None)
+
+        self.assertEqual(session._dropped_blocks, 1)
+        self.assertEqual(session._pcm_queue.get_nowait(), b"middle")
+        self.assertEqual(session._pcm_queue.get_nowait(), b"newest")
+
+    def test_on_close_triggers_reconnect_while_running(self) -> None:
+        session = self._make_session()
+        session.running = True
+        session._trigger_reconnect = Mock()
+
+        session._on_close(client=Mock())
+
+        session._trigger_reconnect.assert_called_once_with("websocket closed")
+
+    def test_keepalive_loop_sends_keepalive_during_idle_periods(self) -> None:
+        session = self._make_session()
+        session.running = True
+        session._state = app.LiveSessionState.RUNNING
+        session._last_send_at = 0.0
+
+        connection = Mock()
+        connection.keep_alive = None
+
+        def send(payload) -> None:
+            self.assertIn("KeepAlive", payload)
+            session._stop_event.set()
+
+        connection.send.side_effect = send
+        session.connection = connection
+
+        with patch.object(app, "DEEPGRAM_KEEPALIVE_SECONDS", 0.01), patch.object(
+            app,
+            "DEEPGRAM_KEEPALIVE_IDLE_THRESHOLD",
+            0.0,
+        ), patch("app.time.monotonic", return_value=10.0):
+            thread = threading.Thread(target=session._keepalive_loop, daemon=True)
+            thread.start()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        connection.send.assert_called()
+
+    def test_reconnect_consumes_backoff_sequence_and_caps_at_attempt_six(self) -> None:
+        session = self._make_session()
+        session.running = True
+        session.current_interim = ""
+        session.final_lines = []
+        status_updates: list[str] = []
+        session.on_status = status_updates.append
+        session.on_transcript = Mock()
+        session._persist_transcript_text = Mock()
+        session._close_connection = Mock()
+
+        waits: list[float] = []
+
+        def fake_wait(delay: float) -> bool:
+            waits.append(delay)
+            return False
+
+        session._stop_event = Mock()
+        session._stop_event.wait.side_effect = fake_wait
+
+        connect_results = [(False, "nope")] * 5 + [(True, "")]
+        session._connect_websocket = Mock(side_effect=connect_results)
+
+        with patch("app.time.strftime", return_value="12:34:56"):
+            session._reconnect()
+
+        self.assertEqual(waits, list(app.RECONNECT_BACKOFF_SECONDS))
+        self.assertEqual(session._connect_websocket.call_count, 6)
+        self.assertEqual(session._reconnect_attempt, 0)
+        self.assertIn("[Reconnected to Deepgram at 12:34:56]", session.final_lines)
+        self.assertTrue(any("attempt 6 of 6" in message for message in status_updates))
+        self.assertIn("Live transcription reconnected.", status_updates)
 
 
 if __name__ == "__main__":

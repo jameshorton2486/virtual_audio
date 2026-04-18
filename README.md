@@ -68,6 +68,9 @@ In Zoom, set `Microphone` to `Same as System`. Otherwise Windows default-device 
 
 Edit the values in `config.json` or use the fields in the app. The app also has a `Refresh Devices` button that re-scans Windows input and output devices and updates the dropdowns.
 
+- `mixed_playback_device`: optional playback target for Mixed mode. Leave blank to reuse `speaker_device`. Useful when you want Mic mode to play to headphones but Mixed mode to play to room speakers or a TV.
+- `restore_devices_on_exit`: when true (default), the app captures the Windows default recording and playback devices at startup and restores them when you close the app normally. Prevents Windows from staying stuck on `CABLE Output` or another mode-specific device after the app exits.
+
 ## Environment Variables
 
 - Store local secrets such as `DEEPGRAM_API_KEY` in `.env`
@@ -161,3 +164,7 @@ After the build finishes, copy these files together before distributing:
 - If the monitor says the signal is silent, confirm the current default recording device is actually receiving audio.
 - If the app closes but audio switching worked, review Python/package installation first.
 - If `Mixed` is greyed out or shows `Mixed Unavailable`, Voicemeeter is not currently exposing a virtual input device. Open Voicemeeter, route mic or system audio to a virtual input, then click `Refresh Devices`.
+
+### Reset Windows Audio
+
+If your Windows audio gets stuck on a device the app set (for example, `CABLE Output` as the recording device after a VAC-mode session), click **Reset Windows Audio** in the Routing tab. This restores the devices that were active when you launched the app, or falls back to your configured `mic_device` and `speaker_device` if no originals were captured. Stop live transcription first, because the button is blocked while a session is running.
