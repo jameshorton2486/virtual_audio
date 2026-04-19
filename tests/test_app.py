@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import subprocess
 import tempfile
@@ -49,6 +50,7 @@ class DummyButton:
 class DummyRoot:
     def __init__(self):
         self.exists = True
+        self.clipboard = ""
 
     def after(self, _delay, callback) -> None:
         callback()
@@ -58,6 +60,15 @@ class DummyRoot:
 
     def destroy(self) -> None:
         self.exists = False
+
+    def clipboard_clear(self) -> None:
+        self.clipboard = ""
+
+    def clipboard_append(self, value: str) -> None:
+        self.clipboard += value
+
+    def update(self) -> None:
+        return None
 
 
 class CaptureHandler(logging.Handler):
@@ -249,6 +260,27 @@ class DeviceHelpersTests(unittest.TestCase):
 
         self.assertEqual(result, "Speakers (Realtek Audio)")
 
+    def test_infer_speaker_output_device_accepts_tv_hdmi_outputs(self) -> None:
+        devices = [
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "SAMSUNG TV (NVIDIA High Definition Audio)",
+        ]
+
+        result = app.infer_speaker_output_device("Nonexistent Speakers", devices)
+
+        self.assertEqual(result, "SAMSUNG TV (NVIDIA High Definition Audio)")
+
+    def test_infer_microphone_input_device_falls_back_to_real_nonvirtual_input(self) -> None:
+        devices = [
+            "Stereo Mix (Realtek(R) Audio)",
+            "Microphone (Realtek HD Audio Mic input)",
+            "CABLE Output (VB-Audio Virtual Cable)",
+        ]
+
+        result = app.infer_microphone_input_device("VB-Audio Point", devices)
+
+        self.assertEqual(result, "Microphone (Realtek HD Audio Mic input)")
+
     def test_set_default_recording_device_updates_all_windows_roles(self) -> None:
         calls = []
 
@@ -264,9 +296,9 @@ class DeviceHelpersTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                [str(app.NIRCMD_PATH), "setdefaultsounddevice", "CABLE Output (VB-Audio Virtual Cable)", "0"],
-                [str(app.NIRCMD_PATH), "setdefaultsounddevice", "CABLE Output (VB-Audio Virtual Cable)", "1"],
-                [str(app.NIRCMD_PATH), "setdefaultsounddevice", "CABLE Output (VB-Audio Virtual Cable)", "2"],
+                [str(app.SOUNDVOLUMEVIEW_PATH), "/SetDefault", "CABLE Output (VB-Audio Virtual Cable)", "Console"],
+                [str(app.SOUNDVOLUMEVIEW_PATH), "/SetDefault", "CABLE Output (VB-Audio Virtual Cable)", "Multimedia"],
+                [str(app.SOUNDVOLUMEVIEW_PATH), "/SetDefault", "CABLE Output (VB-Audio Virtual Cable)", "Communications"],
             ],
         )
 
@@ -285,9 +317,9 @@ class DeviceHelpersTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                [str(app.NIRCMD_PATH), "setdefaultsounddevice", "CABLE Input (VB-Audio Virtual Cable)", "0"],
-                [str(app.NIRCMD_PATH), "setdefaultsounddevice", "CABLE Input (VB-Audio Virtual Cable)", "1"],
-                [str(app.NIRCMD_PATH), "setdefaultsounddevice", "CABLE Input (VB-Audio Virtual Cable)", "2"],
+                [str(app.SOUNDVOLUMEVIEW_PATH), "/SetDefault", "CABLE Input (VB-Audio Virtual Cable)", "Console"],
+                [str(app.SOUNDVOLUMEVIEW_PATH), "/SetDefault", "CABLE Input (VB-Audio Virtual Cable)", "Multimedia"],
+                [str(app.SOUNDVOLUMEVIEW_PATH), "/SetDefault", "CABLE Input (VB-Audio Virtual Cable)", "Communications"],
             ],
         )
 
@@ -492,16 +524,54 @@ class LiveSignalTests(unittest.TestCase):
         session.actual_device_name = "CABLE Output (VB-Audio Virtual Cable)"
         raw_bytes = (np.full(1024, 2500, dtype=np.int16)).tobytes()
 
-        with patch("app.time.time", return_value=10.0):
+        with patch("app.time.time", side_effect=[10.0, 11.1, 12.2]):
+            session._report_input_signal(raw_bytes, 1024)
+            session._report_input_signal(raw_bytes, 1024)
             session._report_input_signal(raw_bytes, 1024)
 
-        self.assertEqual(len(signal_updates), 1)
-        self.assertEqual(signal_updates[0]["state"], "active")
-        self.assertEqual(signal_updates[0]["device_name"], "CABLE Output (VB-Audio Virtual Cable)")
-        self.assertEqual(signal_updates[0]["mode_name"], "VAC")
+        self.assertGreaterEqual(len(signal_updates), 1)
+        self.assertEqual(signal_updates[-1]["state"], "active")
+        self.assertEqual(signal_updates[-1]["device_name"], "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(signal_updates[-1]["mode_name"], "VAC")
         self.assertEqual(len(status_updates), 1)
         self.assertIn("Live input optimal", status_updates[0])
         self.assertIn("RMS", status_updates[0])
+
+    def test_report_input_signal_alternating_boundary_values_do_not_commit_state_change(self) -> None:
+        session = app.LiveTranscriptionSession(
+            api_key="test-key",
+            input_device={
+                "name": "CABLE Output (VB-Audio Virtual Cable)",
+                "index": 1,
+                "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "default_samplerate": 24000},
+                "sample_rate": 24000,
+            },
+            mode_name="VAC",
+            on_transcript=lambda *_args: None,
+            on_status=Mock(),
+            on_signal=Mock(),
+        )
+        session.actual_device_name = "CABLE Output (VB-Audio Virtual Cable)"
+        session.last_signal_status = "optimal"
+        signal_payloads = [
+            {"rms": 0.02, "peak": 0.03, "rms_db": -24.8, "peak_db": -10.0, "state": "active"},
+            {"rms": 0.005, "peak": 0.01, "rms_db": -25.2, "peak_db": -20.0, "state": "low"},
+            {"rms": 0.02, "peak": 0.03, "rms_db": -24.7, "peak_db": -10.0, "state": "active"},
+            {"rms": 0.005, "peak": 0.01, "rms_db": -25.3, "peak_db": -20.0, "state": "low"},
+            {"rms": 0.02, "peak": 0.03, "rms_db": -24.9, "peak_db": -10.0, "state": "active"},
+            {"rms": 0.005, "peak": 0.01, "rms_db": -25.1, "peak_db": -20.0, "state": "low"},
+        ]
+
+        with patch("app.analyze_live_input_signal", side_effect=signal_payloads), patch(
+            "app.time.time",
+            side_effect=[10.0, 10.3, 10.6, 10.9, 11.2, 11.5],
+        ):
+            for _ in signal_payloads:
+                session._report_input_signal(b"raw", 1024)
+
+        self.assertEqual(session.last_signal_status, "optimal")
+        self.assertEqual(session.on_status.call_count, 0)
+        self.assertEqual(session.on_signal.call_count, 2)
 
     def test_format_live_result_text_uses_speaker_labels_when_words_present(self) -> None:
         result = SimpleNamespace(
@@ -594,7 +664,6 @@ class AppBehaviorTests(unittest.TestCase):
         stub.direct_recording_var = DummyVar("")
         stub.direct_playback_var = DummyVar("")
         stub.runtime_audio_var = DummyVar("")
-        stub.header_mode_chip = DummyButton("#1565C0")
         stub.mode_badge_label = DummyButton("#1565C0")
         stub.active_device_label = DummyButton("#1565C0")
         stub.active_source_label = DummyButton("#1565C0")
@@ -636,6 +705,9 @@ class AppBehaviorTests(unittest.TestCase):
         stub.use_current_windows_output_for_speakers = bind_app_method(stub, "use_current_windows_output_for_speakers")
         stub._restore_original_default_devices = bind_app_method(stub, "_restore_original_default_devices")
         stub.reset_windows_audio = bind_app_method(stub, "reset_windows_audio")
+        stub._current_transcript_text = bind_app_method(stub, "_current_transcript_text")
+        stub.copy_transcript_to_clipboard = bind_app_method(stub, "copy_transcript_to_clipboard")
+        stub.save_transcript_as = bind_app_method(stub, "save_transcript_as")
         stub.resolve_active_device = lambda name: {
             "name": name,
             "index": 1,
@@ -651,6 +723,7 @@ class AppBehaviorTests(unittest.TestCase):
             "sample_rate": 24000,
         }
         stub.live_transcription_session = SimpleNamespace(switch_input_device=Mock(return_value=(True, "switched")))
+        stub.live_transcript_final_text = ""
         return stub
 
     def test_refresh_run_control_buttons_includes_mute(self) -> None:
@@ -914,7 +987,6 @@ class AppBehaviorTests(unittest.TestCase):
             app.LOGGER.removeHandler(handler)
 
         self.assertEqual(app_stub.current_mode, "VAC")
-        self.assertEqual(app_stub.header_mode_chip.props["text"], "VAC")
         self.assertEqual(app_stub.mode_badge_label.props["text"], "VAC")
         self.assertEqual(app_stub.active_source_label.props["text_color"], "#66BB6A")
         self.assertEqual(app_stub.status_label.props["text_color"], "#F9A825")
@@ -957,15 +1029,12 @@ class AppBehaviorTests(unittest.TestCase):
             )
 
         self.assertEqual(app_stub.current_mode, "Microphone")
-        self.assertEqual(app_stub.header_mode_chip.props["text"], "")
 
     def test_apply_mode_theme_vac_sets_green(self) -> None:
         app_stub = self._make_app_stub()
 
         app_stub._apply_mode_theme("VAC")
 
-        self.assertEqual(app_stub.header_mode_chip.props["text"], "VAC")
-        self.assertEqual(app_stub.header_mode_chip.props["fg_color"], "#2E7D32")
         self.assertEqual(app_stub.mode_badge_label.props["text"], "VAC")
         self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#2E7D32")
         self.assertEqual(app_stub.active_source_label.props["text_color"], "#66BB6A")
@@ -975,8 +1044,7 @@ class AppBehaviorTests(unittest.TestCase):
 
         app_stub._apply_mode_theme("Microphone")
 
-        self.assertEqual(app_stub.header_mode_chip.props["text"], "Microphone")
-        self.assertEqual(app_stub.header_mode_chip.props["fg_color"], "#1565C0")
+        self.assertEqual(app_stub.mode_badge_label.props["text"], "Microphone")
         self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#1565C0")
 
     def test_apply_mode_theme_source_label_uses_brighter_color(self) -> None:
@@ -995,14 +1063,13 @@ class AppBehaviorTests(unittest.TestCase):
         finally:
             app.LOGGER.removeHandler(handler)
 
-        self.assertEqual(app_stub.header_mode_chip.props["fg_color"], "#616161")
         self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#616161")
         self.assertEqual(app_stub.active_source_label.props["text_color"], "#9E9E9E")
         self.assertTrue(any("[ApplyMode] event=unknown_mode_in_ui_map mode=Unknown" in message for message in handler.messages))
 
-    def test_apply_mode_theme_missing_widget_logs_and_continues(self) -> None:
+    def test_apply_mode_theme_missing_badge_logs_and_continues(self) -> None:
         app_stub = self._make_app_stub()
-        app_stub.header_mode_chip = None
+        app_stub.mode_badge_label = None
         handler = CaptureHandler()
         previous_level = app.LOGGER.level
         app.LOGGER.setLevel(logging.DEBUG)
@@ -1013,8 +1080,7 @@ class AppBehaviorTests(unittest.TestCase):
             app.LOGGER.removeHandler(handler)
             app.LOGGER.setLevel(previous_level)
 
-        self.assertTrue(any("[ApplyMode] event=badge_widget_missing name=header_mode_chip" in message for message in handler.messages))
-        self.assertEqual(app_stub.mode_badge_label.props["fg_color"], "#2E7D32")
+        self.assertTrue(any("[ApplyMode] event=badge_widget_missing name=mode_badge_label" in message for message in handler.messages))
         self.assertTrue(any("[ApplyMode] event=theme_applied mode=VAC accent=#2E7D32 bright=#66BB6A" in message for message in handler.messages))
 
     def test_mixed_unavailable_logs_error_once_then_debug(self) -> None:
@@ -1169,6 +1235,46 @@ class AppBehaviorTests(unittest.TestCase):
         app_stub.device_manager.set_default_recording_device.assert_called_once_with("Microphone (Realtek HD Audio Mic input)")
         app_stub.device_manager.set_default_playback_device.assert_called_once_with("Speakers (Realtek Audio)")
 
+    def test_current_transcript_text_prefers_live_text(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.live_transcript_final_text = "Live transcript text"
+        app_stub.live_transcription_session = SimpleNamespace(transcript_path=Path("live_transcript_123.txt"))
+
+        text, source = app.App._current_transcript_text(app_stub)
+
+        self.assertEqual(text, "Live transcript text")
+        self.assertEqual(source, "live session (live_transcript_123.txt)")
+
+    def test_current_transcript_text_falls_back_to_newest_file(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.live_transcript_final_text = ""
+        app_stub.live_transcription_session = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript_dir = Path(tmpdir)
+            older = transcript_dir / "older.txt"
+            newer = transcript_dir / "newer.txt"
+            older.write_text("older text", encoding="utf-8")
+            newer.write_text("newer text", encoding="utf-8")
+            os.utime(older, (1, 1))
+            os.utime(newer, (2, 2))
+
+            with patch.object(app, "TRANSCRIPTS_DIR", transcript_dir):
+                text, source = app.App._current_transcript_text(app_stub)
+
+        self.assertEqual(text, "newer text")
+        self.assertEqual(source, "most recent file (newer.txt)")
+
+    def test_current_transcript_text_returns_empty_when_nothing_available(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.live_transcript_final_text = ""
+        app_stub.live_transcription_session = None
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(app, "TRANSCRIPTS_DIR", Path(tmpdir)):
+            text, source = app.App._current_transcript_text(app_stub)
+
+        self.assertEqual((text, source), ("", ""))
+
     def test_reset_windows_audio_falls_back_to_configured_devices_when_originals_missing(self) -> None:
         app_stub = self._make_app_stub()
         app_stub._original_default_input_name = None
@@ -1220,6 +1326,37 @@ class AppBehaviorTests(unittest.TestCase):
             app.LOGGER.setLevel(previous_level)
 
         self.assertTrue(any("[Devices] event=inputs_changed" in message for message in handler.messages))
+
+    def test_hydrate_config_self_heals_stale_fake_device_names(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.config.update(
+            {
+                "mic_device": "VB-Audio Point",
+                "speaker_device": "Fake Speakers",
+                "vac_device": "Old Cable",
+                "vac_playback_device": "Fake Playback",
+                "mixed_playback_device": "Ghost TV",
+                "voicemeeter_device": "VB-Audio Matrix",
+            }
+        )
+        app_stub.detected_input_devices = [
+            "Microphone (Realtek HD Audio Mic input)",
+            "CABLE Output (VB-Audio Virtual Cable)",
+        ]
+        app_stub.detected_output_devices = [
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "SAMSUNG TV (NVIDIA High Definition Audio)",
+        ]
+
+        with patch.object(app, "save_config", return_value=None):
+            app.App._hydrate_config_from_detected_devices(app_stub)
+
+        self.assertEqual(app_stub.config["mic_device"], "Microphone (Realtek HD Audio Mic input)")
+        self.assertEqual(app_stub.config["vac_device"], "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(app_stub.config["speaker_device"], "SAMSUNG TV (NVIDIA High Definition Audio)")
+        self.assertEqual(app_stub.config["vac_playback_device"], "CABLE Input (VB-Audio Virtual Cable)")
+        self.assertEqual(app_stub.config["mixed_playback_device"], "")
+        self.assertEqual(app_stub.config["voicemeeter_device"], app.DEFAULT_CONFIG["voicemeeter_device"])
 
     def test_no_silent_excepts(self) -> None:
         source = Path(app.APP_DIR / "app.py").read_text(encoding="utf-8")

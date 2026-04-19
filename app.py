@@ -82,6 +82,7 @@ from meter_widget import AudioLevelMeter
 
 CONFIG_PATH = APP_DIR / "config.json"
 NIRCMD_PATH = APP_DIR / "nircmd.exe"
+SOUNDVOLUMEVIEW_PATH = APP_DIR / "SoundVolumeView.exe"
 TRANSCRIPTS_DIR = APP_DIR / "transcripts"
 LOGS_DIR = APP_DIR / "logs"
 LOG_PATH = LOGS_DIR / "virtual_audio.log"
@@ -1217,16 +1218,30 @@ class AudioDeviceManager:
         if not device_name.strip():
             raise ValueError("Device name is empty.")
 
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        if SOUNDVOLUMEVIEW_PATH.exists():
+            for role in ("Console", "Multimedia", "Communications"):
+                log_event("DeviceManager", event="set_default_device", backend="soundvolumeview", role=role, device=device_name)
+                subprocess.run(
+                    [str(SOUNDVOLUMEVIEW_PATH), "/SetDefault", device_name, role],
+                    check=True,
+                    capture_output=True,
+                    creationflags=creation_flags,
+                )
+            return
+
         if not NIRCMD_PATH.exists():
-            raise FileNotFoundError(f"Missing {NIRCMD_PATH.name} in {APP_DIR}.")
+            raise FileNotFoundError(
+                f"Missing both {SOUNDVOLUMEVIEW_PATH.name} and {NIRCMD_PATH.name} in {APP_DIR}."
+            )
 
         for role in ("0", "1", "2"):
-            log_event("DeviceManager", event="set_default_device", role=role, device=device_name)
+            log_event("DeviceManager", event="set_default_device", backend="nircmd", role=role, device=device_name)
             subprocess.run(
                 [str(NIRCMD_PATH), "setdefaultsounddevice", device_name, role],
                 check=True,
                 capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=creation_flags,
             )
 
     @classmethod
