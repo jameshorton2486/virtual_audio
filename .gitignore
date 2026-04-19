@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.snapshot
+*.bak
 
 .idea/
 .env
@@ -14,3 +16,6 @@ transcripts/
 
 compact-ui-screenshot.png
 compact-ui-window.png
+SoundVolumeView.exe
+app.py.current_snapshot
+data/*.json
