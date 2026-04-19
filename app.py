@@ -77,6 +77,10 @@ import customtkinter as ctk
 import numpy as np
 import sounddevice as sd
 
+from audio.auto_audio_engine import AutoAudioEngine
+from audio.engine import AudioEngine
+from audio.processor import AudioProcessor
+from audio.routing import RoutingManager
 from meter_widget import AudioLevelMeter
 
 
@@ -183,11 +187,12 @@ DEEPGRAM_BASE_CONFIG: Final[dict[str, Any]] = {
     "model": "nova-3",
     "diarize": True,
     "punctuate": True,
-    "smart_format": True,
-    "paragraphs": True,
+    "smart_format": False,
+    "paragraphs": False,
     "utterances": True,
     "filler_words": True,
-    "numerals": True,
+    "numerals": False,
+    "utt_split": 0.8,
 }
 
 QUALITY_COLORS = {
@@ -488,11 +493,11 @@ def get_file_deepgram_query_params() -> dict[str, str]:
 
 
 def get_deepgram_settings_message() -> str:
-    return "Deepgram Settings: Optimized (All Enhancements Enabled)"
+    return "Deepgram Settings: Court Transcript Profile"
 
 
 def get_deepgram_settings_detail() -> str:
-    return "Speaker detection, formatting, segmentation, and accuracy enhancements are always enabled."
+    return "Utterances and diarization stay on, while smart formatting and paragraph reshaping stay off for cleaner downstream transcript blocks."
 
 
 def _deepgram_value(node: Any, key: str, default: Any = None) -> Any:
@@ -540,11 +545,23 @@ def build_blocks_from_deepgram_utterances(utterances: list[Any]) -> list[dict[st
     blocks: list[dict[str, Any]] = []
     for utterance in utterances:
         words = list(_deepgram_value(utterance, "words", []) or [])
+        confidence_values = [
+            float(_deepgram_value(word, "confidence", 1.0) or 1.0)
+            for word in words
+            if _deepgram_value(word, "confidence", None) is not None
+        ]
         blocks.append(
             {
                 "speaker": _deepgram_value(utterance, "speaker"),
                 "start": float(_deepgram_value(utterance, "start", 0.0) or 0.0),
                 "end": float(_deepgram_value(utterance, "end", 0.0) or 0.0),
+                "confidence": float(_deepgram_value(utterance, "confidence", 0.0) or 0.0),
+                "speaker_confidence": (
+                    float(_deepgram_value(utterance, "speaker_confidence", 0.0) or 0.0)
+                    if _deepgram_value(utterance, "speaker_confidence", None) is not None
+                    else None
+                ),
+                "word_confidence_min": min(confidence_values) if confidence_values else None,
                 "text": _normalize_utterance_text(
                     _deepgram_value(utterance, "transcript")
                     or _deepgram_value(utterance, "text")
@@ -566,7 +583,7 @@ def build_blocks_from_deepgram_utterances(utterances: list[Any]) -> list[dict[st
 def merge_utterances(
     utterances: list[dict[str, Any]],
     gap_threshold_seconds: float = 1.2,
-    min_word_count: int = 3,
+    min_word_count: int = 2,
 ) -> list[dict[str, Any]]:
     if not utterances:
         return []
@@ -584,6 +601,14 @@ def merge_utterances(
             current["end"] = utterance.get("end", current.get("end", 0.0))
             current_words.extend(list(utterance.get("words", []) or []))
             current["text"] = _normalize_utterance_text(f"{current.get('text', '')} {utterance.get('text', '')}")
+            if utterance.get("confidence") is not None:
+                current["confidence"] = max(float(current.get("confidence", 0.0) or 0.0), float(utterance.get("confidence", 0.0) or 0.0))
+            current_min_conf = current.get("word_confidence_min")
+            utterance_min_conf = utterance.get("word_confidence_min")
+            if current_min_conf is None:
+                current["word_confidence_min"] = utterance_min_conf
+            elif utterance_min_conf is not None:
+                current["word_confidence_min"] = min(float(current_min_conf), float(utterance_min_conf))
             continue
 
         if len(current_words) >= min_word_count:
@@ -639,6 +664,23 @@ def prevent_micro_speaker_switch(blocks: list[dict[str, Any]]) -> list[dict[str,
     return stabilized
 
 
+def stabilize_speaker_blocks(blocks: list[dict[str, Any]], short_flip_max_words: int = 3) -> list[dict[str, Any]]:
+    if not blocks:
+        return []
+
+    stabilized = [dict(blocks[0])]
+    for block in blocks[1:]:
+        current = dict(block)
+        previous = stabilized[-1]
+        previous_speaker = previous.get("speaker")
+        current_speaker = current.get("speaker")
+        current_word_count = len(_normalize_utterance_text(current.get("text", "")).split())
+        if previous_speaker is not None and current_speaker != previous_speaker and current_word_count <= short_flip_max_words:
+            current["speaker"] = previous_speaker
+        stabilized.append(current)
+    return stabilized
+
+
 def detect_qa_patterns(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     detected: list[dict[str, Any]] = []
     for block in blocks:
@@ -650,6 +692,61 @@ def detect_qa_patterns(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             current["type"] = "Q"
         detected.append(current)
     return detected
+
+
+def enforce_qa_structure(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enforced: list[dict[str, Any]] = []
+    previous_type = ""
+    for block in blocks:
+        current = dict(block)
+        text = _normalize_utterance_text(current.get("text", ""))
+        if not text:
+            enforced.append(current)
+            continue
+        if text.endswith("?"):
+            current["type"] = "Q"
+        elif current.get("type") == "A":
+            current["type"] = "A"
+        elif previous_type in {"Q", "A"}:
+            current["type"] = "A"
+        previous_type = str(current.get("type", "") or "").upper()
+        enforced.append(current)
+    return enforced
+
+
+def flag_low_confidence_words(words: list[Any], threshold: float = 0.85) -> list[dict[str, Any]]:
+    flagged: list[dict[str, Any]] = []
+    for word in words:
+        confidence = _deepgram_value(word, "confidence", None)
+        if confidence is None:
+            continue
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            continue
+        if confidence_value >= threshold:
+            continue
+        flagged.append(
+            {
+                "word": str(_deepgram_value(word, "punctuated_word") or _deepgram_value(word, "word") or "").strip(),
+                "start": float(_deepgram_value(word, "start", 0.0) or 0.0),
+                "end": float(_deepgram_value(word, "end", 0.0) or 0.0),
+                "confidence": confidence_value,
+                "speaker": _deepgram_value(word, "speaker"),
+            }
+        )
+    return [item for item in flagged if item["word"]]
+
+
+def normalize_deepgram_blocks(utterances: list[Any]) -> list[dict[str, Any]]:
+    blocks = build_blocks_from_deepgram_utterances(utterances)
+    blocks = merge_utterances(blocks)
+    blocks = smooth_speakers(blocks)
+    blocks = prevent_micro_speaker_switch(blocks)
+    blocks = stabilize_speaker_blocks(blocks)
+    blocks = detect_qa_patterns(blocks)
+    blocks = enforce_qa_structure(blocks)
+    return blocks
 
 
 def format_utterance_blocks(blocks: list[dict[str, Any]]) -> str:
@@ -693,11 +790,7 @@ def format_deepgram_payload_text(payload: dict[str, Any]) -> str:
             return ""
         utterances = payload["results"].get("utterances", [])
         if utterances:
-            blocks = build_blocks_from_deepgram_utterances(utterances)
-            blocks = merge_utterances(blocks)
-            blocks = smooth_speakers(blocks)
-            blocks = prevent_micro_speaker_switch(blocks)
-            blocks = detect_qa_patterns(blocks)
+            blocks = normalize_deepgram_blocks(utterances)
             utterance_text = format_utterance_blocks(blocks)
             if utterance_text:
                 return utterance_text
@@ -714,11 +807,7 @@ def format_live_result_text(result: Any) -> str:
     try:
         utterances = _deepgram_value(result, "utterances", [])
         if utterances:
-            blocks = build_blocks_from_deepgram_utterances(utterances)
-            blocks = merge_utterances(blocks)
-            blocks = smooth_speakers(blocks)
-            blocks = prevent_micro_speaker_switch(blocks)
-            blocks = detect_qa_patterns(blocks)
+            blocks = normalize_deepgram_blocks(utterances)
             utterance_text = format_utterance_blocks(blocks)
             if utterance_text:
                 return utterance_text
@@ -782,6 +871,32 @@ def classify_speech_signal(rms_db: float, peak_db: float) -> tuple[str, str, str
     if rms_db > RMS_DB_OPTIMAL_MAX:
         return "too_loud", "Too loud — reduce input level", "#FB8C00"
     return "optimal", "Optimal speech level", "#43A047"
+
+
+class SignalStateTracker:
+    def __init__(self, max_history: int = 8, majority_ratio: float = 0.6):
+        self.max_history = max(3, int(max_history))
+        self.majority_ratio = max(0.5, min(1.0, float(majority_ratio)))
+        self.history: list[str] = []
+        self.current_state = ""
+
+    def update(self, state: str) -> tuple[str, bool]:
+        normalized = str(state or "no_signal").strip().lower() or "no_signal"
+        self.history.append(normalized)
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+
+        if not self.current_state:
+            self.current_state = normalized
+            return self.current_state, True
+
+        counts = {candidate: self.history.count(candidate) for candidate in set(self.history)}
+        candidate = max(counts, key=counts.get)
+        threshold = max(2, math.ceil(len(self.history) * self.majority_ratio))
+        if counts[candidate] >= threshold and candidate != self.current_state:
+            self.current_state = candidate
+            return self.current_state, True
+        return self.current_state, False
 
 
 def analyze_live_input_signal(raw_bytes: bytes) -> dict[str, Any] | None:
@@ -1549,32 +1664,30 @@ class LiveTranscriptionSession:
         self._live_events = None
         self._deepgram_client = None
         self._last_signal_emit_at = 0.0
-        self._pending_signal_status = ""
-        self._pending_signal_count = 0
+        self._signal_state_tracker = SignalStateTracker()
+        self._audio_processor = AudioProcessor()
 
     def _close_stream(self, stream) -> None:
-        try:
-            stream.stop()
-            stream.close()
-        except Exception as exc:
-            log_event("LiveSession", level="warning", event="stream_close_warning", device=self.actual_device_name, reason=str(exc))
+        AudioEngine(LOGGER).close_stream(
+            stream,
+            context="LiveSession",
+            device_name=self.actual_device_name,
+        )
 
     def _open_stream_for_device(self, device_index: int, capture_channels: int):
-        sd.check_input_settings(
-            device=device_index,
-            samplerate=self.sample_rate_hz,
-            channels=capture_channels,
+        engine = AudioEngine(
+            LOGGER,
+            sounddevice_module=sd,
+            input_stream_factory=self._input_stream_factory,
         )
-        stream = self._input_stream_factory(
+        return engine.start_input_stream(
+            device_index=device_index,
             samplerate=self.sample_rate_hz,
-            blocksize=1024,
-            device=device_index,
             channels=capture_channels,
-            dtype="float32",
             callback=self._audio_callback,
+            blocksize=1024,
+            dtype="float32",
         )
-        stream.start()
-        return stream
 
     def _configure_connection(self, connection) -> None:
         if self._live_events is None:
@@ -1835,8 +1948,7 @@ class LiveTranscriptionSession:
         self.running = True
         self._last_callback_at = time.monotonic()
         self._last_signal_emit_at = 0.0
-        self._pending_signal_status = ""
-        self._pending_signal_count = 0
+        self._signal_state_tracker = SignalStateTracker()
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.actual_device_name = normalize_audio_device_name(str(self.input_device_info.get("name", self.input_device_name)))
         self._start_background_threads()
@@ -2003,8 +2115,16 @@ class LiveTranscriptionSession:
         if status:
             log_event("LiveSession", level="warning", event="audio_callback_status", status=status)
             self.on_status(f"Audio stream status: {status}")
-        pcm_bytes = self._pcm16_bytes_from_input(indata)
-        self._report_input_signal(pcm_bytes, frames)
+        raw_pcm_bytes = self._pcm16_bytes_from_input(indata)
+        self._report_input_signal(raw_pcm_bytes, frames)
+        processed = self._audio_processor.process(indata)
+        if processed is None:
+            if indata is None:
+                pcm_bytes = raw_pcm_bytes
+            else:
+                return
+        else:
+            pcm_bytes = self._pcm16_bytes_from_samples(processed)
         try:
             self._pcm_queue.put_nowait(pcm_bytes)
         except queue.Full:
@@ -2029,7 +2149,10 @@ class LiveTranscriptionSession:
             samples = np.asarray([float(samples)], dtype=np.float32)
         samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
         samples = np.clip(samples, -1.0, 1.0)
-        pcm16 = (samples * 32767.0).astype(np.int16, copy=False)
+        return self._pcm16_bytes_from_samples(samples)
+
+    def _pcm16_bytes_from_samples(self, samples: np.ndarray) -> bytes:
+        pcm16 = (np.asarray(samples, dtype=np.float32) * 32767.0).astype(np.int16, copy=False)
         return pcm16.tobytes()
 
     def _on_open(self, client, open=None, **kwargs) -> None:
@@ -2122,34 +2245,31 @@ class LiveTranscriptionSession:
         rms = float(signal["rms"])
         peak = float(signal["peak"])
         state = str(signal["state"])
-        if speech_state != self.last_signal_status:
-            if speech_state == self._pending_signal_status:
-                self._pending_signal_count += 1
-            else:
-                self._pending_signal_status = speech_state
-                self._pending_signal_count = 1
-            if self._pending_signal_count >= 2:
-                log_event(
-                    "AudioSignal",
-                    event="state_change",
-                    device=self.actual_device_name,
-                    from_state=self.last_signal_status or "unknown",
-                    to=speech_state,
-                    rms=f"{rms:.5f}",
-                    peak=f"{peak:.5f}",
-                    rms_db=f"{rms_db:.1f}",
-                    peak_db=f"{peak_db:.1f}",
-                )
-                self.last_signal_status = speech_state
-                self._pending_signal_status = ""
-                self._pending_signal_count = 0
-                status_message = f"Live input {speech_state} on {self.actual_device_name} (RMS {rms_db:.1f} dB, Peak {peak_db:.1f} dB)"
-                if speech_state != "optimal":
-                    status_message = f"{feedback}. {status_message}"
-                self.on_status(status_message)
-        else:
-            self._pending_signal_status = ""
-            self._pending_signal_count = 0
+        if not self._signal_state_tracker.current_state and self.last_signal_status:
+            self._signal_state_tracker.current_state = self.last_signal_status
+        stable_state, state_changed = self._signal_state_tracker.update(speech_state)
+        if state_changed:
+            log_level = "debug" if stable_state == "no_signal" else "info"
+            log_event(
+                "AudioSignal",
+                level=log_level,
+                event="state_change",
+                device=self.actual_device_name,
+                from_state=self.last_signal_status or "unknown",
+                to=stable_state,
+                instantaneous_state=speech_state,
+                rms=f"{rms:.5f}",
+                peak=f"{peak:.5f}",
+                rms_db=f"{rms_db:.1f}",
+                peak_db=f"{peak_db:.1f}",
+            )
+            self.last_signal_status = stable_state
+            status_message = f"Live input {stable_state} on {self.actual_device_name} (RMS {rms_db:.1f} dB, Peak {peak_db:.1f} dB)"
+            if stable_state == "no_signal":
+                status_message = f"Temporary silence on {self.actual_device_name} (RMS {rms_db:.1f} dB, Peak {peak_db:.1f} dB)"
+            elif stable_state != "optimal":
+                status_message = f"{feedback}. {status_message}"
+            self.on_status(status_message)
         if now - self.last_signal_debug_at >= 2.0:
             self.last_signal_debug_at = now
             log_event(
@@ -2164,6 +2284,7 @@ class LiveTranscriptionSession:
                 frames=frames,
                 state=state,
                 speech_state=speech_state,
+                stable_state=stable_state,
             )
 
 
@@ -2202,13 +2323,16 @@ class App:
         self._pending_vac_test = False
         self._audio_switch_in_progress = False
         self._pending_mode_button: ModeName | None = None
+        self._pending_live_start_mode: ModeName | None = None
         self._best_mode_running = False
         self._latest_signal_state = "Unknown"
         self._resume_monitor_after_live = False
         self._last_detected_refresh_at = 0.0
+        self._resolved_input_name_cache: dict[tuple[str, str, tuple[str, ...]], str] = {}
         self._last_mixed_unavailable_reason: str | None = None
         self._slow_verification_count = 0
         self._slow_verification_advisory_logged = False
+        self.device_detector = AutoAudioEngine(logger=LOGGER)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -2526,7 +2650,7 @@ class App:
         self.btn_mic = ctk.CTkButton(
             mode_buttons,
             text="Microphone",
-            command=lambda: self.apply_audio_mode("Microphone"),
+            command=lambda: self.run_mode("Microphone"),
             height=40,
             font=("Arial", 10, "bold"),
             fg_color="#1565C0",
@@ -2537,7 +2661,7 @@ class App:
         self.btn_vac = ctk.CTkButton(
             mode_buttons,
             text="VAC",
-            command=lambda: self.apply_audio_mode("VAC"),
+            command=lambda: self.run_mode("VAC"),
             height=40,
             font=("Arial", 10, "bold"),
             fg_color="#2E7D32",
@@ -2548,7 +2672,7 @@ class App:
         self.btn_mix = ctk.CTkButton(
             mode_buttons,
             text="Mixed",
-            command=lambda: self.apply_audio_mode("Mixed"),
+            command=lambda: self.run_mode("Mixed"),
             height=40,
             font=("Arial", 10, "bold"),
             fg_color="#8E24AA",
@@ -3113,14 +3237,24 @@ class App:
         now = time.monotonic()
         if not force and (now - self._last_detected_refresh_at) < 0.2:
             return
-        new_inputs = list_input_devices()
-        new_outputs = list_output_devices()
+        engine = getattr(self, "device_detector", None) or AutoAudioEngine(logger=LOGGER)
+        try:
+            engine.refresh_devices()
+            new_inputs = engine.list_input_names()
+            new_outputs = engine.list_output_names()
+        except Exception as exc:
+            log_event("Devices", level="warning", event="auto_refresh_failed", reason=str(exc))
+            new_inputs = list_input_devices()
+            new_outputs = list_output_devices()
         if new_inputs != self.detected_input_devices:
             LOGGER.debug(
                 "[Devices] event=inputs_changed old_count=%d new_count=%d",
                 len(self.detected_input_devices),
                 len(new_inputs),
             )
+            cache = getattr(self, "_resolved_input_name_cache", None)
+            if cache is not None:
+                cache.clear()
         self.detected_input_devices = new_inputs
         self.detected_output_devices = new_outputs
         self._last_detected_refresh_at = now
@@ -3226,6 +3360,16 @@ class App:
 
     def _resolve_detected_input_name(self, requested_name: str, mode_name: ModeName, *, log_failure_level: str = "error") -> str:
         requested = requested_name.strip()
+        cache = getattr(self, "_resolved_input_name_cache", None)
+        if cache is None:
+            cache = {}
+            self._resolved_input_name_cache = cache
+        cache_key = (str(mode_name), requested, tuple(self.detected_input_devices))
+        if cache_key in cache:
+            resolved = cache[cache_key]
+            if mode_name == "Mixed" and resolved:
+                self._mark_mixed_available()
+            return resolved
         log_event("Resolver", mode=mode_name, requested=requested or "<empty>", candidates_count=len(self.detected_input_devices))
         if not requested:
             if mode_name == "Mixed":
@@ -3242,6 +3386,7 @@ class App:
             log_event("Resolver", mode=mode_name, requested=requested, resolved=requested, match_type="exact")
             if mode_name == "Mixed":
                 self._mark_mixed_available()
+            cache[cache_key] = requested
             return requested
 
         normalized_requested = normalize_audio_device_name(requested)
@@ -3253,12 +3398,14 @@ class App:
                 log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="normalized")
                 if mode_name == "Mixed":
                     self._mark_mixed_available()
+                cache[cache_key] = device
                 return device
             if mode_name != "Mixed" and normalized_requested and (
                 normalized_requested.lower() in normalized_device.lower()
                 or normalized_device.lower() in normalized_requested.lower()
             ):
                 log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="substring")
+                cache[cache_key] = device
                 return device
 
         if mode_name == "Mixed":
@@ -3266,6 +3413,7 @@ class App:
             if candidate in self.detected_input_devices and "voicemeeter" in normalize_audio_device_name(candidate).lower():
                 log_event("Resolver", mode=mode_name, requested=requested, resolved=candidate, match_type="voicemeeter_keyword")
                 self._mark_mixed_available()
+                cache[cache_key] = candidate
                 return candidate
 
         resolved_index, resolved_info = resolve_input_device(requested)
@@ -3278,11 +3426,13 @@ class App:
                     log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="resolved")
                     if mode_name == "Mixed":
                         self._mark_mixed_available()
+                    cache[cache_key] = device
                     return device
             if mode_name != "Mixed" or "voicemeeter" in resolved_name.lower():
                 log_event("Resolver", mode=mode_name, requested=requested, resolved=resolved_name, match_type="resolved_name")
                 if mode_name == "Mixed":
                     self._mark_mixed_available()
+                cache[cache_key] = resolved_name
                 return resolved_name
 
         if mode_name == "Mixed":
@@ -3402,24 +3552,49 @@ class App:
         current_mixed_playback = self.config.get("mixed_playback_device", "")
         current_mix = self.config.get("voicemeeter_device", "")
         output_devices = self.detected_output_devices
+        engine = getattr(self, "device_detector", None) or AutoAudioEngine(logger=LOGGER)
+        try:
+            engine.refresh_devices()
+        except Exception as exc:
+            log_event("Devices", level="warning", event="auto_hydrate_refresh_failed", reason=str(exc))
+            engine = None
+
+        def _match_detected_device(candidate_name: str, detected_names: list[str]) -> str:
+            normalized_candidate = normalize_audio_device_name(candidate_name)
+            for detected_name in detected_names:
+                if normalize_audio_device_name(detected_name) == normalized_candidate:
+                    return detected_name
+            return ""
+
+        best_mic_entry = engine.select_best_input_device("Microphone") if engine is not None else None
+        best_vac_input_entry = engine.select_best_input_device("VAC") if engine is not None else None
+        best_mixed_input_entry = engine.select_best_input_device("Mixed") if engine is not None else None
+        best_speaker_output_entry = engine.select_best_output_device("Microphone") if engine is not None else None
+        best_vac_output_entry = engine.select_best_output_device("VAC") if engine is not None else None
+
+        best_mic = _match_detected_device(best_mic_entry.name, devices) if best_mic_entry is not None else ""
+        best_vac_input = _match_detected_device(best_vac_input_entry.name, devices) if best_vac_input_entry is not None else ""
+        best_mixed_input = _match_detected_device(best_mixed_input_entry.name, devices) if best_mixed_input_entry is not None else ""
+        best_speaker_output = _match_detected_device(best_speaker_output_entry.name, output_devices) if best_speaker_output_entry is not None else ""
+        best_vac_output = _match_detected_device(best_vac_output_entry.name, output_devices) if best_vac_output_entry is not None else ""
 
         if current_mic not in devices or "microphone" not in current_mic.lower():
-            self.config["mic_device"] = infer_microphone_input_device(current_mic, devices)
+            self.config["mic_device"] = best_mic or infer_microphone_input_device(current_mic, devices)
 
         if current_vac not in devices or not all(token in current_vac.lower() for token in ("cable", "output")):
-            self.config["vac_device"] = infer_vac_recording_device(DEFAULT_CONFIG["vac_device"], devices)
+            self.config["vac_device"] = best_vac_input or infer_vac_recording_device(DEFAULT_CONFIG["vac_device"], devices)
 
         if current_speaker not in output_devices or not any(token in current_speaker.lower() for token in ("speaker", "headphone", "realtek")):
-            self.config["speaker_device"] = infer_speaker_output_device(current_speaker, output_devices)
+            self.config["speaker_device"] = best_speaker_output or infer_speaker_output_device(current_speaker, output_devices)
 
         if current_vac_playback not in output_devices or not all(token in current_vac_playback.lower() for token in ("cable", "input")):
-            self.config["vac_playback_device"] = infer_vac_playback_device(DEFAULT_CONFIG["vac_playback_device"], output_devices)
+            self.config["vac_playback_device"] = best_vac_output or infer_vac_playback_device(DEFAULT_CONFIG["vac_playback_device"], output_devices)
 
         if current_mixed_playback and current_mixed_playback not in output_devices:
             self.config["mixed_playback_device"] = ""
 
         if current_mix not in devices or "voicemeeter" not in current_mix.lower():
-            self.config["voicemeeter_device"] = infer_device(DEFAULT_CONFIG["voicemeeter_device"], devices, ["voicemeeter"])
+            self.config["voicemeeter_device"] = best_mixed_input or infer_device(DEFAULT_CONFIG["voicemeeter_device"], devices, ["voicemeeter"])
 
         save_config(self.config)
 
@@ -3681,6 +3856,21 @@ class App:
             "mixed": "Mixed",
         }
         self.apply_audio_mode(presets[preset_name])
+
+    def run_mode(self, mode_name: ModeName) -> None:
+        if self._audio_switch_in_progress:
+            self.status_var.set("Wait for the current audio device switch to finish.")
+            return
+        if self._transcription_running:
+            self.status_var.set("Wait for the current file transcription job to finish.")
+            return
+        if self._live_transcription_running or self._live_transcription_starting:
+            self._pending_live_start_mode = None
+            self.apply_audio_mode(mode_name)
+            return
+
+        self._pending_live_start_mode = mode_name
+        self.apply_audio_mode(mode_name)
 
     def open_config(self) -> None:
         self.tabview.set("Settings")
@@ -3965,6 +4155,34 @@ class App:
             return self.mix_var.get().strip() or "Not configured"
         return self.mic_var.get().strip() or "Not configured"
 
+    def _routing_fallback_order(self, mode_name: ModeName) -> list[ModeName]:
+        orders: dict[ModeName, list[ModeName]] = {
+            "VAC": ["Mixed", "Microphone"],
+            "Mixed": ["VAC", "Microphone"],
+            "Microphone": ["VAC", "Mixed"],
+        }
+        return orders.get(mode_name, ["VAC", "Mixed", "Microphone"])
+
+    def _select_working_live_input(self, mode_name: ModeName) -> tuple[ActiveAudioDevice | None, ModeName | None, dict[str, Any] | None]:
+        detector = getattr(self, "device_detector", None) or AutoAudioEngine(logger=LOGGER)
+        router = RoutingManager(
+            detector,
+            sample_resolved_input_signal,
+            logger=LOGGER,
+        )
+        selected_entry, selected_mode, signal = router.select_working_device(
+            self._routing_fallback_order(mode_name),
+            LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ,
+        )
+        if selected_entry is None or selected_mode is None:
+            return None, None, signal
+        try:
+            active_device = self.resolve_active_device(selected_entry.name)
+        except Exception as exc:
+            log_event("Routing", level="warning", event="fallback_resolve_failed", mode=selected_mode, device=selected_entry.name, reason=str(exc))
+            return None, None, signal
+        return active_device, selected_mode, signal
+
     def _refresh_live_transcription_labels(self) -> None:
         label = getattr(self, "live_transcription_device_label", None)
         if label is not None:
@@ -4209,26 +4427,50 @@ class App:
             return
 
         preflight_ok, failure_code, diagnostics = self._run_preflight(mode_name, active_device)
+        fallback_used = False
+        fallback_message = ""
         if not preflight_ok:
-            success = False
-            message = str(diagnostics.get("feedback", "")).strip() or self._silent_signal_message(mode_name, input_device_name)
-            session = None
-            try:
-                self.root.after(
-                    0,
-                    lambda: self._finish_start_live_transcription(
-                        success,
-                        message,
-                        session,
-                        failure_code=failure_code,
-                        mode_name=mode_name,
-                        device_name=input_device_name,
-                    ),
-                )
-            except Exception as exc:
-                log_event("App", level="warning", event="queue_live_start_failure_failed", reason=str(exc), failure_code=failure_code)
+            if failure_code in {"SIGNAL", "ROUTING"}:
+                fallback_device, fallback_mode, fallback_signal = self._select_working_live_input(mode_name)
+                if fallback_device is not None and fallback_mode is not None:
+                    fallback_used = True
+                    fallback_message = (
+                        f"Selected mode {mode_name} had no usable signal. "
+                        f"Falling back to {fallback_mode} on {fallback_device['name']}."
+                    )
+                    log_event(
+                        "Routing",
+                        event="fallback_selected",
+                        from_mode=mode_name,
+                        to_mode=fallback_mode,
+                        from_device=active_device["name"],
+                        to_device=fallback_device["name"],
+                    )
+                    active_device = fallback_device
+                    mode_name = fallback_mode
+                    input_device_name = active_device["name"]
+                    preflight_ok, failure_code, diagnostics = self._run_preflight(mode_name, active_device)
+
+            if not preflight_ok:
+                success = False
+                message = str(diagnostics.get("feedback", "")).strip() or self._silent_signal_message(mode_name, input_device_name)
+                session = None
+                try:
+                    self.root.after(
+                        0,
+                        lambda: self._finish_start_live_transcription(
+                            success,
+                            message,
+                            session,
+                            failure_code=failure_code,
+                            mode_name=mode_name,
+                            device_name=input_device_name,
+                        ),
+                    )
+                except Exception as exc:
+                    log_event("App", level="warning", event="queue_live_start_failure_failed", reason=str(exc), failure_code=failure_code)
+                    return
                 return
-            return
 
         session = LiveTranscriptionSession(
             api_key=api_key,
@@ -4245,9 +4487,11 @@ class App:
             return
         try:
             final_message = message
+            if fallback_used and fallback_message:
+                final_message = fallback_message
             feedback = str(diagnostics.get("feedback", "")).strip()
             if feedback and diagnostics.get("speech_state") != "optimal":
-                final_message = feedback
+                final_message = f"{final_message} {feedback}".strip()
             self.root.after(0, lambda: self._finish_start_live_transcription(success, final_message, session))
         except Exception as exc:
             log_event("App", level="warning", event="queue_live_start_success_failed", reason=str(exc))
@@ -4636,6 +4880,7 @@ class App:
             self._pending_mode_button = None
             self._refresh_run_control_buttons()
             if outcome == ModeSwitchOutcome.HARD_FAILURE or resolved_device is None:
+                self._pending_live_start_mode = None
                 self._pending_vac_test = False
                 self._refresh_runtime_audio_status()
                 if hasattr(self, "status_label") and self.status_label.winfo_exists():
@@ -4697,6 +4942,12 @@ class App:
             if self._pending_vac_test and mode_name == "VAC":
                 self._pending_vac_test = False
                 self._start_verified_vac_test()
+            if self._pending_live_start_mode == mode_name and not self._live_transcription_running and not self._live_transcription_starting:
+                self._pending_live_start_mode = None
+                try:
+                    self.root.after(0, self.start_live_transcription)
+                except Exception as exc:
+                    log_event("App", level="warning", event="queue_run_mode_start_failed", mode=mode_name, reason=str(exc))
             LOGGER.info(
                 "[ApplyMode] event=finish_complete mode=%s current_mode=%s active_device=%s header_chip=%s",
                 mode_name,

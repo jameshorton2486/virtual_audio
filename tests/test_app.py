@@ -14,6 +14,7 @@ from pathlib import Path
 
 import app
 import numpy as np
+from audio.auto_audio_engine import AutoAudioEngine
 
 
 class DummyVar:
@@ -85,6 +86,61 @@ def bind_app_method(obj, method_name: str):
 
 
 class DeviceHelpersTests(unittest.TestCase):
+    def test_auto_audio_engine_classifies_input_devices(self) -> None:
+        engine = AutoAudioEngine()
+        engine.devices = [
+            {"name": "Microphone (Realtek HD Audio Mic input)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "Stereo Mix", "max_input_channels": 1, "max_output_channels": 0},
+        ]
+
+        categories = engine.classify_input_devices()
+
+        self.assertEqual([entry.name for entry in categories["mic"]], ["Microphone (Realtek HD Audio Mic input)"])
+        self.assertEqual([entry.name for entry in categories["vac"]], ["CABLE Output (VB-Audio Virtual Cable)"])
+        self.assertEqual([entry.name for entry in categories["voicemeeter"]], ["VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)"])
+        self.assertEqual([entry.name for entry in categories["other"]], ["Stereo Mix"])
+
+    def test_auto_audio_engine_selects_best_device_by_mode(self) -> None:
+        engine = AutoAudioEngine()
+        engine.devices = [
+            {"name": "Microphone (Realtek HD Audio Mic input)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "Speakers (Realtek Audio)", "max_input_channels": 0, "max_output_channels": 2},
+            {"name": "CABLE Input (VB-Audio Virtual Cable)", "max_input_channels": 0, "max_output_channels": 2},
+        ]
+
+        self.assertEqual(engine.select_best_input_device("Microphone").name, "Microphone (Realtek HD Audio Mic input)")
+        self.assertEqual(engine.select_best_input_device("VAC").name, "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(engine.select_best_input_device("Mixed").name, "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)")
+        self.assertEqual(engine.select_best_output_device("Microphone").name, "Speakers (Realtek Audio)")
+        self.assertEqual(engine.select_best_output_device("VAC").name, "CABLE Input (VB-Audio Virtual Cable)")
+
+    def test_refresh_detected_devices_prefers_auto_audio_engine(self) -> None:
+        app_stub = SimpleNamespace(
+            detected_input_devices=[],
+            detected_output_devices=[],
+            _last_detected_refresh_at=0.0,
+        )
+
+        fake_devices = [
+            {"name": "Microphone (Realtek HD Audio Mic input)", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "Speakers (Realtek Audio)", "max_input_channels": 0, "max_output_channels": 2},
+        ]
+
+        with patch("app.time.monotonic", return_value=1.0), patch("app.AutoAudioEngine.refresh_devices", autospec=True) as refresh_mock:
+            def _refresh(engine_self):
+                engine_self.devices = fake_devices
+                return fake_devices
+
+            refresh_mock.side_effect = _refresh
+            app.App._refresh_detected_devices(app_stub, force=True)
+
+        self.assertEqual(app_stub.detected_input_devices, ["Microphone (Realtek HD Audio Mic input)"])
+        self.assertEqual(app_stub.detected_output_devices, ["Speakers (Realtek Audio)"])
+
     def test_extract_transcript_text_returns_primary_transcript(self) -> None:
         payload = {
             "results": {
@@ -189,6 +245,86 @@ class DeviceHelpersTests(unittest.TestCase):
 
         result = app.prevent_micro_speaker_switch(blocks)
 
+        self.assertEqual(result[1]["speaker"], 0)
+
+    def test_stabilize_speaker_blocks_reverts_short_flip(self) -> None:
+        blocks = [
+            {"speaker": 0, "text": "Please state your full legal name."},
+            {"speaker": 1, "text": "Yes sir."},
+            {"speaker": 0, "text": "Where were you employed then?"},
+        ]
+
+        result = app.stabilize_speaker_blocks(blocks)
+
+        self.assertEqual(result[1]["speaker"], 0)
+
+    def test_enforce_qa_structure_marks_following_answer_after_question(self) -> None:
+        blocks = [
+            {"speaker": 0, "text": "What time did you arrive?"},
+            {"speaker": 1, "text": "Around 8 a.m."},
+            {"speaker": 1, "text": "And then I waited."},
+        ]
+
+        result = app.enforce_qa_structure(blocks)
+
+        self.assertEqual(result[0]["type"], "Q")
+        self.assertEqual(result[1]["type"], "A")
+        self.assertEqual(result[2]["type"], "A")
+
+    def test_flag_low_confidence_words_returns_only_low_confidence_items(self) -> None:
+        words = [
+            {"word": "hello", "start": 0.0, "end": 0.2, "confidence": 0.95, "speaker": 0},
+            {"word": "their", "start": 0.3, "end": 0.5, "confidence": 0.62, "speaker": 1},
+        ]
+
+        result = app.flag_low_confidence_words(words, threshold=0.85)
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "word": "their",
+                    "start": 0.3,
+                    "end": 0.5,
+                    "confidence": 0.62,
+                    "speaker": 1,
+                }
+            ],
+        )
+
+    def test_normalize_deepgram_blocks_applies_full_alignment_pipeline(self) -> None:
+        utterances = [
+            {
+                "speaker": 0,
+                "start": 0.0,
+                "end": 0.5,
+                "transcript": "What did you say?",
+                "confidence": 0.9,
+                "words": [{"word": "What", "confidence": 0.9}, {"word": "say", "confidence": 0.88}],
+            },
+            {
+                "speaker": 1,
+                "start": 0.7,
+                "end": 1.0,
+                "transcript": "Yes.",
+                "confidence": 0.92,
+                "words": [{"word": "Yes", "confidence": 0.92}],
+            },
+            {
+                "speaker": 1,
+                "start": 1.1,
+                "end": 1.5,
+                "transcript": "I was there.",
+                "confidence": 0.93,
+                "words": [{"word": "I", "confidence": 0.93}, {"word": "there", "confidence": 0.84}],
+            },
+        ]
+
+        result = app.normalize_deepgram_blocks(utterances)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["type"], "Q")
+        self.assertEqual(result[1]["type"], "A")
         self.assertEqual(result[1]["speaker"], 0)
 
     def test_build_transcript_output_paths_uses_transcripts_folder(self) -> None:
@@ -636,11 +772,14 @@ class AppBehaviorTests(unittest.TestCase):
         stub.is_muted = False
         stub._audio_switch_in_progress = False
         stub._pending_mode_button = None
+        stub._pending_live_start_mode = None
         stub._pending_vac_test = False
         stub._closing = False
+        stub._transcription_running = False
         stub._live_transcription_running = False
         stub._live_transcription_starting = False
         stub._last_detected_refresh_at = 0.0
+        stub._resolved_input_name_cache = {}
         stub._last_mixed_unavailable_reason = None
         stub._slow_verification_count = 0
         stub._slow_verification_advisory_logged = False
@@ -708,6 +847,7 @@ class AppBehaviorTests(unittest.TestCase):
         stub._current_transcript_text = bind_app_method(stub, "_current_transcript_text")
         stub.copy_transcript_to_clipboard = bind_app_method(stub, "copy_transcript_to_clipboard")
         stub.save_transcript_as = bind_app_method(stub, "save_transcript_as")
+        stub.run_mode = bind_app_method(stub, "run_mode")
         stub.resolve_active_device = lambda name: {
             "name": name,
             "index": 1,
@@ -724,6 +864,7 @@ class AppBehaviorTests(unittest.TestCase):
         }
         stub.live_transcription_session = SimpleNamespace(switch_input_device=Mock(return_value=(True, "switched")))
         stub.live_transcript_final_text = ""
+        stub.start_live_transcription = Mock()
         return stub
 
     def test_refresh_run_control_buttons_includes_mute(self) -> None:
@@ -734,6 +875,25 @@ class AppBehaviorTests(unittest.TestCase):
 
         self.assertEqual(app_stub.mute_button.props["text"], "Muted — Click to Unmute")
         self.assertEqual(app_stub.mute_button.props["border_width"], 2)
+
+    def test_run_mode_queues_live_start_after_apply(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.apply_audio_mode = Mock()
+
+        app.App.run_mode(app_stub, "VAC")
+
+        self.assertEqual(app_stub._pending_live_start_mode, "VAC")
+        app_stub.apply_audio_mode.assert_called_once_with("VAC")
+
+    def test_run_mode_hot_switches_without_queue_when_live_running(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._live_transcription_running = True
+        app_stub.apply_audio_mode = Mock()
+
+        app.App.run_mode(app_stub, "Mixed")
+
+        self.assertIsNone(app_stub._pending_live_start_mode)
+        app_stub.apply_audio_mode.assert_called_once_with("Mixed")
 
     def test_mixed_mode_requires_voicemeeter_keyword(self) -> None:
         app_stub = self._make_app_stub()
@@ -751,6 +911,21 @@ class AppBehaviorTests(unittest.TestCase):
             app.LOGGER.removeHandler(handler)
 
         self.assertTrue(any(message.startswith("[Failure: ROUTING]") for message in handler.messages))
+
+    def test_resolve_detected_input_name_uses_cache_for_repeated_exact_match(self) -> None:
+        app_stub = self._make_app_stub()
+        handler = CaptureHandler()
+        app.LOGGER.addHandler(handler)
+        try:
+            first = app_stub._resolve_detected_input_name("CABLE Output (VB-Audio Virtual Cable)", "VAC")
+            second = app_stub._resolve_detected_input_name("CABLE Output (VB-Audio Virtual Cable)", "VAC")
+        finally:
+            app.LOGGER.removeHandler(handler)
+
+        self.assertEqual(first, "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(second, "CABLE Output (VB-Audio Virtual Cable)")
+        self.assertEqual(sum("match_type=exact" in message for message in handler.messages), 1)
+        self.assertEqual(sum(message.startswith("[Resolver]") and "candidates_count=" in message for message in handler.messages), 1)
 
     def test_preflight_emits_all_steps(self) -> None:
         app_stub = self._make_app_stub()
@@ -990,7 +1165,87 @@ class AppBehaviorTests(unittest.TestCase):
         self.assertEqual(app_stub.mode_badge_label.props["text"], "VAC")
         self.assertEqual(app_stub.active_source_label.props["text_color"], "#66BB6A")
         self.assertEqual(app_stub.status_label.props["text_color"], "#F9A825")
-        self.assertTrue(any("[ApplyMode] event=finish_success_with_warning mode=VAC" in message for message in handler.messages))
+
+    def test_finish_apply_audio_mode_starts_live_when_run_mode_pending(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._pending_live_start_mode = "VAC"
+
+        with patch.object(app, "save_config", return_value=None):
+            app_stub._finish_apply_audio_mode(
+                app.ModeSwitchOutcome.SUCCESS,
+                "VAC",
+                {
+                    "name": "CABLE Output (VB-Audio Virtual Cable)",
+                    "index": 1,
+                    "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1},
+                    "sample_rate": 24000,
+                },
+                "CABLE Input (VB-Audio Virtual Cable)",
+                "ok",
+            )
+
+        self.assertIsNone(app_stub._pending_live_start_mode)
+        app_stub.start_live_transcription.assert_called_once()
+
+    def test_finish_apply_audio_mode_clears_pending_live_start_on_failure(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._pending_live_start_mode = "VAC"
+
+        app_stub._finish_apply_audio_mode(
+            app.ModeSwitchOutcome.HARD_FAILURE,
+            "VAC",
+            None,
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "failed",
+        )
+
+        self.assertIsNone(app_stub._pending_live_start_mode)
+        app_stub.start_live_transcription.assert_not_called()
+
+    def test_start_live_transcription_worker_falls_back_to_microphone_after_vac_signal_failure(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub._select_working_live_input = Mock(
+            return_value=(
+                {
+                    "name": "Microphone (Realtek HD Audio Mic input)",
+                    "index": 0,
+                    "info": {"name": "Microphone (Realtek HD Audio Mic input)", "max_input_channels": 1},
+                    "sample_rate": 24000,
+                },
+                "Microphone",
+                {"speech_state": "optimal", "feedback": "Optimal speech level"},
+            )
+        )
+        app_stub._finish_start_live_transcription = Mock()
+        app_stub.verify_active_device = Mock(return_value=True)
+        preflight_results = [
+            (False, "SIGNAL", {"feedback": "VAC silent", "speech_state": "no_signal"}),
+            (True, "", {"feedback": "Optimal speech level", "speech_state": "optimal"}),
+        ]
+        app_stub._run_preflight = Mock(side_effect=preflight_results)
+
+        started_session = Mock()
+        started_session.start.return_value = (True, "Deepgram live connection opened.")
+
+        with patch("app.LiveTranscriptionSession", return_value=started_session):
+            app.App._start_live_transcription_worker(
+                app_stub,
+                "test-key",
+                {
+                    "name": "CABLE Output (VB-Audio Virtual Cable)",
+                    "index": 1,
+                    "info": {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 1},
+                    "sample_rate": 24000,
+                },
+                "VAC",
+            )
+
+        app_stub._select_working_live_input.assert_called_once_with("VAC")
+        self.assertEqual(app_stub._run_preflight.call_args_list[1].args[0], "Microphone")
+        self.assertEqual(started_session.start.call_count, 1)
+        finish_args = app_stub._finish_start_live_transcription.call_args.args
+        self.assertTrue(finish_args[0])
+        self.assertIn("Falling back to Microphone", finish_args[1])
 
     def test_finish_apply_audio_mode_sets_status_color_on_success(self) -> None:
         app_stub = self._make_app_stub()
