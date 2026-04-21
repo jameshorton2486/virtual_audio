@@ -1173,6 +1173,7 @@ class AppBehaviorTests(unittest.TestCase):
         stub._slow_verification_count = 0
         stub._slow_verification_advisory_logged = False
         stub._latest_signal_state = "Unknown"
+        stub.audio_state = app.AudioState()
         stub.detected_input_devices = [
             "Microphone (Realtek HD Audio Mic input)",
             "CABLE Output (VB-Audio Virtual Cable)",
@@ -1198,6 +1199,7 @@ class AppBehaviorTests(unittest.TestCase):
         stub.debug_queue_var = DummyVar("Queue: -")
         stub.debug_watchdog_var = DummyVar("Audio: OK")
         stub.debug_routing_var = DummyVar("Routing: -")
+        stub.input_truth_var = DummyVar("Input truth scan pending...")
         stub.mode_badge_label = DummyButton("#1565C0")
         stub.active_device_label = DummyButton("#1565C0")
         stub.active_source_label = DummyButton("#1565C0")
@@ -1240,6 +1242,9 @@ class AppBehaviorTests(unittest.TestCase):
         stub._finish_apply_audio_mode = bind_app_method(stub, "_finish_apply_audio_mode")
         stub._reconcile_startup_mode = bind_app_method(stub, "_reconcile_startup_mode")
         stub._refresh_detected_devices = bind_app_method(stub, "_refresh_detected_devices")
+        stub._lock_active_input_device = bind_app_method(stub, "_lock_active_input_device")
+        stub._clear_active_input_device_lock = bind_app_method(stub, "_clear_active_input_device_lock")
+        stub._format_input_truth_entry = bind_app_method(stub, "_format_input_truth_entry")
         stub._active_source_summary = bind_app_method(stub, "_active_source_summary")
         stub._active_device_matches_mode = bind_app_method(stub, "_active_device_matches_mode")
         stub._apply_mode_theme = bind_app_method(stub, "_apply_mode_theme")
@@ -1775,6 +1780,28 @@ class AppBehaviorTests(unittest.TestCase):
             )
 
         self.assertEqual(app_stub.status_label.props["text_color"], "#66BB6A")
+
+    def test_lock_active_input_device_updates_audio_state(self) -> None:
+        app_stub = self._make_app_stub()
+        device = {
+            "name": "Microphone (Razer Seiren V3 Mini)",
+            "index": 3,
+            "info": {"name": "Microphone (Razer Seiren V3 Mini)", "max_input_channels": 1},
+            "sample_rate": 24000,
+        }
+
+        app_stub._lock_active_input_device(device)
+
+        self.assertTrue(app_stub.audio_state.locked)
+        self.assertEqual(app_stub.audio_state.selected_device_name, "Microphone (Razer Seiren V3 Mini)")
+        self.assertEqual(app_stub.audio_state.resolved_device_index, 3)
+
+    def test_format_input_truth_entry_marks_no_signal(self) -> None:
+        app_stub = self._make_app_stub()
+
+        result = app_stub._format_input_truth_entry("Microphone (Realtek HD Audio Mic input)", -100.0)
+
+        self.assertIn("NO SIGNAL", result)
 
     def test_finish_apply_audio_mode_does_not_repaint_on_hard_failure(self) -> None:
         app_stub = self._make_app_stub()

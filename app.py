@@ -159,6 +159,13 @@ class ActiveAudioDevice(TypedDict):
     sample_rate: int
 
 
+class AudioState:
+    def __init__(self) -> None:
+        self.selected_device_name: str | None = None
+        self.resolved_device_index: int | None = None
+        self.locked = False
+
+
 class DeviceVerificationResult(str, Enum):
     CONFIRMED = "confirmed"
     EVENTUALLY_CONFIRMED = "eventually_confirmed"
@@ -1464,6 +1471,24 @@ def resolve_input_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
     if match is None:
         return None, None
     return match[0], match[1]
+
+
+def resolve_input_device_exact(name: str) -> tuple[int | None, dict[str, Any] | None]:
+    target = normalize_audio_device_name(name)
+    try:
+        devices = sd.query_devices()
+    except Exception as exc:
+        log_event("Resolver", level="warning", event="query_input_devices_failed", requested=name, reason=str(exc))
+        return None, None
+
+    for index, device in enumerate(devices):
+        if int(device.get("max_input_channels", 0)) <= 0:
+            continue
+        raw_name = str(device.get("name", "")).strip()
+        normalized = normalize_audio_device_name(raw_name)
+        if normalized == target:
+            return index, device
+    return None, None
 
 
 def resolve_output_device(name: str) -> tuple[int | None, dict[str, Any] | None]:
@@ -2882,6 +2907,7 @@ class App:
         self.device_manager = AudioDeviceManager()
         self.current_mode: ModeName = mode_key_to_name(self.config["active_mode"])
         self.active_audio_device: ActiveAudioDevice | None = None
+        self.audio_state = AudioState()
         self.is_muted = False
         self.settings_window: ctk.CTkToplevel | None = None
         self.setup_notes_label = None
@@ -2940,6 +2966,7 @@ class App:
         self.debug_queue_var = ctk.StringVar(value="Queue: -")
         self.debug_watchdog_var = ctk.StringVar(value="Audio: OK")
         self.debug_routing_var = ctk.StringVar(value="Routing: -")
+        self.input_truth_var = ctk.StringVar(value="Input truth scan pending...")
         self.safe_mode_var = ctk.BooleanVar(value=True)
         self.shortcuts_var = ctk.StringVar(
             value="Shortcuts: Ctrl+1 Monitor | Ctrl+2 Routing | Ctrl+3 Transcribe | Ctrl+4 Settings | Ctrl+M Mute | Ctrl+Shift+1/2/3 Modes | F5 Refresh"
@@ -2975,9 +3002,11 @@ class App:
         self._capture_launch_audio_defaults()
         try:
             self.active_audio_device = self.resolve_active_device(self._current_live_input_device_name())
+            self._lock_active_input_device(self.active_audio_device)
         except Exception as exc:
             log_event("Startup", level="warning", event="initial_active_device_unresolved", mode=self.current_mode, reason=str(exc))
             self.active_audio_device = None
+            self._clear_active_input_device_lock()
         self.monitor = AudioQualityMonitor(
             sample_rate_hz=int(self.config["sample_rate_hz"]),
             interval_seconds=float(self.config["quality_check_interval_seconds"]),
@@ -2992,6 +3021,7 @@ class App:
         self._refresh_mode_hint()
         self._refresh_detection_summary()
         self._refresh_runtime_audio_status()
+        self._queue_input_truth_refresh()
 
         if self.wer_enabled_var.get():
             self.monitor.start()
@@ -3202,7 +3232,7 @@ class App:
 
         self.active_device_label = ctk.CTkLabel(
             mode_text_frame,
-            text="Active Device: Detecting...",
+            text="ACTIVE INPUT: Detecting...",
             text_color="#8AB4F8",
             font=("Arial", 10, "bold"),
             anchor="w",
@@ -3718,14 +3748,26 @@ class App:
         )
         self.mix_validation_label.pack(fill="x", padx=14, pady=(0, 6))
 
+        self.input_truth_label = ctk.CTkLabel(
+            settings_frame,
+            textvariable=self.input_truth_var,
+            font=("Consolas", 9),
+            text_color="#C6C6C6",
+            wraplength=760,
+            justify="left",
+            anchor="w",
+        )
+        self.input_truth_label.pack(fill="x", padx=14, pady=(0, 10))
+
         actions = ctk.CTkFrame(settings_frame, fg_color="transparent")
         actions.pack(fill="x", padx=12, pady=(10, 12))
-        for column in range(3):
+        for column in range(4):
             actions.grid_columnconfigure(column, weight=1)
 
         ctk.CTkButton(actions, text="Refresh Devices", command=self.refresh_detected_devices, height=34).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ctk.CTkButton(actions, text="Open config.json", command=self.open_config_file, height=34).grid(row=0, column=1, sticky="ew", padx=6)
-        ctk.CTkButton(actions, text="Save Settings", command=self.save_settings, height=34).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+        ctk.CTkButton(actions, text="Refresh Signal Preview", command=self._queue_input_truth_refresh, height=34).grid(row=0, column=2, sticky="ew", padx=6)
+        ctk.CTkButton(actions, text="Save Settings", command=self.save_settings, height=34).grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
         help_frame = ctk.CTkFrame(self.settings_tab)
         help_frame.pack(fill="x", padx=8, pady=(0, 12))
@@ -4027,6 +4069,90 @@ class App:
         self.detected_output_devices = new_outputs
         self._last_detected_refresh_at = now
 
+    def _clear_active_input_device_lock(self) -> None:
+        state = getattr(self, "audio_state", None)
+        if state is None:
+            return
+        state.selected_device_name = None
+        state.resolved_device_index = None
+        state.locked = False
+
+    def _lock_active_input_device(self, active_device: ActiveAudioDevice | None) -> None:
+        state = getattr(self, "audio_state", None)
+        if state is None:
+            return
+        if active_device is None:
+            self._clear_active_input_device_lock()
+            return
+        state.selected_device_name = normalize_audio_device_name(active_device["name"])
+        state.resolved_device_index = int(active_device["index"])
+        state.locked = True
+        log_event(
+            "AUDIO",
+            event="active_input_locked",
+            device=state.selected_device_name,
+            index=state.resolved_device_index,
+        )
+
+    def _format_input_truth_entry(self, device_name: str, rms_db: float | None) -> str:
+        if rms_db is None:
+            return f"{device_name} -> unavailable ?"
+        if rms_db < -80.0:
+            status = "NO SIGNAL"
+        elif rms_db > -3.0:
+            status = "CLIPPING"
+        else:
+            status = "OK"
+        return f"{device_name} -> {rms_db:.1f} dB [{status}]"
+
+    def _sample_input_truth_db(self, device_index: int, device_name: str, *, duration_seconds: float = 0.2) -> float | None:
+        try:
+            signal = sample_resolved_input_signal(
+                device_index,
+                LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ,
+                device_name,
+                duration_seconds=duration_seconds,
+            )
+        except Exception as exc:
+            log_event("SignalPreview", level="warning", event="sample_failed", device=device_name, index=device_index, reason=str(exc))
+            return None
+        if signal is None:
+            return None
+        return float(signal.get("rms_db", linear_to_db(float(signal.get("rms", 0.0)))))
+
+    def _apply_input_truth_snapshot(self, rows: list[str]) -> None:
+        text = "Input truth:\n" + ("\n".join(rows) if rows else "No input devices detected.")
+        self.input_truth_var.set(text)
+
+    def _queue_input_truth_refresh(self) -> None:
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        self.input_truth_var.set("Input truth: scanning live signal across detected inputs...")
+
+        def _worker() -> None:
+            rows: list[str] = []
+            try:
+                devices = sd.query_devices()
+            except Exception as exc:
+                rows = [f"Unable to enumerate input devices: {exc}"]
+            else:
+                for index, device in enumerate(devices):
+                    if int(device.get("max_input_channels", 0)) <= 0:
+                        continue
+                    device_name = normalize_audio_device_name(str(device.get("name", f"Input {index}")))
+                    rms_db = self._sample_input_truth_db(index, device_name)
+                    rows.append(self._format_input_truth_entry(device_name, rms_db))
+
+            if self._closing:
+                return
+            try:
+                root.after(0, lambda: self._apply_input_truth_snapshot(rows))
+            except Exception as exc:
+                log_event("SignalPreview", level="warning", event="queue_refresh_failed", reason=str(exc))
+
+        threading.Thread(target=_worker, daemon=True, name="input-truth-scan").start()
+
     def _active_source_summary(self) -> tuple[str, str]:
         if self.active_audio_device is None:
             return "⚠️ Source: None — Click a mode to begin.", "#9E9E9E"
@@ -4059,9 +4185,11 @@ class App:
             save_config(self.config)
             try:
                 self.active_audio_device = self.resolve_active_device(self._current_live_input_device_name())
+                self._lock_active_input_device(self.active_audio_device)
             except Exception as exc:
                 log_event("Startup", level="warning", event="resolve_fallback_failed", mode=fallback_mode, reason=str(exc))
                 self.active_audio_device = None
+                self._clear_active_input_device_lock()
             if reason:
                 self.status_var.set(reason)
                 self.debug_routing_var.set(f"Routing: Mixed | UNAVAILABLE\nReason: {reason}")
@@ -4084,7 +4212,11 @@ class App:
         self.debug_device_var.set(f"Devices: input={input_name} | output={output_name}")
         active_device_label = getattr(self, "active_device_label", None)
         if active_device_label is not None and active_device_label.winfo_exists():
-            active_device_label.configure(text=f"Active Device: {input_name}")
+            state = getattr(self, "audio_state", None)
+            if state is not None and state.locked and state.selected_device_name:
+                active_device_label.configure(text=f"ACTIVE INPUT: {state.selected_device_name} (locked #{state.resolved_device_index})")
+            else:
+                active_device_label.configure(text=f"ACTIVE INPUT: {input_name} (unlocked)")
         signal_label = getattr(self, "signal_label", None)
         if signal_label is not None and signal_label.winfo_exists():
             signal_label.configure(text=f"Signal: {self._latest_signal_state}")
@@ -4419,6 +4551,7 @@ class App:
         self._refresh_detection_summary()
         self._refresh_mode_hint()
         self._refresh_runtime_audio_status()
+        self._queue_input_truth_refresh()
         self.status_var.set("Refreshed detected Windows recording and playback devices.")
 
     def _normalize_direct_device_selection(self, current_value: str, devices: list[str]) -> str:
@@ -4727,7 +4860,7 @@ class App:
         normalized_name = normalize_audio_device_name(device_name)
         if normalized_name == NULL_INPUT_DEVICE_NAME:
             return build_silence_input_device(int(self.config["sample_rate_hz"]))
-        device_index, device_info = resolve_input_device(device_name)
+        device_index, device_info = resolve_input_device_exact(device_name)
         if device_index is None or device_info is None:
             raise RuntimeError(f"Failed to resolve device: {device_name}")
 
@@ -4745,6 +4878,9 @@ class App:
     def verify_active_device(self) -> bool:
         if self.active_audio_device is None:
             return False
+        state = getattr(self, "audio_state", None)
+        if state is not None and state.locked and state.resolved_device_index is not None:
+            return int(self.active_audio_device["index"]) == int(state.resolved_device_index)
         current_index, _ = resolve_input_device(self.active_audio_device["name"])
         return current_index == self.active_audio_device["index"]
 
@@ -5826,6 +5962,7 @@ class App:
                 return
 
             self.active_audio_device = resolved_device
+            self._lock_active_input_device(resolved_device)
             if not self.verify_active_device():
                 self._pending_vac_test = False
                 self._refresh_runtime_audio_status()
@@ -5848,9 +5985,10 @@ class App:
             save_config(self.config)
             self.mode_var.set(mode_name)
             self.active_audio_device = resolved_device
+            self._lock_active_input_device(resolved_device)
             self.direct_recording_var.set(resolved_device["name"])
             self.direct_playback_var.set(playback_target)
-            self.active_device_label.configure(text=f"Active Device: {resolved_device['name']}")
+            self.active_device_label.configure(text=f"ACTIVE INPUT: {resolved_device['name']}")
             self._apply_mode_theme(mode_name)
             self._refresh_run_control_buttons()
             self._refresh_runtime_audio_status()
@@ -5919,13 +6057,14 @@ class App:
                 return
 
             self.active_audio_device = resolved_device
+            self._lock_active_input_device(resolved_device)
             self.current_mode = mode_name
             self.config["last_mode"] = mode_name
             save_config(self.config)
             self.mode_var.set(mode_name)
             self.direct_recording_var.set(resolved_device["name"])
             self.direct_playback_var.set(playback_target)
-            self.active_device_label.configure(text=f"Active Device: {resolved_device['name']}")
+            self.active_device_label.configure(text=f"ACTIVE INPUT: {resolved_device['name']}")
             self._apply_mode_theme(mode_name)
             self._refresh_run_control_buttons()
             self._refresh_runtime_audio_status(signal_state="Active")
