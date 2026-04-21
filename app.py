@@ -106,6 +106,7 @@ PREFLIGHT_SIGNAL_THRESHOLD_RMS = 0.001
 DEVICE_VERIFY_INITIAL_TIMEOUT_SECONDS = 1.5
 DEVICE_VERIFY_EXTENDED_TIMEOUT_SECONDS = 5.0
 RMS_DB_SILENCE_FLOOR = -45.0
+PREFLIGHT_MIN_SIGNAL_DB = -80.0
 RMS_DB_TOO_QUIET = -25.0
 RMS_DB_OPTIMAL_MAX = -12.0
 PEAK_DB_CLIP_WARNING = -3.0
@@ -4171,22 +4172,6 @@ class App:
                     self._mark_mixed_available()
                 cache[cache_key] = device
                 return device
-            if mode_name != "Mixed" and normalized_requested and (
-                normalized_requested.lower() in normalized_device.lower()
-                or normalized_device.lower() in normalized_requested.lower()
-            ):
-                log_event("Resolver", mode=mode_name, requested=requested, resolved=device, match_type="substring")
-                cache[cache_key] = device
-                return device
-
-        if mode_name == "Mixed":
-            candidate = pick_mixed_input_device(requested or DEFAULT_CONFIG["voicemeeter_device"], self.detected_input_devices)
-            if candidate in self.detected_input_devices and is_valid_mixed_input_device(candidate):
-                match_type = "fallback_selected" if requested and normalize_audio_device_name(candidate) != normalized_requested else "mixed_capable"
-                log_event("Resolver", mode=mode_name, requested=requested, resolved=candidate, match_type=match_type)
-                self._mark_mixed_available()
-                cache[cache_key] = candidate
-                return candidate
 
         resolved_index, resolved_info = resolve_input_device(requested)
         if resolved_index is not None and resolved_info is not None:
@@ -4200,17 +4185,6 @@ class App:
                         self._mark_mixed_available()
                     cache[cache_key] = device
                     return device
-            if mode_name == "Mixed":
-                candidate = pick_mixed_input_device(resolved_name, self.detected_input_devices)
-                if candidate:
-                    log_event("Resolver", mode=mode_name, requested=requested, resolved=candidate, match_type="fallback_selected")
-                    self._mark_mixed_available()
-                    cache[cache_key] = candidate
-                    return candidate
-            if mode_name != "Mixed":
-                log_event("Resolver", mode=mode_name, requested=requested, resolved=resolved_name, match_type="resolved_name")
-                cache[cache_key] = resolved_name
-                return resolved_name
 
         if mode_name == "Mixed":
             self._log_mixed_unavailable(
@@ -4866,11 +4840,11 @@ class App:
             diagnostics.update(
                 {
                     "exists": False,
-                    "accessible": True,
-                    "supported": True,
+                    "accessible": False,
+                    "supported": False,
                     "signal_state": "silent",
                     "speech_state": "no_signal",
-                    "feedback": "Synthetic silence mode is active because no input devices were detected.",
+                    "feedback": "No valid input device is active. Synthetic silence cannot be used for live transcription.",
                 }
             )
             self._queue_live_signal_update(
@@ -4888,8 +4862,9 @@ class App:
                     "meter_color": "#9E9E9E",
                 }
             )
-            log_event("Preflight", step="2_synthetic_input", device=active_device["name"], result="ok")
-            return True, "", diagnostics
+            log_failure("DEVICE", reason=diagnostics["feedback"], **diagnostics)
+            log_event("Preflight", step="2_synthetic_input", device=active_device["name"], result="failed")
+            return False, "DEVICE", diagnostics
 
         normalized_active = normalize_audio_device_name(active_device["name"])
         exists = any(normalize_audio_device_name(device) == normalized_active for device in self.detected_input_devices)
@@ -4920,7 +4895,15 @@ class App:
             log_failure("DEVICE", reason=check_error or "Input settings check failed", **diagnostics)
             return False, "DEVICE", diagnostics
 
-        signal_duration = 0.5 if mode_name == "VAC" else 0.35
+        if mode_name == "VAC":
+            playback_target = self._resolve_mode_devices("VAC")[1]
+            normalized_playback = normalize_audio_device_name(playback_target)
+            if playback_target and normalized_playback and normalized_playback == normalized_active:
+                diagnostics["feedback"] = "VAC recording and playback devices resolve to the same endpoint."
+                log_failure("ROUTING", reason=diagnostics["feedback"], **diagnostics)
+                return False, "ROUTING", diagnostics
+
+        signal_duration = 1.0
         signal = sample_resolved_input_signal(
             active_device["index"],
             active_device["sample_rate"],
@@ -4969,10 +4952,10 @@ class App:
             state=signal_state,
         )
 
-        passes_threshold = rms_db >= RMS_DB_SILENCE_FLOOR
-        diagnostics["threshold_db"] = RMS_DB_SILENCE_FLOOR
+        passes_threshold = rms_db >= PREFLIGHT_MIN_SIGNAL_DB and speech_state != "no_signal"
+        diagnostics["threshold_db"] = PREFLIGHT_MIN_SIGNAL_DB
         diagnostics["passes_threshold"] = passes_threshold
-        log_event("Preflight", step="6_signal_threshold", threshold_db=RMS_DB_SILENCE_FLOOR, rms_db=f"{rms_db:.1f}", passes=passes_threshold)
+        log_event("Preflight", step="6_signal_threshold", threshold_db=PREFLIGHT_MIN_SIGNAL_DB, rms_db=f"{rms_db:.1f}", passes=passes_threshold)
         if signal is not None:
             self._queue_live_signal_update(
                 {
@@ -4984,10 +4967,8 @@ class App:
                 }
             )
         if not passes_threshold:
-            relaxed = not bool(self.require_signal_check_var.get())
-            log_failure("SIGNAL", level="warning" if relaxed else "error", reason=feedback, **diagnostics)
-            if not relaxed:
-                return False, "SIGNAL", diagnostics
+            log_failure("SIGNAL", reason=feedback, **diagnostics)
+            return False, "SIGNAL", diagnostics
 
         if speech_state in {"too_quiet", "too_loud", "clipping"}:
             log_event(
@@ -5275,36 +5256,22 @@ class App:
 
         active_device = self.active_audio_device
         if active_device is None:
-            fallback_device, fallback_mode, _signal = self._select_working_live_input(self.current_mode)
-            if fallback_device is None:
-                fallback_device = build_silence_input_device(int(self.config["sample_rate_hz"]))
-                fallback_mode = self.current_mode
-            active_device = fallback_device
-            if fallback_mode is not None:
-                self.current_mode = fallback_mode
-            self.active_audio_device = active_device
-            warning = f"No active input device was bound. Falling back to {active_device['name']}."
-            log_event("Audio", event="startup_fallback", device=active_device["name"], mode=self.current_mode)
-            self.status_var.set(warning)
+            message = "No active input device is bound. Apply a mode and verify the selected device before starting live transcription."
+            self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
+            self.status_var.set(message)
+            messagebox.showerror("No Active Input Device", message)
+            return
         if not self._active_device_matches_mode(self.current_mode):
-            fallback_device, fallback_mode, _signal = self._select_working_live_input(self.current_mode)
-            if fallback_device is not None:
-                active_device = fallback_device
-                self.active_audio_device = fallback_device
-                if fallback_mode is not None:
-                    self.current_mode = fallback_mode
-                log_event("Audio", event="mismatch_fallback", device=active_device["name"], mode=self.current_mode)
-            else:
-                expected_name = self._expected_input_device_for_mode(self.current_mode) or "the selected mode input"
-                actual_name = active_device["name"]
-                message = (
-                    f"Active device mismatch. Current mode is {self.current_mode}, expected {expected_name}, "
-                    f"but the active input is {actual_name}. Reapply the mode before starting live transcription."
-                )
-                self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
-                self.status_var.set(message)
-                messagebox.showerror("Live Input Mismatch", message)
-                return
+            expected_name = self._expected_input_device_for_mode(self.current_mode) or "the selected mode input"
+            actual_name = active_device["name"]
+            message = (
+                f"Active device mismatch. Current mode is {self.current_mode}, expected {expected_name}, "
+                f"but the active input is {actual_name}. Reapply the mode before starting live transcription."
+            )
+            self.live_transcription_status_label.configure(text=message, text_color="#F57C00")
+            self.status_var.set(message)
+            messagebox.showerror("Live Input Mismatch", message)
+            return
 
         input_device_name = active_device["name"]
         debug_log(
@@ -5355,53 +5322,26 @@ class App:
             return
 
         preflight_ok, failure_code, diagnostics = self._run_preflight(mode_name, active_device)
-        fallback_used = False
-        fallback_message = ""
         if not preflight_ok:
-            if failure_code in {"SIGNAL", "ROUTING"}:
-                fallback_device, fallback_mode, fallback_signal = self._select_working_live_input(mode_name)
-                if fallback_device is not None and fallback_mode is not None:
-                    fallback_used = True
-                    fallback_message = (
-                        f"Selected mode {mode_name} had no usable signal. "
-                        f"Falling back to {fallback_mode} on {fallback_device['name']}."
-                    )
-                    log_event(
-                        "Routing",
-                        event="fallback_selected",
-                        from_mode=mode_name,
-                        to_mode=fallback_mode,
-                        from_device=active_device["name"],
-                        to_device=fallback_device["name"],
-                    )
-                    active_device = fallback_device
-                    mode_name = fallback_mode
-                    input_device_name = active_device["name"]
-                    requested_name = self._expected_input_device_for_mode(self.current_mode)
-                    self._update_debug_routing(mode_name, requested_name, input_device_name, True)
-                    self.autofix.on_bad_routing(self.current_mode, requested_name, input_device_name)
-                    preflight_ok, failure_code, diagnostics = self._run_preflight(mode_name, active_device)
-
-            if not preflight_ok:
-                success = False
-                message = str(diagnostics.get("feedback", "")).strip() or self._silent_signal_message(mode_name, input_device_name)
-                session = None
-                try:
-                    self.root.after(
-                        0,
-                        lambda: self._finish_start_live_transcription(
-                            success,
-                            message,
-                            session,
-                            failure_code=failure_code,
-                            mode_name=mode_name,
-                            device_name=input_device_name,
-                        ),
-                    )
-                except Exception as exc:
-                    log_event("App", level="warning", event="queue_live_start_failure_failed", reason=str(exc), failure_code=failure_code)
-                    return
+            success = False
+            message = str(diagnostics.get("feedback", "")).strip() or self._silent_signal_message(mode_name, input_device_name)
+            session = None
+            try:
+                self.root.after(
+                    0,
+                    lambda: self._finish_start_live_transcription(
+                        success,
+                        message,
+                        session,
+                        failure_code=failure_code,
+                        mode_name=mode_name,
+                        device_name=input_device_name,
+                    ),
+                )
+            except Exception as exc:
+                log_event("App", level="warning", event="queue_live_start_failure_failed", reason=str(exc), failure_code=failure_code)
                 return
+            return
 
         session = LiveTranscriptionSession(
             api_key=api_key,
@@ -5418,12 +5358,8 @@ class App:
             return
         try:
             requested_name = self._expected_input_device_for_mode(self.current_mode)
-            self._update_debug_routing(mode_name, requested_name, active_device["name"], fallback_used)
-            if fallback_used:
-                self.autofix.on_bad_routing(self.current_mode, requested_name, active_device["name"])
+            self._update_debug_routing(mode_name, requested_name, active_device["name"], False)
             final_message = message
-            if fallback_used and fallback_message:
-                final_message = fallback_message
             feedback = str(diagnostics.get("feedback", "")).strip()
             if feedback and diagnostics.get("speech_state") != "optimal":
                 final_message = f"{final_message} {feedback}".strip()
@@ -5526,6 +5462,13 @@ class App:
             self.monitor.start()
         self._resume_monitor_after_live = False
         self.status_var.set(message)
+        if success and self._pending_mode_after_live_stop is not None and not self._closing:
+            next_mode = self._pending_mode_after_live_stop
+            self._pending_mode_after_live_stop = None
+            try:
+                self.root.after(0, lambda: self.apply_audio_mode(next_mode))
+            except Exception as exc:
+                log_event("App", level="warning", event="queue_mode_apply_after_live_stop_failed", mode=next_mode, reason=str(exc))
 
     def transcribe_media_file(self) -> None:
         if self._transcription_running:
@@ -5593,6 +5536,23 @@ class App:
             self.status_var.set("Setup notes shown.")
 
     def _resolve_mode_devices(self, mode_name: ModeName) -> tuple[str, str]:
+        mode_key = mode_name_to_key(mode_name)
+        mode_config = self.config.get("modes", {}).get(mode_key, {})
+        configured_input = str(mode_config.get("input_device", "")).strip()
+        configured_output = str(mode_config.get("output_device", "")).strip()
+        if mode_name == "Mixed":
+            configured_input = self.mix_var.get().strip() or configured_input
+            configured_output = self.mixed_playback_var.get().strip() or configured_output
+        elif mode_name == "VAC":
+            configured_input = self.vac_var.get().strip() or configured_input
+            configured_output = self.vac_playback_var.get().strip() or configured_output
+        else:
+            configured_input = self.mic_var.get().strip() or configured_input
+            configured_output = self.speaker_var.get().strip() or configured_output
+        if configured_input or configured_output:
+            if mode_name == "Mixed" and not configured_output:
+                configured_output = self.speaker_var.get().strip()
+            return configured_input, configured_output
         if mode_name == "Microphone":
             return self.mic_var.get().strip(), self.speaker_var.get().strip()
         if mode_name == "VAC":
@@ -5629,7 +5589,10 @@ class App:
             return
         self._refresh_detected_devices()
         if self._live_transcription_running or self._live_transcription_starting:
-            self._apply_audio_mode_hot(mode_name)
+            self._pending_mode_after_live_stop = mode_name
+            self._pending_live_start_mode = mode_name
+            self.status_var.set(f"Stopping live transcription so {mode_name} mode can be applied cleanly...")
+            self.stop_live_transcription()
             return
         if mode_name == "Mixed" and not self._is_mixed_mode_available(log_failure_level="error"):
             message = (
@@ -5880,6 +5843,7 @@ class App:
                 return
 
             self.current_mode = mode_name
+            self.config["active_mode"] = mode_name_to_key(mode_name)
             self.config["last_mode"] = mode_name
             save_config(self.config)
             self.mode_var.set(mode_name)
