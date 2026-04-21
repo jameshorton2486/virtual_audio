@@ -1,7 +1,7 @@
 {
   "mic_device": "Microphone (Realtek HD Audio Mic input)",
   "vac_device": "CABLE Output (VB-Audio Virtual Cable)",
-  "speaker_device": "Speakers 1 (Realtek HD Audio output with SST)",
+  "speaker_device": "Speakers (Realtek Audio)",
   "vac_playback_device": "CABLE Input (VB-Audio Virtual Cable)",
   "voicemeeter_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
   "mixed_playback_device": "",
@@ -10,5 +10,20 @@
   "wer_mode_enabled": true,
   "quality_check_interval_seconds": 2.0,
   "sample_rate_hz": 24000,
-  "last_mode": "VAC"
+  "last_mode": "Microphone",
+  "active_mode": "mic",
+  "modes": {
+    "mic": {
+      "input_device": "Microphone (Realtek HD Audio Mic input)",
+      "output_device": "Speakers (Realtek Audio)"
+    },
+    "vac": {
+      "input_device": "CABLE Output (VB-Audio Virtual Cable)",
+      "output_device": "CABLE Input (VB-Audio Virtual Cable)"
+    },
+    "mixed": {
+      "input_device": "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+      "output_device": "Speakers (Realtek Audio)"
+    }
+  }
 }

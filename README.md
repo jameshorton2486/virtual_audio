@@ -94,6 +94,21 @@ Edit the values in `config.json` or use the fields in the app. The app also has 
 - Each live session also saves a matching `.json` metadata file with mode, device, timestamps, and status
 - Live transcription uses the same `Smart Format`, `Diarization`, `Paragraphs`, `Filler Words`, and `Numerals` options shown in the Deepgram panel
 
+## Copy and Save a Transcript
+
+The Transcribe tab has three buttons above the transcript window:
+
+- **Copy Transcript**: copies the full transcript text to the Windows clipboard. If a live session is running, it copies the committed live text. Otherwise, it copies the contents of the most recently saved transcript file.
+- **Save Transcript As...**: opens a Save As dialog so you can pick any folder and filename. Defaults to a timestamped `transcript_YYYYMMDD_HHMMSS.txt`.
+- **Open Transcripts Folder**: opens the app's default `transcripts` folder in File Explorer.
+
+## UI Overview
+
+- **Monitor**: live signal meter, current mode status, and WER optimization readout.
+- **Routing**: one-off changes to Windows recording and playback defaults.
+- **Transcribe**: file and live transcription controls; copy/save transcripts.
+- **Settings**: persistent device choices used by the mode buttons and live transcription.
+
 ## Hot Mode Switching
 
 - While live transcription is running, you can click `Microphone`, `VAC`, or `Mixed` to hot-switch the active capture source without stopping the Deepgram session.
