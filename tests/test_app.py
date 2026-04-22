@@ -1352,6 +1352,16 @@ class AppBehaviorTests(unittest.TestCase):
         self.assertIn("No detected recording inputs are available for Mixed mode.", app_stub.status_var.get())
         self.assertIn("UNAVAILABLE", app_stub.debug_routing_var.get())
 
+    def test_validate_last_mode_prefers_microphone_on_startup_when_available(self) -> None:
+        app_stub = self._make_app_stub()
+        app_stub.current_mode = "VAC"
+        app_stub.mode_var.set("VAC")
+
+        app.App._validate_last_mode_against_detected_devices(app_stub)
+
+        self.assertEqual(app_stub.current_mode, "Microphone")
+        self.assertEqual(app_stub.mode_var.get(), "Microphone")
+
     def test_resolve_detected_input_name_uses_cache_for_repeated_exact_match(self) -> None:
         app_stub = self._make_app_stub()
         handler = CaptureHandler()

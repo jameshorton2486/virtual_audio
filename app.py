@@ -4380,6 +4380,27 @@ class App:
         saved_mode: ModeName = self.current_mode
         if saved_mode not in ("Microphone", "VAC", "Mixed"):
             return
+        if saved_mode != "Microphone":
+            preferred_mic, _preferred_playback = self._resolve_mode_devices("Microphone")
+            if preferred_mic:
+                preferred_mic_resolved = self._resolve_detected_input_name(preferred_mic, "Microphone") or preferred_mic
+                if preferred_mic_resolved in self.detected_input_devices:
+                    log_event(
+                        "StartupValidation",
+                        event="last_mode_reset_to_microphone",
+                        saved_mode=saved_mode,
+                        effective_mode="Microphone",
+                        preferred_device=preferred_mic_resolved,
+                        note="startup always prefers direct microphone mode when available",
+                    )
+                    self.current_mode = "Microphone"
+                    mode_var = getattr(self, "mode_var", None)
+                    if mode_var is not None:
+                        try:
+                            mode_var.set("Microphone")
+                        except Exception as exc:
+                            log_event("StartupValidation", level="warning", event="mode_var_update_failed", reason=str(exc))
+                    return
         configured_device, _playback = self._resolve_mode_devices(saved_mode)
         if not configured_device:
             log_event(
