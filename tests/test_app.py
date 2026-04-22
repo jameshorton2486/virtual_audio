@@ -985,6 +985,26 @@ class LiveSignalTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result["state"], "active")
 
+
+class LiveSessionTests(unittest.TestCase):
+    def test_live_session_prefers_resolved_device_sample_rate(self) -> None:
+        session = app.LiveTranscriptionSession(
+            api_key="test-key",
+            input_device={
+                "name": "Microphone (Razer Seiren V3 Mini)",
+                "index": 29,
+                "info": {"name": "Microphone (Razer Seiren V3 Mini)", "max_input_channels": 1},
+                "sample_rate": 48000,
+            },
+            mode_name="Microphone",
+            on_transcript=lambda *args, **kwargs: None,
+            on_status=lambda *args, **kwargs: None,
+            on_signal=lambda *args, **kwargs: None,
+        )
+
+        self.assertEqual(session.sample_rate_hz, 48000)
+        self.assertEqual(session.capture_channels, 1)
+
     def test_analyze_live_input_signal_detects_clipping(self) -> None:
         raw_bytes = (np.full(1024, 32000, dtype=np.int16)).tobytes()
 

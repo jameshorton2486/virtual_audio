@@ -31,20 +31,40 @@ class AudioEngine:
         blocksize: int = 1024,
         dtype: str = "float32",
     ):
-        self.sd.check_input_settings(
-            device=device_index,
-            samplerate=samplerate,
-            channels=channels,
-        )
-        stream = self._input_stream_factory(
-            samplerate=samplerate,
-            blocksize=blocksize,
-            device=device_index,
-            channels=channels,
-            dtype=dtype,
-            callback=callback,
-        )
-        stream.start()
+        if self.logger is not None:
+            self.logger.info(
+                "[AudioEngine] Opening input stream device=%s samplerate=%s channels=%s blocksize=%s dtype=%s",
+                device_index,
+                samplerate,
+                channels,
+                blocksize,
+                dtype,
+            )
+        try:
+            self.sd.check_input_settings(
+                device=device_index,
+                samplerate=samplerate,
+                channels=channels,
+            )
+            stream = self._input_stream_factory(
+                samplerate=samplerate,
+                blocksize=blocksize,
+                device=device_index,
+                channels=channels,
+                dtype=dtype,
+                callback=callback,
+            )
+            stream.start()
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.error(
+                    "[AudioEngine] Failed input stream device=%s samplerate=%s channels=%s reason=%s",
+                    device_index,
+                    samplerate,
+                    channels,
+                    exc,
+                )
+            raise
         if self.logger is not None:
             self.logger.info(
                 "[AudioEngine] Started input stream device=%s samplerate=%s channels=%s blocksize=%s",

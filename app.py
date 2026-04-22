@@ -2165,7 +2165,7 @@ class LiveTranscriptionSession:
         self.input_device_name = input_device["name"].strip()
         self.input_device_index = int(input_device["index"])
         self.input_device_info = input_device["info"]
-        self.sample_rate_hz = LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ
+        self.sample_rate_hz = self._resolve_session_sample_rate(input_device)
         self.capture_channels = max(1, min(int(self.input_device_info.get("max_input_channels", 1)), 2))
         self.mode_name = mode_name.strip() or "Unknown"
         self.on_transcript = on_transcript
@@ -2212,6 +2212,16 @@ class LiveTranscriptionSession:
         self._audio_processor = AudioProcessor()
         self._uses_synthetic_input = bool(self.input_device_info.get("is_synthetic"))
 
+    def _resolve_session_sample_rate(self, input_device: ActiveAudioDevice) -> int:
+        candidate = input_device.get("sample_rate", LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ)
+        try:
+            sample_rate = int(float(candidate))
+        except (TypeError, ValueError):
+            sample_rate = LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ
+        if sample_rate <= 0:
+            sample_rate = LIVE_TRANSCRIPTION_SAMPLE_RATE_HZ
+        return sample_rate
+
     def _close_stream(self, stream) -> None:
         AudioEngine(LOGGER).close_stream(
             stream,
@@ -2219,7 +2229,7 @@ class LiveTranscriptionSession:
             device_name=self.actual_device_name,
         )
 
-    def _open_stream_for_device(self, device_index: int, capture_channels: int):
+    def _open_stream_for_device(self, device_index: int, capture_channels: int, sample_rate_hz: int | None = None):
         if device_index == NULL_INPUT_DEVICE_INDEX or self._uses_synthetic_input:
             return None
         engine = AudioEngine(
@@ -2227,9 +2237,10 @@ class LiveTranscriptionSession:
             sounddevice_module=sd,
             input_stream_factory=self._input_stream_factory,
         )
+        stream_sample_rate = int(sample_rate_hz or self.sample_rate_hz)
         return engine.start_input_stream(
             device_index=device_index,
-            samplerate=self.sample_rate_hz,
+            samplerate=stream_sample_rate,
             channels=capture_channels,
             callback=self._audio_callback,
             blocksize=1024,
@@ -2391,7 +2402,7 @@ class LiveTranscriptionSession:
             if old_stream is not None:
                 self._close_stream(old_stream)
                 self.stream = None
-            self.stream = self._open_stream_for_device(self.input_device_index, self.capture_channels)
+            self.stream = self._open_stream_for_device(self.input_device_index, self.capture_channels, self.sample_rate_hz)
             self._last_callback_at = time.monotonic()
             log_event("LiveSession", event="audio_stream_reopened", device=self.actual_device_name)
             return True, ""
@@ -2510,7 +2521,7 @@ class LiveTranscriptionSession:
             if self.stream is not None:
                 self._close_stream(self.stream)
                 self.stream = None
-            self.stream = self._open_stream_for_device(self.input_device_index, self.capture_channels)
+            self.stream = self._open_stream_for_device(self.input_device_index, self.capture_channels, self.sample_rate_hz)
         except Exception as exc:
             self._close_connection()
             log_failure("DEVICE", mode=self.mode_name, device=self.input_device_name, reason=str(exc))
@@ -2617,8 +2628,9 @@ class LiveTranscriptionSession:
             new_info = new_device.get("info") or {}
             new_index = int(new_device["index"])
             new_channels = max(1, min(int(new_info.get("max_input_channels", 1)), 2))
+            new_sample_rate = self._resolve_session_sample_rate(new_device)
             self._uses_synthetic_input = bool(new_info.get("is_synthetic")) or new_index == NULL_INPUT_DEVICE_INDEX
-            new_stream = self._open_stream_for_device(new_index, new_channels)
+            new_stream = self._open_stream_for_device(new_index, new_channels, new_sample_rate)
             if self._uses_synthetic_input and (self._silence_thread is None or not self._silence_thread.is_alive()):
                 self._silence_thread = threading.Thread(target=self._silence_loop, name="LiveSessionSilence", daemon=True)
                 self._silence_thread.start()
@@ -2629,6 +2641,7 @@ class LiveTranscriptionSession:
             self.input_device_name = new_device["name"].strip()
             self.actual_device_name = normalize_audio_device_name(str(new_info.get("name", self.input_device_name)))
             self.mode_name = new_mode_name.strip() or self.mode_name
+            self.sample_rate_hz = new_sample_rate
             self.capture_channels = new_channels
 
             marker = f"[Switched to {self.mode_name} mode at {time.strftime('%H:%M:%S')} - {self.actual_device_name}]"
@@ -2664,13 +2677,21 @@ class LiveTranscriptionSession:
         except Exception as exc:
             LOGGER.exception(_log_message("Failure: DEVICE", mode=new_mode_name, device=new_device.get("name", ""), reason=str(exc)))
             try:
-                restored_stream = self._open_stream_for_device(old_index, old_channels)
+                restored_stream = self._open_stream_for_device(old_index, old_channels, self.sample_rate_hz)
                 self.stream = restored_stream
                 self.input_device_index = old_index
                 self.input_device_info = old_info
                 self.input_device_name = old_name
                 self.actual_device_name = old_actual
                 self.mode_name = old_mode
+                self.sample_rate_hz = self._resolve_session_sample_rate(
+                    {
+                        "name": old_name,
+                        "index": old_index,
+                        "info": old_info,
+                        "sample_rate": self.sample_rate_hz,
+                    }
+                )
                 self.capture_channels = old_channels
                 self._uses_synthetic_input = bool((old_info or {}).get("is_synthetic")) or old_index == NULL_INPUT_DEVICE_INDEX
                 return False, f"Hot switch failed; restored {old_actual}."
