@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -72,6 +73,20 @@ class AppUtilityTests(unittest.TestCase):
         self.assertIsNone(stream)
         show_error_popup.assert_called_once()
 
+    @patch("app.get_vac_device", return_value=7)
+    @patch("app.sd.InputStream")
+    def test_start_audio_stream_uses_smaller_blocksize(self, input_stream: Mock, _get_vac_device: Mock) -> None:
+        stream = Mock()
+        input_stream.return_value = stream
+        app._ACTIVE_AUDIO_CALLBACK = lambda *args, **kwargs: None
+
+        result = app.start_audio_stream()
+
+        self.assertEqual(result, stream)
+        input_stream.assert_called_once()
+        self.assertEqual(input_stream.call_args.kwargs["blocksize"], 1600)
+        stream.start.assert_called_once()
+
     def test_safe_thread_catches_exception(self) -> None:
         calls: list[str] = []
 
@@ -83,6 +98,147 @@ class AppUtilityTests(unittest.TestCase):
         crash()
 
         self.assertEqual(calls, ["started"])
+
+    def test_format_live_result_text_uses_speaker_labels_when_diarized(self) -> None:
+        result = SimpleNamespace(
+            channel=SimpleNamespace(
+                alternatives=[
+                    SimpleNamespace(
+                        transcript="hello there general kenobi",
+                        words=[
+                            SimpleNamespace(word="hello", punctuated_word="Hello", speaker=0),
+                            SimpleNamespace(word="there", punctuated_word="there.", speaker=0),
+                            SimpleNamespace(word="general", punctuated_word="General", speaker=1),
+                            SimpleNamespace(word="kenobi", punctuated_word="Kenobi.", speaker=1),
+                        ],
+                    )
+                ]
+            )
+        )
+
+        text = app.format_live_result_text(result)
+
+        self.assertEqual(text, "[Speaker 0] Hello there.\n[Speaker 1] General Kenobi.")
+
+    def test_format_live_result_text_falls_back_when_no_speaker_words_present(self) -> None:
+        result = {
+            "channel": {
+                "alternatives": [
+                    {
+                        "transcript": "plain transcript fallback",
+                        "words": [],
+                    }
+                ]
+            }
+        }
+
+        text = app.format_live_result_text(result)
+
+        self.assertEqual(text, "plain transcript fallback")
+
+    def test_build_deepgram_live_options_enables_requested_features(self) -> None:
+        with patch.dict("os.environ", {}, clear=False):
+            options = app.build_deepgram_live_options()
+
+        self.assertEqual(options["model"], "nova-3")
+        self.assertEqual(options["language"], "en-US")
+        self.assertTrue(options["diarize"])
+        self.assertTrue(options["paragraphs"])
+        self.assertTrue(options["filler_words"])
+        self.assertTrue(options["numerals"])
+
+    def test_build_deepgram_live_options_uses_keyterms_for_nova_3(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "DEEPGRAM_MODEL": "nova-3",
+                "DEEPGRAM_KEYTERMS": "Zoom, VB-Audio Virtual Cable, Deepgram",
+            },
+            clear=False,
+        ):
+            options = app.build_deepgram_live_options()
+
+        self.assertEqual(options["keyterm"], ["Zoom", "VB-Audio Virtual Cable", "Deepgram"])
+        self.assertNotIn("keywords", options)
+
+    def test_build_deepgram_live_options_falls_back_to_keywords_for_non_nova_3(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "DEEPGRAM_MODEL": "nova-2",
+                "DEEPGRAM_KEYWORDS": "Zoom:2, Deepgram:3",
+            },
+            clear=False,
+        ):
+            options = app.build_deepgram_live_options()
+
+        self.assertEqual(options["keywords"], ["Zoom:2", "Deepgram:3"])
+        self.assertNotIn("keyterm", options)
+
+
+class DeepgramLiveClientTests(unittest.TestCase):
+    def test_keepalive_fires_after_idle_interval(self) -> None:
+        ui_queue: "queue.Queue[tuple[str, object]]" = app.queue.Queue()
+        client = app.DeepgramLiveClient("test-key", ui_queue)
+        connection = Mock()
+
+        def mark_stopped() -> None:
+            client.running = False
+
+        connection.keep_alive.side_effect = mark_stopped
+        client.connection = connection
+        client.running = True
+        client._last_send_ts = 0.0
+
+        with patch("app.time.monotonic", side_effect=[10.0, 10.0]), patch("app.time.sleep", return_value=None):
+            client._keepalive_loop()
+
+        connection.keep_alive.assert_called_once()
+
+    def test_on_close_while_running_triggers_reconnect_event(self) -> None:
+        ui_queue: "queue.Queue[tuple[str, object]]" = app.queue.Queue()
+        client = app.DeepgramLiveClient("test-key", ui_queue)
+        client.running = True
+        client._reconnect_event = Mock()
+
+        client._on_close(None)
+
+        client._reconnect_event.set.assert_called_once()
+
+    def test_successful_reconnect_preserves_transcript_buffers(self) -> None:
+        ui_queue: "queue.Queue[tuple[str, object]]" = app.queue.Queue()
+        client = app.DeepgramLiveClient("test-key", ui_queue)
+        client.running = True
+        client.final_lines = ["[Speaker 0] Existing final"]
+        client.interim_text = "[Speaker 1] Existing interim"
+        connection = Mock()
+        connection.start.return_value = True
+
+        with patch.object(client, "_create_connection", return_value=connection), patch(
+            "app.time.monotonic",
+            return_value=123.0,
+        ):
+            ok = client._attempt_reconnect()
+
+        self.assertTrue(ok)
+        self.assertEqual(client.connection, connection)
+        self.assertEqual(client.final_lines, ["[Speaker 0] Existing final"])
+        self.assertEqual(client.interim_text, "[Speaker 1] Existing interim")
+        self.assertEqual(ui_queue.get_nowait(), ("status", "Reconnected."))
+
+    def test_failed_reconnect_stops_client_and_pushes_error(self) -> None:
+        ui_queue: "queue.Queue[tuple[str, object]]" = app.queue.Queue()
+        client = app.DeepgramLiveClient("test-key", ui_queue)
+        client.running = True
+        connection = Mock()
+        connection.start.return_value = False
+
+        with patch.object(client, "_create_connection", return_value=connection), patch("app.time.sleep", return_value=None):
+            ok = client._attempt_reconnect()
+
+        self.assertFalse(ok)
+        self.assertFalse(client.running)
+        self.assertEqual(ui_queue.get_nowait(), ("error", "Deepgram disconnected - click Start to resume."))
 
 
 if __name__ == "__main__":

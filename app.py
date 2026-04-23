@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import inspect
 import logging
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -31,6 +31,8 @@ CONFIG = {
     "input_device": "CABLE Output (VB-Audio Virtual Cable)",
     "sample_rate": 16000,
     "channels": 1,
+    "deepgram_model": "nova-3",
+    "deepgram_language": "en-US",
 }
 
 _ACTIVE_AUDIO_CALLBACK = None
@@ -143,6 +145,46 @@ def get_deepgram_api_key() -> str:
     return os.environ.get("DEEPGRAM_API_KEY", "").strip()
 
 
+def _env_csv_values(name: str) -> list[str]:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return []
+    values = [item.strip() for item in re.split(r"[,;\r\n]+", raw_value) if item.strip()]
+    return values
+
+
+def build_deepgram_live_options() -> dict[str, Any]:
+    model = os.environ.get("DEEPGRAM_MODEL", CONFIG["deepgram_model"]).strip() or CONFIG["deepgram_model"]
+    language = os.environ.get("DEEPGRAM_LANGUAGE", CONFIG["deepgram_language"]).strip() or CONFIG["deepgram_language"]
+    keyterms = _env_csv_values("DEEPGRAM_KEYTERMS")
+    keywords = _env_csv_values("DEEPGRAM_KEYWORDS")
+
+    options: dict[str, Any] = {
+        "model": model,
+        "language": language,
+        "smart_format": True,
+        "punctuate": True,
+        "interim_results": True,
+        "diarize": True,
+        "paragraphs": True,
+        "filler_words": True,
+        "numerals": True,
+        "encoding": "linear16",
+        "channels": CONFIG["channels"],
+        "sample_rate": CONFIG["sample_rate"],
+    }
+
+    if keyterms:
+        options["keyterm"] = keyterms
+    elif keywords:
+        if model.lower().startswith("nova-3"):
+            options["keyterm"] = [term.split(":", 1)[0].strip() for term in keywords if term.split(":", 1)[0].strip()]
+        else:
+            options["keywords"] = keywords
+
+    return options
+
+
 def compute_rms_db(audio: np.ndarray) -> float:
     samples = np.asarray(audio, dtype=np.float32)
     if samples.ndim == 2:
@@ -155,7 +197,7 @@ def compute_rms_db(audio: np.ndarray) -> float:
 
 
 def signal_state_from_db(rms_db: float) -> str:
-    return "No Signal" if rms_db < -80.0 else "Active"
+    return "No Signal" if rms_db < -50.0 else "Active"
 
 
 def pcm16_bytes(audio: np.ndarray) -> bytes:
@@ -217,7 +259,7 @@ def start_audio_stream():
             channels=1,
             samplerate=CONFIG["sample_rate"],
             callback=_ACTIVE_AUDIO_CALLBACK,
-            blocksize=8000,
+            blocksize=1600,
             dtype="float32",
         )
         stream.start()
@@ -234,12 +276,53 @@ def _deepgram_value(node: Any, key: str, default: Any = None) -> Any:
     return getattr(node, key, default)
 
 
+def _words_from_result(result: Any) -> list[Any]:
+    channel = _deepgram_value(result, "channel")
+    alternatives = _deepgram_value(channel, "alternatives", [])
+    if not alternatives:
+        return []
+    return list(_deepgram_value(alternatives[0], "words", []) or [])
+
+
+def _speaker_label(speaker: Any) -> str:
+    if speaker is None or str(speaker).strip() == "":
+        return "Speaker"
+    return f"Speaker {speaker}"
+
+
+def _speaker_segment_text(words: list[Any]) -> str:
+    segments: list[str] = []
+    current_speaker: Any = None
+    current_words: list[str] = []
+
+    for word_info in words:
+        speaker = _deepgram_value(word_info, "speaker")
+        punctuated = str(_deepgram_value(word_info, "punctuated_word", "")).strip()
+        raw_word = punctuated or str(_deepgram_value(word_info, "word", "")).strip()
+        if not raw_word:
+            continue
+        if current_words and speaker != current_speaker:
+            segments.append(f"[{_speaker_label(current_speaker)}] {' '.join(current_words)}")
+            current_words = []
+        current_speaker = speaker
+        current_words.append(raw_word)
+
+    if current_words:
+        segments.append(f"[{_speaker_label(current_speaker)}] {' '.join(current_words)}")
+
+    return "\n".join(segment for segment in segments if segment.strip()).strip()
+
+
 def format_live_result_text(result: Any) -> str:
     try:
         channel = _deepgram_value(result, "channel")
         alternatives = _deepgram_value(channel, "alternatives", [])
         if not alternatives:
             return ""
+        words = _words_from_result(result)
+        speaker_text = _speaker_segment_text(words)
+        if speaker_text:
+            return speaker_text
         return str(_deepgram_value(alternatives[0], "transcript", "")).strip()
     except Exception as exc:
         log_error("Deepgram transcript format failed", exc)
@@ -254,36 +337,37 @@ class DeepgramLiveClient:
         self.final_lines: list[str] = []
         self.interim_text = ""
         self.running = False
+        self._last_send_ts = 0.0
+        self._keepalive_thread: threading.Thread | None = None
+        self._reconnect_event = threading.Event()
+        self._reconnect_worker: threading.Thread | None = None
+        self._logged_paragraphs_check = False
+
+    def _create_connection(self):
+        from deepgram import DeepgramClient, LiveTranscriptionEvents
+
+        client = DeepgramClient(self.api_key)
+        connection = client.listen.websocket.v("1")
+        connection.on(LiveTranscriptionEvents.Open, self._on_open)
+        connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
+        connection.on(LiveTranscriptionEvents.Error, self._on_error)
+        connection.on(LiveTranscriptionEvents.Close, self._on_close)
+        return connection
+
+    def _ensure_background_workers(self) -> None:
+        if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
+            self._keepalive_thread = threading.Thread(target=self._keepalive_loop, name="deepgram-keepalive", daemon=True)
+            self._keepalive_thread.start()
+        if self._reconnect_worker is None or not self._reconnect_worker.is_alive():
+            self._reconnect_worker = threading.Thread(target=self._reconnect_loop, name="deepgram-reconnect", daemon=True)
+            self._reconnect_worker.start()
 
     def start(self) -> tuple[bool, str]:
         if not self.api_key:
             return False, "Missing DEEPGRAM_API_KEY in .env."
         try:
-            from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
-        except Exception as exc:
-            log_error("Deepgram SDK unavailable", exc)
-            return False, f"Deepgram SDK is not available: {exc}"
-
-        try:
-            client = DeepgramClient(self.api_key)
-            connection = client.listen.websocket.v("1")
-            connection.on(LiveTranscriptionEvents.Open, self._on_open)
-            connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
-            connection.on(LiveTranscriptionEvents.Error, self._on_error)
-            connection.on(LiveTranscriptionEvents.Close, self._on_close)
-
-            supported_names = set(inspect.signature(LiveOptions.__init__).parameters.keys())
-            raw_options = {
-                "model": "nova-3",
-                "language": "en-US",
-                "smart_format": True,
-                "punctuate": True,
-                "interim_results": True,
-                "encoding": "linear16",
-                "channels": CONFIG["channels"],
-                "sample_rate": CONFIG["sample_rate"],
-            }
-            options = LiveOptions(**{key: value for key, value in raw_options.items() if key in supported_names})
+            connection = self._create_connection()
+            options = build_deepgram_live_options()
             if not connection.start(options):
                 return False, "Failed to start Deepgram live transcription connection."
         except Exception as exc:
@@ -292,10 +376,14 @@ class DeepgramLiveClient:
 
         self.connection = connection
         self.running = True
+        self._last_send_ts = time.monotonic()
+        self._logged_paragraphs_check = False
+        self._ensure_background_workers()
         return True, "Deepgram live transcription connected."
 
     def stop(self) -> None:
         self.running = False
+        self._reconnect_event.set()
         if self.connection is not None:
             try:
                 self.connection.finish()
@@ -307,6 +395,53 @@ class DeepgramLiveClient:
         if not self.running or self.connection is None:
             return
         self.connection.send(pcm_bytes)
+        self._last_send_ts = time.monotonic()
+
+    def _keepalive_loop(self) -> None:
+        while self.running:
+            if self.connection is not None and (time.monotonic() - self._last_send_ts) > 5.0:
+                try:
+                    keep_alive = getattr(self.connection, "keep_alive", None)
+                    if callable(keep_alive):
+                        keep_alive()
+                    else:
+                        self.connection.send('{"type":"KeepAlive"}')
+                    self._last_send_ts = time.monotonic()
+                except Exception as exc:
+                    log_error("Deepgram keepalive failed", exc)
+            time.sleep(1.0)
+
+    def _attempt_reconnect(self) -> bool:
+        for backoff_seconds in (2.0, 4.0, 8.0):
+            if not self.running:
+                return False
+            try:
+                connection = self._create_connection()
+                options = build_deepgram_live_options()
+                if connection.start(options):
+                    self.connection = connection
+                    self._last_send_ts = time.monotonic()
+                    self.ui_queue.put(("status", "Reconnected."))
+                    return True
+            except Exception as exc:
+                log_error("Deepgram reconnect failed", exc)
+            if not self.running:
+                return False
+            if self._reconnect_event.wait(backoff_seconds):
+                self._reconnect_event.clear()
+                if not self.running:
+                    return False
+        self.running = False
+        self.ui_queue.put(("error", "Deepgram disconnected - click Start to resume."))
+        return False
+
+    def _reconnect_loop(self) -> None:
+        while True:
+            self._reconnect_event.wait()
+            self._reconnect_event.clear()
+            if not self.running:
+                return
+            self._attempt_reconnect()
 
     def current_transcript(self) -> str:
         sections = [line for line in self.final_lines if line.strip()]
@@ -319,15 +454,25 @@ class DeepgramLiveClient:
 
     def _on_close(self, client, close=None, **kwargs) -> None:
         self.ui_queue.put(("status", "Deepgram connection closed."))
+        if self.running:
+            self._reconnect_event.set()
 
     def _on_error(self, client, error=None, **kwargs) -> None:
         message = str(error) if error else "Deepgram live transcription error."
         log_error("Deepgram error", message)
         self.ui_queue.put(("error", message))
+        if self.running:
+            self._reconnect_event.set()
 
     def _on_transcript(self, client, result=None, **kwargs) -> None:
         if result is None:
             return
+        if not self._logged_paragraphs_check:
+            self._logged_paragraphs_check = True
+            channel = _deepgram_value(result, "channel")
+            alternatives = _deepgram_value(channel, "alternatives", [])
+            has_paragraphs = bool(alternatives) and _deepgram_value(alternatives[0], "paragraphs") is not None
+            LOGGER.info("Deepgram live paragraphs present in response: %s", has_paragraphs)
         transcript = format_live_result_text(result)
         if not transcript:
             return
