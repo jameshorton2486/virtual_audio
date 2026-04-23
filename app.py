@@ -7,6 +7,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -27,10 +28,12 @@ ENV_PATH = APP_DIR / ".env"
 LOGS_DIR = Path(os.environ.get("VIRTUAL_AUDIO_LOG_DIR", str(APP_DIR / "logs")))
 TRANSCRIPTS_DIR = APP_DIR / "transcripts"
 DATA_DIR = APP_DIR / "data"
+DEPOSITIONS_ROOT = Path(r"C:\Users\james\Depositions")
 LOG_PATH = LOGS_DIR / "virtual_audio.log"
 ERROR_LOG_PATH = LOGS_DIR / "errors.log"
 AUDIO_QUEUE_MAX_BLOCKS = 150
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+FUZZY_MATCH_THRESHOLD = 2
 
 NOTICE_KEYTERM_PROMPT = """# Deposition PDF To Deepgram Keyterms
 
@@ -251,6 +254,165 @@ def extract_notice_session_keyterms(payload: dict[str, Any]) -> list[str]:
     proper_nouns = [str(item).strip() for item in payload.get("proper_nouns", []) or []]
     legal_terms = [str(item).strip() for item in payload.get("legal_terms", []) or []]
     return _dedupe_terms(proper_nouns + legal_terms)
+
+
+def normalize_cause_number(raw: str) -> str:
+    value = str(raw or "").strip().upper()
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"-+", "-", value)
+    return value
+
+
+def witness_slug(full_name: str) -> str:
+    honorifics = {"mr", "mrs", "ms", "dr", "jr", "sr", "ii", "iii", "iv", "esq", "md", "phd"}
+    tokens = [token for token in re.split(r"[\s.,]+", str(full_name or "")) if token]
+    cleaned_tokens = []
+    for token in tokens:
+        lowered = token.lower().strip(".")
+        if lowered in honorifics:
+            continue
+        ascii_token = re.sub(r"[^a-z]", "", lowered)
+        if ascii_token:
+            cleaned_tokens.append(ascii_token)
+    if not cleaned_tokens:
+        return "unknown_unknown"
+    if len(cleaned_tokens) == 1:
+        return f"{cleaned_tokens[0]}_unknown"
+    last = cleaned_tokens[-1]
+    rest = "_".join(cleaned_tokens[:-1])
+    return f"{last}_{rest}"
+
+
+def parse_case_identity(response: dict[str, Any]) -> dict[str, str]:
+    proper_nouns = [str(item).strip() for item in response.get("proper_nouns", []) or [] if str(item).strip()]
+    cause_number = None
+    witness_name = None
+    excluded_tokens = {"associates", "pc", "llc", "llp", "firm", "court", "county", "district", "offices", "solutions", "bank", "corporation"}
+
+    for item in proper_nouns:
+        normalized = normalize_cause_number(item)
+        if re.match(r"^[\dA-Z]+[-\dA-Z]*$", normalized) and any(char.isdigit() for char in normalized) and 6 <= len(normalized) <= 30:
+            cause_number = normalized
+            break
+    if cause_number is None:
+        raise ValueError("No cause number found in extraction")
+
+    for item in proper_nouns:
+        if normalize_cause_number(item) == cause_number:
+            continue
+        parts = [part for part in str(item).split() if part]
+        if len(parts) < 2:
+            continue
+        candidate_tokens = [re.sub(r"[^A-Za-z]", "", part) for part in parts]
+        if not all(token and token[0].isupper() for token in candidate_tokens):
+            continue
+        if any(any(char.isdigit() for char in part) for part in parts):
+            continue
+        lowered = {token.lower() for token in candidate_tokens}
+        if lowered & excluded_tokens:
+            continue
+        witness_name = " ".join(parts)
+        break
+    if witness_name is None:
+        raise ValueError("No deponent name found")
+
+    return {
+        "cause_number": cause_number,
+        "deponent_full_name": witness_name,
+        "witness_slug": witness_slug(witness_name),
+    }
+
+
+def levenshtein(a: str, b: str) -> int:
+    if len(a) < len(b):
+        return levenshtein(b, a)
+    if not b:
+        return len(a)
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a):
+        current = [i + 1]
+        for j, char_b in enumerate(b):
+            insert_cost = previous[j + 1] + 1
+            delete_cost = current[j] + 1
+            substitute_cost = previous[j] + (char_a != char_b)
+            current.append(min(insert_cost, delete_cost, substitute_cost))
+        previous = current
+    return previous[-1]
+
+
+def check_fuzzy_match(new_name: str, parent: Path) -> str | None:
+    if not parent.exists():
+        return None
+    for entry in parent.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name == new_name:
+            return entry.name
+        if levenshtein(entry.name.upper(), new_name.upper()) <= FUZZY_MATCH_THRESHOLD:
+            return entry.name
+    return None
+
+
+def _resolve_name_with_prompt(kind: str, new_name: str, parent: Path, ui_queue: queue.Queue[tuple[str, Any]]) -> str:
+    match_name = check_fuzzy_match(new_name, parent)
+    if match_name is None:
+        return new_name
+    if match_name == new_name:
+        return match_name
+
+    reply_queue: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=1)
+    ui_queue.put(
+        (
+            "fuzzy_match",
+            {
+                "kind": kind,
+                "new": new_name,
+                "existing": match_name,
+                "reply_queue": reply_queue,
+            },
+        )
+    )
+    try:
+        action, selected_name = reply_queue.get(timeout=30)
+    except queue.Empty as exc:
+        raise RuntimeError("User cancelled folder creation") from exc
+    if action == "use_existing" and selected_name:
+        return selected_name
+    if action == "create_new":
+        return new_name
+    raise RuntimeError("User cancelled folder creation")
+
+
+def write_case_info(cause_folder: Path, identity: dict[str, str], payload: dict[str, Any]) -> None:
+    case_info_path = cause_folder / "case_info.json"
+    if case_info_path.exists():
+        return
+    case_info = {
+        "cause_number": identity["cause_number"],
+        "deponent_full_name": identity["deponent_full_name"],
+        "witness_slug": identity["witness_slug"],
+        "proper_nouns": list(payload.get("proper_nouns", []) or []),
+        "legal_terms": list(payload.get("legal_terms", []) or []),
+        "likely_domain_terms": list(payload.get("likely_domain_terms", []) or []),
+        "spelling_variants": list(payload.get("spelling_variants", []) or []),
+    }
+    case_info_path.write_text(json.dumps(case_info, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def resolve_deposition_folder(identity: dict[str, str], payload: dict[str, Any], ui_queue: queue.Queue[tuple[str, Any]]) -> Path:
+    DEPOSITIONS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    cause_name = _resolve_name_with_prompt("cause", identity["cause_number"], DEPOSITIONS_ROOT, ui_queue)
+    cause_folder = DEPOSITIONS_ROOT / cause_name
+    cause_folder.mkdir(parents=True, exist_ok=True)
+    write_case_info(cause_folder, identity, payload)
+
+    witness_name = _resolve_name_with_prompt("witness", identity["witness_slug"], cause_folder, ui_queue)
+    witness_folder = cause_folder / witness_name
+    witness_folder.mkdir(parents=True, exist_ok=True)
+    (witness_folder / "source_docs").mkdir(parents=True, exist_ok=True)
+    (witness_folder / "keyterms").mkdir(parents=True, exist_ok=True)
+    return witness_folder
 
 
 def save_notice_extraction(payload: dict[str, Any], pdf_path: Path) -> Path:
@@ -649,6 +811,7 @@ class SimpleAudioApp:
         self.notice_output_path: Path | None = None
         self.notice_keyterms: list[str] = []
         self.notice_prompt_result: dict[str, Any] | None = None
+        self.current_witness_folder: Path | None = None
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -798,16 +961,51 @@ class SimpleAudioApp:
                 self.notice_output_path = Path(payload_dict["output_path"])
                 self.notice_prompt_result = dict(payload_dict["payload"])
                 self.notice_keyterms = list(payload_dict["session_keyterms"])
+                try:
+                    if self.notice_prompt_result is None or self.notice_pdf_path is None or self.notice_output_path is None:
+                        raise RuntimeError("Notice metadata is incomplete.")
+                    identity = parse_case_identity(self.notice_prompt_result)
+                    witness_folder = resolve_deposition_folder(identity, self.notice_prompt_result, self.ui_queue)
+                    source_pdf_path = witness_folder / "source_docs" / self.notice_pdf_path.name
+                    shutil.copy2(self.notice_pdf_path, source_pdf_path)
+                    keyterm_output_path = witness_folder / "keyterms" / self.notice_output_path.name
+                    keyterm_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(self.notice_output_path), str(keyterm_output_path))
+                    self.notice_output_path = keyterm_output_path
+                    self.current_witness_folder = witness_folder
+                except Exception as exc:
+                    log_error("Folder creation failed", exc)
+                    self.status_var.set(f"Folder creation failed: {exc}")
+                    show_error_popup(str(exc))
                 self.notice_var.set(
                     f"{self.notice_pdf_path.name}: {len(self.notice_keyterms)} keyterms loaded "
-                    f"(saved {self.notice_output_path.name})"
+                    f"(saved {self.notice_output_path.name if self.notice_output_path else 'n/a'})"
                 )
+                if self.current_witness_folder is not None:
+                    self.notice_var.set(f"{self.notice_var.get()} -> {self.current_witness_folder}")
                 self.status_var.set("Notice keyterms ready.")
                 self.notice_button.configure(state="normal")
             elif kind == "notice_status":
                 self.notice_var.set(str(payload))
             elif kind == "notice_loaded_failed":
                 self.notice_button.configure(state="normal")
+            elif kind == "fuzzy_match":
+                detail = dict(payload)
+                choice = messagebox.askyesnocancel(
+                    "Possible duplicate detected",
+                    f"A similar {detail['kind']} folder already exists.\n\n"
+                    f"New:      {detail['new']}\n"
+                    f"Existing: {detail['existing']}\n\n"
+                    f"Yes = Use existing\n"
+                    f"No  = Create new\n"
+                    f"Cancel = Abort",
+                )
+                if choice is True:
+                    detail["reply_queue"].put(("use_existing", detail["existing"]))
+                elif choice is False:
+                    detail["reply_queue"].put(("create_new", detail["new"]))
+                else:
+                    detail["reply_queue"].put(("cancel", None))
             elif kind == "error":
                 self.status_var.set(str(payload))
                 show_error_popup(str(payload))
@@ -981,8 +1179,9 @@ class SimpleAudioApp:
         text = transcript_text.strip()
         if not text:
             return
-        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-        path = TRANSCRIPTS_DIR / f"live_transcript_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        target_dir = self.current_witness_folder if self.current_witness_folder is not None else TRANSCRIPTS_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"live_transcript_{time.strftime('%Y%m%d_%H%M%S')}.txt"
         try:
             path.write_text(text, encoding="utf-8")
         except OSError as exc:

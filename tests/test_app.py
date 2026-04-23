@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -201,6 +202,89 @@ class AppUtilityTests(unittest.TestCase):
         terms = app.extract_notice_session_keyterms(payload)
 
         self.assertEqual(terms, ["Gregory Ernest Stone", "Zoom", "oral deposition"])
+
+    def test_normalize_cause_number(self) -> None:
+        self.assertEqual(app.normalize_cause_number("2024-CI-27841"), "2024-CI-27841")
+        self.assertEqual(app.normalize_cause_number("  2024-ci-27841  "), "2024-CI-27841")
+        self.assertEqual(app.normalize_cause_number("2024--CI---27841"), "2024-CI-27841")
+        self.assertEqual(app.normalize_cause_number("2025CI08060"), "2025CI08060")
+
+    def test_witness_slug(self) -> None:
+        self.assertEqual(app.witness_slug("Gregory Ernest Stone"), "stone_gregory_ernest")
+        self.assertEqual(app.witness_slug("John Smith Jr."), "smith_john")
+        self.assertEqual(app.witness_slug("Dr. Bianca Caram"), "caram_bianca")
+        self.assertEqual(app.witness_slug("Stone"), "stone_unknown")
+        self.assertEqual(app.witness_slug(""), "unknown_unknown")
+
+    def test_parse_case_identity_from_stone_response(self) -> None:
+        response = {
+            "proper_nouns": [
+                "2024-CI-27841",
+                "Gregory Ernest Stone",
+                "Thomas D. Jones",
+                "Bexar County",
+            ]
+        }
+
+        identity = app.parse_case_identity(response)
+
+        self.assertEqual(identity["cause_number"], "2024-CI-27841")
+        self.assertEqual(identity["witness_slug"], "stone_gregory_ernest")
+
+    def test_parse_case_identity_skips_firm_as_witness(self) -> None:
+        response = {
+            "proper_nouns": [
+                "2024-CI-27841",
+                "Thomas D. Jones, PC",
+                "Gregory Ernest Stone",
+            ]
+        }
+
+        identity = app.parse_case_identity(response)
+
+        self.assertEqual(identity["deponent_full_name"], "Gregory Ernest Stone")
+
+    def test_levenshtein(self) -> None:
+        self.assertEqual(app.levenshtein("", "abc"), 3)
+        self.assertEqual(app.levenshtein("2025-CVA-001596D2", "2025CVA001596D2"), 2)
+        self.assertEqual(app.levenshtein("foo", "foo"), 0)
+
+    def test_check_fuzzy_match_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = app.Path(tmpdir)
+            (parent / "2024-CI-27841").mkdir()
+
+            match = app.check_fuzzy_match("2024-CI-27841", parent)
+
+        self.assertEqual(match, "2024-CI-27841")
+
+    def test_check_fuzzy_match_near(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = app.Path(tmpdir)
+            (parent / "2025-CVA-001596D2").mkdir()
+
+            match = app.check_fuzzy_match("2025CVA001596D2", parent)
+
+        self.assertEqual(match, "2025-CVA-001596D2")
+
+    def test_check_fuzzy_match_distant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = app.Path(tmpdir)
+            (parent / "2024-CI-27841").mkdir()
+
+            match = app.check_fuzzy_match("2025-CI-10000", parent)
+
+        self.assertIsNone(match)
+
+    def test_save_transcript_snapshot_uses_current_witness_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_stub = SimpleNamespace(current_witness_folder=app.Path(tmpdir))
+            with patch("app.time.strftime", return_value="20260423_151500"):
+                app.SimpleAudioApp._save_transcript_snapshot(app_stub, "hello transcript")
+
+            output_path = app.Path(tmpdir) / "live_transcript_20260423_151500.txt"
+            self.assertTrue(output_path.exists())
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "hello transcript")
 
 
 class DeepgramLiveClientTests(unittest.TestCase):
