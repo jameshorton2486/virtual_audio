@@ -143,7 +143,6 @@ class AppUtilityTests(unittest.TestCase):
         self.assertEqual(options["model"], "nova-3")
         self.assertEqual(options["language"], "en-US")
         self.assertTrue(options["diarize"])
-        self.assertTrue(options["paragraphs"])
         self.assertTrue(options["filler_words"])
         self.assertTrue(options["numerals"])
 
@@ -239,6 +238,71 @@ class DeepgramLiveClientTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertFalse(client.running)
         self.assertEqual(ui_queue.get_nowait(), ("error", "Deepgram disconnected - click Start to resume."))
+
+    def test_request_reconnect_sets_event(self) -> None:
+        ui_queue: "queue.Queue[tuple[str, object]]" = app.queue.Queue()
+        client = app.DeepgramLiveClient("test-key", ui_queue)
+        client.running = True
+        client._reconnect_event = Mock()
+        client._reconnect_event.is_set.return_value = False
+
+        client.request_reconnect("Reconnecting...")
+
+        client._reconnect_event.is_set.assert_called_once()
+        client._reconnect_event.set.assert_called_once()
+        self.assertEqual(ui_queue.get_nowait(), ("status", "Reconnecting..."))
+
+
+class AudioSenderLoopTests(unittest.TestCase):
+    def test_sender_loop_retries_pending_chunk_after_send_failure(self) -> None:
+        app_stub = SimpleNamespace(
+            audio_stop_event=app.threading.Event(),
+            audio_queue=app.queue.Queue(),
+            deepgram=None,
+            running=True,
+        )
+        deepgram = Mock()
+        calls: list[bytes] = []
+
+        def send_side_effect(chunk: bytes) -> None:
+            calls.append(chunk)
+            if len(calls) == 1:
+                raise RuntimeError("temporary drop")
+            app_stub.audio_stop_event.set()
+
+        deepgram.send.side_effect = send_side_effect
+        app_stub.deepgram = deepgram
+        app_stub.audio_queue.put(b"chunk-1")
+
+        with patch.object(app, "log_error"), patch("app.time.sleep", return_value=None):
+            app.SimpleAudioApp._audio_sender_loop(app_stub)
+
+        self.assertEqual(calls, [b"chunk-1", b"chunk-1"])
+        deepgram.request_reconnect.assert_called_once_with("Deepgram send failed. Reconnecting...")
+
+    def test_sender_loop_does_not_stop_on_send_failure(self) -> None:
+        app_stub = SimpleNamespace(
+            audio_stop_event=app.threading.Event(),
+            audio_queue=app.queue.Queue(),
+            deepgram=None,
+            running=True,
+        )
+        deepgram = Mock()
+
+        def send_side_effect(_chunk: bytes) -> None:
+            app_stub.running = False
+            app_stub.audio_stop_event.set()
+            raise RuntimeError("temporary drop")
+
+        deepgram.send.side_effect = send_side_effect
+        app_stub.deepgram = deepgram
+        app_stub.audio_queue.put(b"chunk-1")
+
+        with patch.object(app, "log_error"), patch("app.time.sleep", return_value=None):
+            app.SimpleAudioApp._audio_sender_loop(app_stub)
+
+        self.assertTrue(app_stub.audio_stop_event.is_set())
+        deepgram.request_reconnect.assert_called_once()
 
 
 if __name__ == "__main__":

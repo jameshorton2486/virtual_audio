@@ -26,6 +26,7 @@ LOGS_DIR = APP_DIR / "logs"
 TRANSCRIPTS_DIR = APP_DIR / "transcripts"
 LOG_PATH = LOGS_DIR / "virtual_audio.log"
 ERROR_LOG_PATH = LOGS_DIR / "errors.log"
+AUDIO_QUEUE_MAX_BLOCKS = 150
 
 CONFIG = {
     "input_device": "CABLE Output (VB-Audio Virtual Cable)",
@@ -166,7 +167,6 @@ def build_deepgram_live_options() -> dict[str, Any]:
         "punctuate": True,
         "interim_results": True,
         "diarize": True,
-        "paragraphs": True,
         "filler_words": True,
         "numerals": True,
         "encoding": "linear16",
@@ -341,7 +341,6 @@ class DeepgramLiveClient:
         self._keepalive_thread: threading.Thread | None = None
         self._reconnect_event = threading.Event()
         self._reconnect_worker: threading.Thread | None = None
-        self._logged_paragraphs_check = False
 
     def _create_connection(self):
         from deepgram import DeepgramClient, LiveTranscriptionEvents
@@ -377,7 +376,6 @@ class DeepgramLiveClient:
         self.connection = connection
         self.running = True
         self._last_send_ts = time.monotonic()
-        self._logged_paragraphs_check = False
         self._ensure_background_workers()
         return True, "Deepgram live transcription connected."
 
@@ -452,27 +450,26 @@ class DeepgramLiveClient:
     def _on_open(self, client, open=None, **kwargs) -> None:
         self.ui_queue.put(("status", "Deepgram connected."))
 
+    def request_reconnect(self, status_message: str | None = None) -> None:
+        if not self.running:
+            return
+        if status_message and not self._reconnect_event.is_set():
+            self.ui_queue.put(("status", status_message))
+        self._reconnect_event.set()
+
     def _on_close(self, client, close=None, **kwargs) -> None:
         self.ui_queue.put(("status", "Deepgram connection closed."))
-        if self.running:
-            self._reconnect_event.set()
+        self.request_reconnect()
 
     def _on_error(self, client, error=None, **kwargs) -> None:
         message = str(error) if error else "Deepgram live transcription error."
         log_error("Deepgram error", message)
         self.ui_queue.put(("error", message))
-        if self.running:
-            self._reconnect_event.set()
+        self.request_reconnect()
 
     def _on_transcript(self, client, result=None, **kwargs) -> None:
         if result is None:
             return
-        if not self._logged_paragraphs_check:
-            self._logged_paragraphs_check = True
-            channel = _deepgram_value(result, "channel")
-            alternatives = _deepgram_value(channel, "alternatives", [])
-            has_paragraphs = bool(alternatives) and _deepgram_value(alternatives[0], "paragraphs") is not None
-            LOGGER.info("Deepgram live paragraphs present in response: %s", has_paragraphs)
         transcript = format_live_result_text(result)
         if not transcript:
             return
@@ -487,7 +484,7 @@ class DeepgramLiveClient:
 class SimpleAudioApp:
     def __init__(self) -> None:
         self.ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self.audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=32)
+        self.audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_MAX_BLOCKS)
         self.audio_stop_event = threading.Event()
         self.sender_thread: threading.Thread | None = None
         self.stream = None
@@ -651,20 +648,24 @@ class SimpleAudioApp:
 
     @safe_thread
     def _audio_sender_loop(self) -> None:
+        pending_chunk: bytes | None = None
         while not self.audio_stop_event.is_set():
-            try:
-                pcm_bytes = self.audio_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
+            if pending_chunk is None:
+                try:
+                    pending_chunk = self.audio_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
             if self.deepgram is None or not self.running:
+                time.sleep(0.05)
                 continue
             try:
-                self.deepgram.send(pcm_bytes)
+                self.deepgram.send(pending_chunk)
+                pending_chunk = None
             except Exception as exc:
                 log_error("Deepgram send failed", exc)
-                self.ui_queue.put(("error", f"Deepgram send failed: {exc}"))
-                self.ui_queue.put(("status", "Deepgram send failed."))
-                self.audio_stop_event.set()
+                if self.deepgram is not None:
+                    self.deepgram.request_reconnect("Deepgram send failed. Reconnecting...")
+                time.sleep(0.2)
 
     def start_transcription(self) -> None:
         global _ACTIVE_AUDIO_CALLBACK
