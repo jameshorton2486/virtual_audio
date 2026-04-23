@@ -63,8 +63,9 @@ class AppUtilityTests(unittest.TestCase):
         self.assertIn("Device B", output)
 
     @patch("app.show_error_popup")
+    @patch("app.get_vac_device", return_value=7)
     @patch("app.sd.InputStream")
-    def test_start_audio_stream_returns_none_on_failure(self, input_stream: Mock, show_error_popup: Mock) -> None:
+    def test_start_audio_stream_returns_none_on_failure(self, input_stream: Mock, _get_vac_device: Mock, show_error_popup: Mock) -> None:
         input_stream.side_effect = RuntimeError("boom")
         app._ACTIVE_AUDIO_CALLBACK = lambda *args, **kwargs: None
 
@@ -146,6 +147,12 @@ class AppUtilityTests(unittest.TestCase):
         self.assertTrue(options["filler_words"])
         self.assertTrue(options["numerals"])
 
+    def test_build_deepgram_live_options_merges_session_keyterms(self) -> None:
+        with patch.dict("os.environ", {"DEEPGRAM_KEYTERMS": "Zoom,Deepgram"}, clear=False):
+            options = app.build_deepgram_live_options(["Gregory Ernest Stone", "Zoom"])
+
+        self.assertEqual(options["keyterm"], ["Zoom", "Deepgram", "Gregory Ernest Stone"])
+
     def test_build_deepgram_live_options_uses_keyterms_for_nova_3(self) -> None:
         with patch.dict(
             "os.environ",
@@ -173,6 +180,27 @@ class AppUtilityTests(unittest.TestCase):
 
         self.assertEqual(options["keywords"], ["Zoom:2", "Deepgram:3"])
         self.assertNotIn("keyterm", options)
+
+    def test_parse_claude_json_payload_handles_fenced_json(self) -> None:
+        payload = app.parse_claude_json_payload(
+            """```json
+            {"proper_nouns":["Gregory Ernest Stone"],"legal_terms":[],"likely_domain_terms":[],"spelling_variants":[]}
+            ```"""
+        )
+
+        self.assertEqual(payload["proper_nouns"], ["Gregory Ernest Stone"])
+
+    def test_extract_notice_session_keyterms_uses_proper_and_legal_terms_only(self) -> None:
+        payload = {
+            "proper_nouns": ["Gregory Ernest Stone", "Zoom"],
+            "legal_terms": ["oral deposition"],
+            "likely_domain_terms": ["[inferred] MRI"],
+            "spelling_variants": [],
+        }
+
+        terms = app.extract_notice_session_keyterms(payload)
+
+        self.assertEqual(terms, ["Gregory Ernest Stone", "Zoom", "oral deposition"])
 
 
 class DeepgramLiveClientTests(unittest.TestCase):

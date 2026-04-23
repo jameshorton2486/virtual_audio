@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import math
 import os
@@ -11,7 +13,7 @@ import time
 import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 from typing import Any
 
 import customtkinter as ctk
@@ -22,11 +24,71 @@ import sounddevice as sd
 APP_DIR = Path(__file__).resolve().parent
 VENV_PYTHON = APP_DIR / ".venv" / "Scripts" / "python.exe"
 ENV_PATH = APP_DIR / ".env"
-LOGS_DIR = APP_DIR / "logs"
+LOGS_DIR = Path(os.environ.get("VIRTUAL_AUDIO_LOG_DIR", str(APP_DIR / "logs")))
 TRANSCRIPTS_DIR = APP_DIR / "transcripts"
+DATA_DIR = APP_DIR / "data"
 LOG_PATH = LOGS_DIR / "virtual_audio.log"
 ERROR_LOG_PATH = LOGS_DIR / "errors.log"
 AUDIO_QUEUE_MAX_BLOCKS = 150
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+
+NOTICE_KEYTERM_PROMPT = """# Deposition PDF To Deepgram Keyterms
+
+Extract only speech-to-text boost terms from a deposition notice PDF and any attached court-reporter coversheet.
+
+Your output will be used for Deepgram Nova-3 keyterm boosting.
+
+Return exactly one JSON object:
+{
+  "proper_nouns": [],
+  "legal_terms": [],
+  "likely_domain_terms": [],
+  "spelling_variants": []
+}
+
+Hard rules:
+- Return only JSON.
+- Do not add fields.
+- Do not include prose.
+- Do not include pronouns.
+- Do not include generic common nouns or form labels.
+- Do not invent names, firms, addresses, or case facts.
+- Deduplicate exact duplicates.
+- Preserve capitalization and spelling exactly as printed.
+- Prefer terms likely to be misheard by ASR.
+- Prefer 1-5 word terms.
+
+Include in proper_nouns:
+- cause number
+- deponent name
+- party names
+- attorney names
+- staff names if unusual
+- law firm names
+- reporting firm names
+- insurer or carrier names only if explicitly supported
+- court names
+- county names
+- city names
+- state names if part of the case caption or venue
+- street names if explicitly shown and likely useful in speech
+- platform names like Zoom if explicitly printed
+- both canonical and variant spellings when present
+
+Include in legal_terms:
+- oral deposition
+- deponent
+- next friend
+- certificate of service
+- read and sign
+- attorney of record
+- Texas Rules of Civil Procedure
+- fully qualified rule citations like Texas Rules of Civil Procedure 199.1
+
+Include in likely_domain_terms only if strongly supported by the document and prefix each inferred item with [inferred] .
+
+Return only the JSON object.
+"""
 
 CONFIG = {
     "input_device": "CABLE Output (VB-Audio Virtual Cable)",
@@ -146,6 +208,10 @@ def get_deepgram_api_key() -> str:
     return os.environ.get("DEEPGRAM_API_KEY", "").strip()
 
 
+def get_anthropic_api_key() -> str:
+    return os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+
 def _env_csv_values(name: str) -> list[str]:
     raw_value = os.environ.get(name, "").strip()
     if not raw_value:
@@ -154,11 +220,94 @@ def _env_csv_values(name: str) -> list[str]:
     return values
 
 
-def build_deepgram_live_options() -> dict[str, Any]:
+def _dedupe_terms(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _strip_json_fence(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def parse_claude_json_payload(text: str) -> dict[str, Any]:
+    return dict(json.loads(_strip_json_fence(text)))
+
+
+def extract_notice_session_keyterms(payload: dict[str, Any]) -> list[str]:
+    proper_nouns = [str(item).strip() for item in payload.get("proper_nouns", []) or []]
+    legal_terms = [str(item).strip() for item in payload.get("legal_terms", []) or []]
+    return _dedupe_terms(proper_nouns + legal_terms)
+
+
+def save_notice_extraction(payload: dict[str, Any], pdf_path: Path) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", pdf_path.stem).strip("_") or "notice"
+    output_path = DATA_DIR / f"{safe_stem}_claude_keyterms_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return output_path
+
+
+def extract_notice_keyterms_with_claude(pdf_path: Path, api_key: str) -> dict[str, Any]:
+    try:
+        from anthropic import Anthropic
+    except Exception as exc:
+        raise RuntimeError(f"Anthropic SDK is not available: {exc}") from exc
+
+    response = Anthropic(api_key=api_key.strip()).messages.create(
+        model=os.environ.get("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL).strip() or DEFAULT_ANTHROPIC_MODEL,
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": base64.b64encode(pdf_path.read_bytes()).decode("ascii"),
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": NOTICE_KEYTERM_PROMPT,
+                    },
+                ],
+            }
+        ],
+    )
+    text_blocks = [str(getattr(block, "text", "")) for block in getattr(response, "content", []) if getattr(block, "type", "") == "text"]
+    response_text = "\n".join(block for block in text_blocks if block.strip())
+    if not response_text.strip():
+        raise RuntimeError("Claude returned no text content for the notice extraction.")
+    payload = parse_claude_json_payload(response_text)
+    payload.setdefault("proper_nouns", [])
+    payload.setdefault("legal_terms", [])
+    payload.setdefault("likely_domain_terms", [])
+    payload.setdefault("spelling_variants", [])
+    return payload
+
+
+def build_deepgram_live_options(session_keyterms: list[str] | None = None) -> dict[str, Any]:
     model = os.environ.get("DEEPGRAM_MODEL", CONFIG["deepgram_model"]).strip() or CONFIG["deepgram_model"]
     language = os.environ.get("DEEPGRAM_LANGUAGE", CONFIG["deepgram_language"]).strip() or CONFIG["deepgram_language"]
     keyterms = _env_csv_values("DEEPGRAM_KEYTERMS")
     keywords = _env_csv_values("DEEPGRAM_KEYWORDS")
+    merged_keyterms = _dedupe_terms(keyterms + list(session_keyterms or []))
 
     options: dict[str, Any] = {
         "model": model,
@@ -174,8 +323,8 @@ def build_deepgram_live_options() -> dict[str, Any]:
         "sample_rate": CONFIG["sample_rate"],
     }
 
-    if keyterms:
-        options["keyterm"] = keyterms
+    if merged_keyterms:
+        options["keyterm"] = merged_keyterms
     elif keywords:
         if model.lower().startswith("nova-3"):
             options["keyterm"] = [term.split(":", 1)[0].strip() for term in keywords if term.split(":", 1)[0].strip()]
@@ -330,9 +479,10 @@ def format_live_result_text(result: Any) -> str:
 
 
 class DeepgramLiveClient:
-    def __init__(self, api_key: str, ui_queue: queue.Queue[tuple[str, Any]]):
+    def __init__(self, api_key: str, ui_queue: queue.Queue[tuple[str, Any]], session_keyterms: list[str] | None = None):
         self.api_key = api_key.strip()
         self.ui_queue = ui_queue
+        self.session_keyterms = _dedupe_terms(list(session_keyterms or []))
         self.connection = None
         self.final_lines: list[str] = []
         self.interim_text = ""
@@ -366,7 +516,7 @@ class DeepgramLiveClient:
             return False, "Missing DEEPGRAM_API_KEY in .env."
         try:
             connection = self._create_connection()
-            options = build_deepgram_live_options()
+            options = build_deepgram_live_options(self.session_keyterms)
             if not connection.start(options):
                 return False, "Failed to start Deepgram live transcription connection."
         except Exception as exc:
@@ -415,7 +565,7 @@ class DeepgramLiveClient:
                 return False
             try:
                 connection = self._create_connection()
-                options = build_deepgram_live_options()
+                options = build_deepgram_live_options(self.session_keyterms)
                 if connection.start(options):
                     self.connection = connection
                     self._last_send_ts = time.monotonic()
@@ -495,6 +645,10 @@ class SimpleAudioApp:
         self.device_index, self.device_info = resolve_input_device(CONFIG["input_device"])
         self.locked_device_name = str(self.device_info.get("name", CONFIG["input_device"])) if self.device_info else CONFIG["input_device"]
         self.transcript_text = ""
+        self.notice_pdf_path: Path | None = None
+        self.notice_output_path: Path | None = None
+        self.notice_keyterms: list[str] = []
+        self.notice_prompt_result: dict[str, Any] | None = None
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -507,6 +661,7 @@ class SimpleAudioApp:
         self.input_var = ctk.StringVar(value=self.locked_device_name)
         self.rms_var = ctk.StringVar(value="RMS: -200.0 dB")
         self.status_var = ctk.StringVar(value="Idle")
+        self.notice_var = ctk.StringVar(value="No deposition notice loaded.")
 
         self._build_ui()
         self.root.after(100, self._process_ui_queue)
@@ -562,6 +717,28 @@ class SimpleAudioApp:
         )
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
+        self.notice_button = ctk.CTkButton(
+            frame,
+            text="Load Notice PDF (Claude)",
+            command=self.load_notice_pdf,
+            height=36,
+            font=("Arial", 12, "bold"),
+            fg_color="#455A64",
+            hover_color="#263238",
+        )
+        self.notice_button.pack(fill="x", padx=18, pady=(0, 10))
+
+        ctk.CTkLabel(frame, text="Notice Keyterms:", font=("Arial", 13, "bold"), anchor="w").pack(fill="x", padx=18)
+        self.notice_label = ctk.CTkLabel(
+            frame,
+            textvariable=self.notice_var,
+            font=("Consolas", 11),
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        )
+        self.notice_label.pack(fill="x", padx=18, pady=(0, 12))
+
         ctk.CTkLabel(frame, text="Signal Level:", font=("Arial", 13, "bold"), anchor="w").pack(fill="x", padx=18)
         self.rms_label = ctk.CTkLabel(frame, textvariable=self.rms_var, font=("Consolas", 12), anchor="w")
         self.rms_label.pack(fill="x", padx=18)
@@ -615,6 +792,22 @@ class SimpleAudioApp:
             elif kind == "transcript":
                 self.transcript_text = str(payload)
                 self._set_transcript_text(self.transcript_text)
+            elif kind == "notice_loaded":
+                payload_dict = dict(payload)
+                self.notice_pdf_path = Path(payload_dict["pdf_path"])
+                self.notice_output_path = Path(payload_dict["output_path"])
+                self.notice_prompt_result = dict(payload_dict["payload"])
+                self.notice_keyterms = list(payload_dict["session_keyterms"])
+                self.notice_var.set(
+                    f"{self.notice_pdf_path.name}: {len(self.notice_keyterms)} keyterms loaded "
+                    f"(saved {self.notice_output_path.name})"
+                )
+                self.status_var.set("Notice keyterms ready.")
+                self.notice_button.configure(state="normal")
+            elif kind == "notice_status":
+                self.notice_var.set(str(payload))
+            elif kind == "notice_loaded_failed":
+                self.notice_button.configure(state="normal")
             elif kind == "error":
                 self.status_var.set(str(payload))
                 show_error_popup(str(payload))
@@ -667,6 +860,49 @@ class SimpleAudioApp:
                     self.deepgram.request_reconnect("Deepgram send failed. Reconnecting...")
                 time.sleep(0.2)
 
+    def load_notice_pdf(self) -> None:
+        pdf_path = filedialog.askopenfilename(
+            title="Select Deposition Notice PDF",
+            filetypes=[("PDF files", "*.pdf")],
+        )
+        if not pdf_path:
+            return
+        self.notice_button.configure(state="disabled")
+        self.notice_var.set(f"Extracting keyterms from {Path(pdf_path).name}...")
+        threading.Thread(
+            target=self._extract_notice_pdf_worker,
+            args=(Path(pdf_path),),
+            daemon=True,
+            name="claude-notice-extractor",
+        ).start()
+
+    @safe_thread
+    def _extract_notice_pdf_worker(self, pdf_path: Path) -> None:
+        api_key = get_anthropic_api_key()
+        if not api_key:
+            self.ui_queue.put(("notice_status", "Missing ANTHROPIC_API_KEY."))
+            self.ui_queue.put(("notice_loaded_failed", str(pdf_path)))
+            self.ui_queue.put(("error", "Missing ANTHROPIC_API_KEY in .env."))
+            return
+        try:
+            payload = extract_notice_keyterms_with_claude(pdf_path, api_key)
+            output_path = save_notice_extraction(payload, pdf_path)
+            self.ui_queue.put(
+                (
+                    "notice_loaded",
+                    {
+                        "pdf_path": str(pdf_path),
+                        "output_path": str(output_path),
+                        "payload": payload,
+                        "session_keyterms": extract_notice_session_keyterms(payload),
+                    },
+                )
+            )
+        except Exception as exc:
+            self.ui_queue.put(("notice_status", f"Notice extraction failed for {pdf_path.name}."))
+            self.ui_queue.put(("notice_loaded_failed", str(pdf_path)))
+            self.ui_queue.put(("error", f"Notice extraction failed: {exc}"))
+
     def start_transcription(self) -> None:
         global _ACTIVE_AUDIO_CALLBACK
 
@@ -682,7 +918,7 @@ class SimpleAudioApp:
             self.status_var.set("Missing DEEPGRAM_API_KEY.")
             return
 
-        self.deepgram = DeepgramLiveClient(api_key, self.ui_queue)
+        self.deepgram = DeepgramLiveClient(api_key, self.ui_queue, session_keyterms=self.notice_keyterms)
         success, message = self.deepgram.start()
         if not success:
             self.deepgram = None
