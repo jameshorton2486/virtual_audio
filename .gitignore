@@ -3,19 +3,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.snapshot
 *.bak
 
 .idea/
+.mypy_cache/
+.pytest_cache/
 .env
 
-build/
-dist/
 logs/
 transcripts/
-
-compact-ui-screenshot.png
-compact-ui-window.png
+data/
 SoundVolumeView.exe
-app.py.current_snapshot
-data/*.json

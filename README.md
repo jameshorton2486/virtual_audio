@@ -1,185 +1,86 @@
 # Virtual Audio Control
 
-Windows desktop utility for switching recording devices between a microphone, a virtual audio cable, and a mixed Voicemeeter path.
+A simple, stable Zoom transcription tool.
 
-## What It Includes
+This app captures Zoom audio from `CABLE Output (VB-Audio Virtual Cable)`, sends it to Deepgram for live transcription, and shows:
 
-- Simple desktop UI built with `customtkinter`
-- Device switching through `nircmd.exe`
-- Built-in config editor for device names
-- Auto-detection and refresh for Windows recording devices
-- Auto-detection for VAC recording and playback endpoints
-- Live audio quality panel intended to help reduce transcription errors
-- Built-in `Test VAC Routing` action that sends a short tone through the cable
-- Built-in file transcription for Zoom recordings and saved media using Deepgram
-- Built-in live transcription panel for active microphone, VAC, or mixed input
-- Packaging command for a standalone `.exe`
+- the active input device
+- live RMS / signal level
+- live transcription output
+
+It does not switch Windows devices and does not interfere with your microphone. Your Razer mic can still be used directly in Zoom while the app transcribes Zoom playback through VAC.
+
+## Install
+
+```powershell
+git clone <repo>
+cd virtual_audio
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Requirements
+
+- Python 3.10+
+- VB-Audio Virtual Cable installed
+- Zoom installed
 
 ## Setup
 
-1. Install Python 3.11+ on Windows.
-2. Put `nircmd.exe` in this folder.
-3. Create the virtual environment:
+Open Zoom and go to Audio Settings.
+
+Set:
+
+- Speaker: `CABLE Input (VB-Audio Virtual Cable)`
+- Microphone: `Razer Seiren V3 Mini`
+
+The app input is fixed to:
+
+- `CABLE Output (VB-Audio Virtual Cable)`
+
+## Run App
 
 ```powershell
-python -m venv .venv
+python app.py
 ```
 
-4. Install the dependencies into that environment:
+To list detected audio devices:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+python app.py --list-devices
 ```
 
-5. Add your Deepgram API key in a local `.env` file:
+## Expected Result
 
-```powershell
-Copy-Item .env.example .env
-```
+- Zoom audio is transcribed
+- Your microphone still works in Zoom
+- The app shows signal activity from VAC
+- The app does not switch devices or override Windows audio
 
-Then edit `.env` and set:
+## UI
+
+The app contains one panel only:
+
+- fixed input device display
+- `Start Transcription`
+- `Stop`
+- RMS / signal status
+- live transcription box
+
+## Deepgram
+
+Create a local `.env` file from `.env.example` and set:
 
 ```text
 DEEPGRAM_API_KEY=your_real_key_here
 ```
 
-6. Run the app:
+## Testing
 
-```powershell
-.\.venv\Scripts\python.exe app.py
-```
+The simplified app is designed so that:
 
-`app.py` also auto-restarts itself inside `.venv` on Windows when launched from a normal shell, so `python app.py` will still hand off to the local project environment if it exists. PyCharm-hosted runs keep the interpreter you selected in the IDE.
-You can also just double-click `run_app.bat`.
-
-## Important Zoom Setting
-
-In Zoom, set `Microphone` to `Same as System`. Otherwise Windows default-device switching will not affect the meeting input.
-
-## How The Mode Buttons Work
-
-- Clicking a mode button changes the Windows default recording device for all three Windows audio roles.
-- `VAC` mode selects `CABLE Output (VB-Audio Virtual Cable)` as the recording device and `CABLE Input (VB-Audio Virtual Cable)` as the Windows playback device.
-- `Microphone` and `Mixed` modes restore playback to the configured speaker device.
-- If an individual app is pinned to a different output device instead of `Default`, change that app back to the Windows default output.
-- Use `Test VAC Routing` to send a short tone through the cable and confirm the app meter responds.
-
-## Configure Device Names
-
-Edit the values in `config.json` or use the fields in the app. The app also has a `Refresh Devices` button that re-scans Windows input and output devices and updates the dropdowns.
-
-- `mixed_playback_device`: optional playback target for Mixed mode. Leave blank to reuse `speaker_device`. Useful when you want Mic mode to play to headphones but Mixed mode to play to room speakers or a TV.
-- `restore_devices_on_exit`: when true (default), the app captures the Windows default recording and playback devices at startup and restores them when you close the app normally. Prevents Windows from staying stuck on `CABLE Output` or another mode-specific device after the app exits.
-
-## Environment Variables
-
-- Store local secrets such as `DEEPGRAM_API_KEY` in `.env`
-- `.env` is ignored by Git
-- Use `.env.example` as the template
-
-## File Transcription
-
-- Use the `Transcribe File` button in the app for saved Zoom recordings, downloaded videos, and other media files
-- Supported file types include `wav`, `mp3`, `m4a`, `mp4`, `webm`, `flac`, `ogg`, and more
-- Transcript text and the full Deepgram JSON response are saved into the local `transcripts` folder
-- `Smart Format`, `Diarization`, `Paragraphs`, `Filler Words`, and `Numerals` can be turned on or off from the UI before starting either file or live transcription
-
-## Live Transcription
-
-- Use `Start Live Transcription` to stream the currently active recording device to Deepgram in real time
-- `Microphone` mode streams your live mic
-- `VAC` mode streams routed playback audio such as Zoom output or other system audio
-- `Mixed` mode streams the configured Voicemeeter mixed path
-- The rolling transcript appears in the app, auto-scrolls, and is saved automatically into the local `transcripts` folder when you stop
-- Each live session also saves a matching `.json` metadata file with mode, device, timestamps, and status
-- Live transcription uses the same `Smart Format`, `Diarization`, `Paragraphs`, `Filler Words`, and `Numerals` options shown in the Deepgram panel
-
-## Copy and Save a Transcript
-
-The Transcribe tab has three buttons above the transcript window:
-
-- **Copy Transcript**: copies the full transcript text to the Windows clipboard. If a live session is running, it copies the committed live text. Otherwise, it copies the contents of the most recently saved transcript file.
-- **Save Transcript As...**: opens a Save As dialog so you can pick any folder and filename. Defaults to a timestamped `transcript_YYYYMMDD_HHMMSS.txt`.
-- **Open Transcripts Folder**: opens the app's default `transcripts` folder in File Explorer.
-
-## UI Overview
-
-- **Monitor**: live signal meter, current mode status, and WER optimization readout.
-- **Routing**: one-off changes to Windows recording and playback defaults.
-- **Transcribe**: file and live transcription controls; copy/save transcripts.
-- **Settings**: persistent device choices used by the mode buttons and live transcription.
-
-## Hot Mode Switching
-
-- While live transcription is running, you can click `Microphone`, `VAC`, or `Mixed` to hot-switch the active capture source without stopping the Deepgram session.
-- The transcript stays in the same file and inserts inline markers such as `[Switched to VAC mode at 15:04:23 - CABLE Output (VB-Audio Virtual Cable)]`.
-- The matching live-session `.json` metadata file now includes a `mode_switches` array with timestamps and before/after device names.
-- If the new source fails preflight or stream open, the app keeps the current live session on the old device instead of tearing the whole session down.
-
-## Recommended Live Workflows
-
-- Zoom deposition audio only: switch to `VAC`, make sure Windows playback is routed to `CABLE Input`, then start live transcription
-- Your own live speech: switch to `Microphone`, confirm your mic is the active recording device, then start live transcription
-- Narration over routed playback: switch to `Mixed`, verify Voicemeeter routing first, then start live transcription
-
-## Logs and Diagnostics
-
-- `logs/virtual_audio.log` is the main rotating app log. It keeps `5` files at `5 MB` each.
-- `logs/errors.log` is the warning/error log. It keeps `3` files at `2 MB` each.
-- Structured logs use the format `[Tag] key=value ...` so failures and device decisions can be filtered quickly.
-- Failure lines are classified as `SIGNAL`, `ROUTING`, `DEVICE`, `DEPENDENCY`, or `UNKNOWN`.
-- Set `VIRTUAL_AUDIO_DEBUG=1` before launching the app to include DEBUG-level diagnostics such as periodic `[AudioSignal]` entries in the main log.
-
-## WER Notes
-
-- `VAC` mode is usually the cleanest path for transcription when you only need playback audio.
-- `Mixed` mode is useful when you need mic narration over playback, but the final quality depends on Voicemeeter routing and levels.
-- The live meter is a basic signal-health check. It is not a true WER estimator.
-
-### Understanding the Meter
-
-| Metric | Range | Meaning |
-|---|---|---|
-| RMS | >= -45 dB | Any usable signal at all (below this = silence / no signal) |
-| RMS | -45 to -25 dB | Too quiet for reliable transcription |
-| RMS | -25 to -12 dB | Optimal speech range |
-| RMS | -12 to -3 dB | Too loud |
-| Peak | >= -3 dB | Risk of clipping |
-| Peak | >= -0.1 dB | Hard clipping |
-
-- `no_signal` means the app is effectively seeing silence, usually from mute, bad routing, or no active playback.
-- `too_quiet` means speech is present but below the target range, so raising mic gain or source volume should help.
-- `optimal` means the measured speech level is in the target window for reliable transcription.
-- `too_loud` means the level is still usable but should be reduced before it reaches clipping.
-- `clipping` means the peak level is already in the danger zone and should be turned down immediately.
-
-## Build a Standalone EXE
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install pyinstaller
-.\.venv\Scripts\pyinstaller.exe --onefile --noconsole --name VirtualAudioControl app.py
-```
-
-After the build finishes, copy these files together before distributing:
-
-- `dist\VirtualAudioControl.exe`
-- `nircmd.exe`
-- `config.json`
-
-## Shortcuts
-
-- `Ctrl+M` toggles mute on the current default recording device
-- `Ctrl+Shift+1` switches to `Microphone`
-- `Ctrl+Shift+2` switches to `VAC`
-- `Ctrl+Shift+3` switches to `Mixed`
-
-## Troubleshooting
-
-- If switching fails, check that `nircmd.exe` is present and the device names are exact.
-- If the monitor says the signal is silent, confirm the current default recording device is actually receiving audio.
-- If the app closes but audio switching worked, review Python/package installation first.
-- If `Mixed` is greyed out or shows `Mixed Unavailable`, Voicemeeter is not currently exposing a virtual input device. Open Voicemeeter, route mic or system audio to a virtual input, then click `Refresh Devices`.
-
-### Reset Windows Audio
-
-If your Windows audio gets stuck on a device the app set (for example, `CABLE Output` as the recording device after a VAC-mode session), click **Reset Windows Audio** in the Routing tab. This restores the devices that were active when you launched the app, or falls back to your configured `mic_device` and `speaker_device` if no originals were captured. Stop live transcription first, because the button is blocked while a session is running.
+- it does not crash when there is no signal
+- it does not exit automatically because of device switching logic
+- RMS updates when audio plays
+- Deepgram receives audio from the VAC stream
